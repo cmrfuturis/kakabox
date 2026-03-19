@@ -41,16 +41,16 @@ _INIT_SEQUENCE = [
 
 
 class Gesture(IntFlag):
+    # Bit mapping verified by hardware calibration on this unit
     NONE             = 0x000
-    UP               = 0x001
+    WAVE             = 0x001
     DOWN             = 0x002
-    LEFT             = 0x004
-    RIGHT            = 0x008
-    FORWARD          = 0x010
-    BACKWARD         = 0x020
+    UP               = 0x004
+    LEFT             = 0x008
+    FORWARD          = 0x010   # push toward sensor
+    BACKWARD         = 0x020   # pull away from sensor
     CLOCKWISE        = 0x040
-    COUNTER_CLOCKWISE = 0x080
-    WAVE             = 0x100
+    RIGHT            = 0x080
 
 
 class GestureSensor:
@@ -82,9 +82,7 @@ class GestureSensor:
 
     def read(self) -> Gesture:
         """Return detected gesture, or Gesture.NONE if nothing detected."""
-        low = self._read(_REG_GESTURE_HIGH)   # register 0x43 = bits 0-7
-        high = self._read(_REG_GESTURE_LOW)   # register 0x44 = bit 8 (wave)
-        raw = ((high & 0x01) << 8) | low
+        raw = self._read(_REG_GESTURE_HIGH)   # register 0x43 — all gestures
         try:
             return Gesture(raw)
         except ValueError:
