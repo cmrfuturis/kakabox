@@ -25,6 +25,7 @@ from hardware.audio_output import set_volume
 from hardware.encoder import Encoder
 from hardware.gesture import Gesture, GestureSensor
 from hardware.nfc import PN532
+from api.routes import start as start_api
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 VOLUME_STEP = 10
@@ -87,6 +88,9 @@ class Kakabox:
 
     def run(self) -> None:
         self._running = True
+
+        start_api(self)
+        logger.info("REST API started on http://0.0.0.0:8000")
 
         nfc_thread = threading.Thread(target=self._nfc_loop, daemon=True)
         nfc_thread.start()
