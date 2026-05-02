@@ -23,3 +23,4 @@ Thumbs.db
 
 # Config with secrets
 device/config.local.json
+device/box_identity.json
