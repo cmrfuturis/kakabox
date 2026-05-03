@@ -1,0 +1,31 @@
+# systemd-Unit für die Kakabox-Hauptanwendung.
+#
+# Wird NICHT per Default beim Boot gestartet — sondern erst wenn comitup
+# meldet, dass das Heim-WLAN steht (siehe kakabox-comitup-callback).
+#
+# Manuell:
+#   sudo systemctl start kakabox.service
+#   sudo journalctl -u kakabox -f
+[Unit]
+Description=Kakabox device main loop
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=riffi
+Group=riffi
+WorkingDirectory=/home/riffi/Dokumente/kakabox/device
+ExecStart=/home/riffi/Dokumente/kakabox/device/.venv/bin/python /home/riffi/Dokumente/kakabox/device/main.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Sicherheit: nur Lesen vom System, schreiben nur in eigene Dirs
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/riffi/Dokumente/kakabox/device
+
+[Install]
+WantedBy=multi-user.target

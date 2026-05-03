@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="de" class="uk-height-1-1">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kakabox · WLAN verbinden</title>
+    <link rel="icon" href="img/favicon.ico">
+    <link rel="stylesheet" type="text/css" href="css/uikit.css">
+    <script src="js/blink.js"></script>
+    <style>
+        body { background: linear-gradient(135deg, #7c5cfc 0%, #4338ca 100%); font-family: 'Helvetica Neue', sans-serif; color: #fff; }
+        .kb-card { background: #fff; color: #1f2937; border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,0.15); padding: 2rem 1.5rem; }
+        .kb-emoji { font-size: 3rem; line-height: 1; }
+        .kb-title { font-size: 1.4rem; font-weight: 700; color: #111827; }
+        .uk-button-primary { background-color: #7c5cfc; border-color: #7c5cfc; }
+        .uk-button-primary:hover { background-color: #4338ca; border-color: #4338ca; }
+    </style>
+</head>
+<body class="uk-height-1-1">
+<div class="uk-flex uk-flex-center uk-flex-middle" style="min-height: 100vh;">
+    <div class="uk-width-large uk-padding-small">
+        <div class="kb-card">
+            <div class="uk-text-center uk-margin-bottom">
+                <div class="kb-emoji">🔐</div>
+                <div class="kb-title uk-margin-small-top">{{ ssid }}</div>
+                <div class="uk-text-small uk-text-muted">WLAN-Passwort eingeben</div>
+            </div>
+
+            <form method="POST" action="/connect">
+                <input type="hidden" name="ssid" value="{{ ssid }}">
+                {% if encrypted == 'encrypted' %}
+                <div class="uk-margin">
+                    <input class="uk-input" type="password" name="password" placeholder="Passwort"
+                           autofocus required minlength="8" maxlength="63">
+                </div>
+                {% else %}
+                <div class="uk-alert uk-alert-warning">
+                    Das Netz ist offen — keine Passworteingabe nötig.
+                </div>
+                {% endif %}
+
+                <div class="uk-grid uk-grid-small">
+                    <div class="uk-width-1-2"><a href="/" class="uk-button uk-button-default uk-width-1-1">Zurück</a></div>
+                    <div class="uk-width-1-2"><button class="uk-button uk-button-primary uk-width-1-1" type="submit">Verbinden</button></div>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+</body>
+</html>

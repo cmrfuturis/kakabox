@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="de" class="uk-height-1-1">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="20">
+    <title>Kakabox · Verbinde …</title>
+    <link rel="icon" href="img/favicon.ico">
+    <link rel="stylesheet" type="text/css" href="css/uikit.css">
+    <style>
+        body { background: linear-gradient(135deg, #7c5cfc 0%, #4338ca 100%); font-family: 'Helvetica Neue', sans-serif; color: #fff; }
+        .kb-card { background: #fff; color: #1f2937; border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,0.15); padding: 2rem 1.5rem; text-align: center; }
+        .kb-emoji { font-size: 3.5rem; line-height: 1; }
+        .kb-title { font-size: 1.4rem; font-weight: 700; color: #111827; margin-top: 0.5rem; }
+        .kb-spinner { display: inline-block; width: 36px; height: 36px; border: 4px solid rgba(124,92,252,0.2); border-top-color: #7c5cfc; border-radius: 50%; animation: spin 1s linear infinite; margin: 1rem 0; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="uk-height-1-1">
+<div class="uk-flex uk-flex-center uk-flex-middle" style="min-height: 100vh;">
+    <div class="uk-width-large uk-padding-small">
+        <div class="kb-card">
+            <div class="kb-emoji">📡</div>
+            <div class="kb-title">Verbinde mit „{{ ssid }}" …</div>
+            <div class="kb-spinner"></div>
+            <p class="uk-text-muted">Das kann bis zu einer Minute dauern. Sobald die Verbindung steht, schaltet sich dieser Hotspot ab — dein Gerät verbindet sich automatisch wieder mit deinem normalen WLAN.</p>
+            <p class="uk-text-small uk-text-muted">Diese Seite aktualisiert sich alle 20 Sekunden.</p>
+        </div>
+    </div>
+</div>
+</body>
+</html>

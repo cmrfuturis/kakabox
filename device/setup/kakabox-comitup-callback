@@ -1,0 +1,44 @@
+#!/bin/bash
+# Wird von comitup bei jedem State-Wechsel aufgerufen.
+# Argument: HOTSPOT | CONNECTING | CONNECTED
+#
+# Verantwortung:
+#   - Audio-Feedback abspielen
+#   - kakabox.service starten/stoppen je nach WLAN-Status
+#
+# Wird aus /etc/comitup.conf via external_callback geladen.
+
+set -u
+
+STATE="${1:-}"
+LOG=/var/log/kakabox-callback.log
+PROMPTS=/usr/share/kakabox/prompts
+
+log() { echo "$(date -Is) [$STATE] $*" >> "$LOG"; }
+
+play_prompt() {
+    local file="$PROMPTS/$1"
+    [ -f "$file" ] || { log "prompt missing: $file"; return; }
+    # Auf MAX98357A direkt — hartkodiert, weil wir den Card-Index zur Boot-Zeit
+    # nicht kennen, aber den Kartennamen
+    aplay -q -D plughw:CARD=MAX98357A,DEV=0 "$file" 2>&1 | tee -a "$LOG"
+}
+
+case "$STATE" in
+    HOTSPOT)
+        log "Hotspot-Modus aktiv — kakabox.service stoppen"
+        systemctl stop kakabox.service 2>>"$LOG" || true
+        play_prompt setup_active.wav
+        ;;
+    CONNECTING)
+        log "Verbindungsversuch ..."
+        ;;
+    CONNECTED)
+        log "Mit Heim-WLAN verbunden — kakabox.service starten"
+        play_prompt wifi_connected.wav
+        systemctl start kakabox.service 2>>"$LOG" || true
+        ;;
+    *)
+        log "Unbekannter State: $STATE"
+        ;;
+esac
