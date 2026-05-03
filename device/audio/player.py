@@ -1,4 +1,6 @@
 import logging
+import threading
+import time
 import mpv
 from dataclasses import dataclass
 from typing import Optional, Callable
@@ -27,11 +29,19 @@ class Player:
             video=False,
             terminal=False,
         )
-        self._mpv["msg-level"] = "all=error"
+        # 'warn' (statt 'error') zeigt uns ALSA-Probleme im Log,
+        # ohne das Log mit Debug-Spam zu fluten.
+        self._mpv["msg-level"] = "all=warn"
         self._state = PlaybackState()
         self._on_track_end: Optional[Callable] = None
 
-        self._mpv.observe_property("eof-reached", self._on_eof)
+        # Track-Ende-Erkennung via Polling auf idle-active. Robuster als der
+        # eof-reached Property-Observer (der nach play() nicht zuverlässig feuerte
+        # und bei Auto-Advance-Tracks komplett ausfiel).
+        self._eof_thread = threading.Thread(
+            target=self._eof_watch_loop, daemon=True, name="player-eof"
+        )
+        self._eof_thread.start()
 
     # ------------------------------------------------------------------
     # Public API
@@ -54,6 +64,42 @@ class Player:
         self._state.paused = False
         self._mpv.play(track.path)
         logger.info("Playing: %s", track.title)
+
+    def play_file(self, path: str, title: str = "", start_seconds: float = 0.0) -> None:
+        """Play an arbitrary file path (used by playlist with locally cached audio).
+
+        Disables album auto-advance — caller controls the next-track logic via
+        ``on_track_end()`` callback.
+
+        ``start_seconds`` lässt mpv die Wiedergabe direkt an dieser Position starten —
+        wird für Resume-on-Replace genutzt.
+        """
+        self._state.current_album = None
+        synthetic = Track(id=str(path), title=title or str(path), path=str(path), index=0)
+        self._state.current_track = synthetic
+        self._state.playing = True
+        self._state.paused = False
+        if start_seconds and start_seconds > 0:
+            # mpv "start"-Property gilt für die nächste loadfile-Action
+            self._mpv["start"] = str(start_seconds)
+        else:
+            self._mpv["start"] = "0"
+        self._mpv.play(str(path))
+
+    def current_position_seconds(self) -> float:
+        """Aktuelle Wiedergabeposition in Sekunden (oder 0 wenn nichts läuft)."""
+        try:
+            pos = self._mpv.time_pos
+            return float(pos) if pos is not None else 0.0
+        except Exception:
+            return 0.0
+
+    def seek_to(self, seconds: float) -> None:
+        """Setze die aktuelle Wiedergabeposition (z. B. für Track-Neustart)."""
+        try:
+            self._mpv.seek(seconds, "absolute")
+        except Exception as e:
+            logger.warning("Seek fehlgeschlagen: %s", e)
 
     def pause(self) -> None:
         if self._state.playing:
@@ -122,20 +168,45 @@ class Player:
         logger.info("Playing [%d/%d]: %s", self._state.track_index + 1,
                     len(album.tracks), track.title)
 
-    def _on_eof(self, _name, value) -> None:
-        if not value:
-            return
-        if self._on_track_end:
-            self._on_track_end()
-        # auto-advance to next track
-        album = self._state.current_album
-        if album and self._state.track_index < len(album.tracks) - 1:
-            self._state.track_index += 1
-            self._play_current()
-        else:
-            self._state.playing = False
-            self._state.current_track = None
-            logger.info("Playback finished")
+    def _eof_watch_loop(self) -> None:
+        """Pollt den mpv-Idle-Status und feuert ``_on_track_end``-Callback,
+        wenn ein Track natürlich zu Ende lief (idle-active wechselt False→True
+        während ``self._state.playing == True``).
+
+        Wird in einem Daemon-Thread ausgeführt. Lebt für die gesamte Player-
+        Lebensdauer; Selbstabbruch durch Garbage-Collection des Players.
+        """
+        prev_idle = True  # vor erstem play() ist mpv idle
+        while True:
+            try:
+                idle = bool(self._mpv.idle_active)
+            except Exception:
+                # mpv terminated → Loop beenden
+                return
+
+            if idle and not prev_idle and self._state.playing and not self._state.paused:
+                # Übergang Playing → Idle = Track-Ende
+                self._state.playing = False
+                self._state.current_track = None
+                logger.info("Track-Ende erkannt (mpv idle).")
+
+                # Callback-Aufruf außerhalb des Lock-State, damit der Callback
+                # neue play_file()-Aufrufe machen kann.
+                cb = self._on_track_end
+                if cb:
+                    try:
+                        cb()
+                    except Exception as e:
+                        logger.error("on_track_end callback fehlgeschlagen: %s", e)
+
+                # Album-Auto-Advance bleibt erhalten (für lokale Bibliothek).
+                album = self._state.current_album
+                if album and self._state.track_index < len(album.tracks) - 1:
+                    self._state.track_index += 1
+                    self._play_current()
+
+            prev_idle = idle
+            time.sleep(0.2)
 
     def __del__(self):
         try:

@@ -10,7 +10,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import requests
 
@@ -18,6 +18,7 @@ logger = logging.getLogger("kakabox.network")
 
 DEFAULT_BACKEND_URL = os.environ.get("KAKABOX_BACKEND", "http://localhost:8000")
 DEFAULT_TIMEOUT = 5.0
+DEFAULT_DOWNLOAD_TIMEOUT = 60.0  # MP3-Downloads dürfen länger dauern
 
 
 class BackendError(RuntimeError):
@@ -64,18 +65,23 @@ class Backend:
     def is_connected(self) -> bool:
         return bool(self.token)
 
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}"}
+
     # ------------------------------------------------------------------
-    # Public API
+    # Connection / heartbeat
     # ------------------------------------------------------------------
 
     def ensure_connected(self) -> bool:
-        """Connect once if no token is stored yet. Returns True on success."""
         if self.is_connected:
             return True
         return self.connect()
 
     def connect(self) -> bool:
-        """POST /api/box/connect with serial + activation code, store token."""
         serial = self._identity.get("serial_number")
         code = self._identity.get("activation_code")
         if not serial or not code:
@@ -95,7 +101,7 @@ class Backend:
         if resp.status_code == 401:
             logger.error(
                 "Backend rejected connect: serial/activation invalid or box not yet "
-                "registered in webapp. Register the box in the parent app first."
+                "registered in webapp."
             )
             return False
 
@@ -111,15 +117,13 @@ class Backend:
         return True
 
     def heartbeat(self, payload: dict[str, Any]) -> bool:
-        """POST /api/box/heartbeat. Returns True on 2xx."""
         if not self.is_connected:
             return False
-        url = f"{self._base_url}/api/box/heartbeat"
         try:
             resp = requests.post(
-                url,
+                f"{self._base_url}/api/box/heartbeat",
                 json=payload,
-                headers={"Authorization": f"Bearer {self.token}"},
+                headers=self._auth_headers(),
                 timeout=self._timeout,
             )
         except requests.RequestException as e:
@@ -127,27 +131,28 @@ class Backend:
             return False
 
         if resp.status_code == 401:
-            logger.error("Backend says token invalid — clearing local token.")
-            self._identity["api_token"] = None
-            self._save_identity()
+            self._clear_token("token invalid (heartbeat)")
             return False
 
         if not resp.ok:
-            logger.warning("heartbeat: HTTP %s — %s", resp.status_code, resp.text[:200])
+            logger.warning("heartbeat: HTTP %s", resp.status_code)
             return False
         return True
 
+    # ------------------------------------------------------------------
+    # Tag-Scan
+    # ------------------------------------------------------------------
+
     def tag_scan(self, uid: str) -> dict[str, Any] | None:
-        """POST /api/box/tag-scan. Returns parsed JSON, or None on transport error."""
+        """Return parsed JSON, or None on transport error."""
         if not self.is_connected:
             raise NotConnected("device has no api_token; call ensure_connected() first")
 
-        url = f"{self._base_url}/api/box/tag-scan"
         try:
             resp = requests.post(
-                url,
+                f"{self._base_url}/api/box/tag-scan",
                 json={"tag_uid": uid.upper()},
-                headers={"Authorization": f"Bearer {self.token}"},
+                headers=self._auth_headers(),
                 timeout=self._timeout,
             )
         except requests.RequestException as e:
@@ -155,14 +160,151 @@ class Backend:
             return None
 
         if resp.status_code == 401:
-            logger.error("Backend says token invalid — clearing local token.")
-            self._identity["api_token"] = None
-            self._save_identity()
+            self._clear_token("token invalid (tag_scan)")
             return None
 
-        # 200 (paired/play), 404 (unknown), 403 (foreign household) all return JSON
+        # Alle 200/403/404 antworten mit JSON-Body
         try:
             return resp.json()
         except ValueError:
             logger.error("tag_scan: non-JSON response (HTTP %s)", resp.status_code)
             return None
+
+    # ------------------------------------------------------------------
+    # Audio-Sync
+    # ------------------------------------------------------------------
+
+    def audio_manifest(self) -> dict[str, Any] | None:
+        """Liste der Audios, die diese Box haben sollte."""
+        if not self.is_connected:
+            return None
+        try:
+            resp = requests.get(
+                f"{self._base_url}/api/box/audio-manifest",
+                headers=self._auth_headers(),
+                timeout=self._timeout,
+            )
+        except requests.RequestException as e:
+            logger.warning("audio_manifest transport error: %s", e)
+            return None
+
+        if resp.status_code == 401:
+            self._clear_token("token invalid (audio_manifest)")
+            return None
+        if not resp.ok:
+            logger.warning("audio_manifest: HTTP %s", resp.status_code)
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            return None
+
+    def download_audio(self, content_id: int, target_path: Path) -> bool:
+        """Lädt eine MP3-Datei in target_path. Schreibt atomisch über .part-Tempfile."""
+        if not self.is_connected:
+            return False
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target_path.with_suffix(target_path.suffix + ".part")
+
+        try:
+            with requests.get(
+                f"{self._base_url}/api/box/audio/{content_id}/download",
+                headers=self._auth_headers(),
+                timeout=DEFAULT_DOWNLOAD_TIMEOUT,
+                stream=True,
+            ) as resp:
+                if resp.status_code == 401:
+                    self._clear_token("token invalid (download_audio)")
+                    return False
+                if not resp.ok:
+                    logger.warning("download_audio %s: HTTP %s", content_id, resp.status_code)
+                    return False
+                with tmp_path.open("wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=64 * 1024):
+                        if chunk:
+                            fh.write(chunk)
+        except requests.RequestException as e:
+            logger.warning("download_audio %s transport error: %s", content_id, e)
+            tmp_path.unlink(missing_ok=True)
+            return False
+
+        # Atomisches Rename
+        tmp_path.replace(target_path)
+        return True
+
+    def report_audio_cached(self, content_id: int, file_hash: str) -> bool:
+        """Bestätigt dem Backend, dass diese Box den Content jetzt lokal hat."""
+        if not self.is_connected:
+            return False
+        try:
+            resp = requests.post(
+                f"{self._base_url}/api/box/audio/{content_id}/cached",
+                json={"file_hash": file_hash},
+                headers=self._auth_headers(),
+                timeout=self._timeout,
+            )
+        except requests.RequestException as e:
+            logger.warning("report_audio_cached transport error: %s", e)
+            return False
+        return resp.ok
+
+    def report_storage(self, total_mb: int, free_mb: int) -> bool:
+        if not self.is_connected:
+            return False
+        try:
+            resp = requests.post(
+                f"{self._base_url}/api/box/storage-status",
+                json={"total_mb": total_mb, "free_mb": free_mb},
+                headers=self._auth_headers(),
+                timeout=self._timeout,
+            )
+        except requests.RequestException as e:
+            logger.warning("report_storage transport error: %s", e)
+            return False
+        return resp.ok
+
+    # ------------------------------------------------------------------
+    # Commands (Pull-Modell)
+    # ------------------------------------------------------------------
+
+    def fetch_commands(self) -> Iterable[dict[str, Any]]:
+        if not self.is_connected:
+            return []
+        try:
+            resp = requests.get(
+                f"{self._base_url}/api/box/commands",
+                headers=self._auth_headers(),
+                timeout=self._timeout,
+            )
+        except requests.RequestException as e:
+            logger.warning("fetch_commands transport error: %s", e)
+            return []
+        if not resp.ok:
+            return []
+        try:
+            return resp.json().get("commands", [])
+        except ValueError:
+            return []
+
+    def acknowledge_command(self, command_id: int) -> bool:
+        if not self.is_connected:
+            return False
+        try:
+            resp = requests.post(
+                f"{self._base_url}/api/box/commands/{command_id}/ack",
+                headers=self._auth_headers(),
+                timeout=self._timeout,
+            )
+        except requests.RequestException:
+            return False
+        return resp.ok
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _clear_token(self, reason: str) -> None:
+        logger.error("Clearing local token: %s", reason)
+        self._identity["api_token"] = None
+        self._save_identity()

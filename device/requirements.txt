@@ -4,3 +4,6 @@ python-mpv==1.0.7
 fastapi==0.115.0
 uvicorn==0.30.6
 requests==2.32.3
+# gpiozero + lgpio (Pi 5 RP1) kommen via System-Site-Packages — der venv ist
+# mit `include-system-site-packages = true` konfiguriert. Auf der Pi installieren:
+#   sudo apt install python3-gpiozero python3-lgpio

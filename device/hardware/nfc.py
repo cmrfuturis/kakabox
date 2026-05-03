@@ -117,32 +117,53 @@ class PN532:
     # ------------------------------------------------------------------
 
     def read_tag(self, timeout: float = 0.3) -> str | None:
+        """Poll for ONE ISO14443A tag. Returns UID hex string or None.
+
+        Behält das ursprüngliche Single-Tag-Verhalten für Code, der das erwartet.
         """
-        Poll for one ISO14443A tag. Returns UID as hex string (e.g. '04:AB:12:CD')
-        or None if no tag is present within timeout.
+        tags = self.read_tags(timeout=timeout, max_targets=1)
+        return tags[0] if tags else None
+
+    def read_tags(self, timeout: float = 0.3, max_targets: int = 2) -> list[str]:
+        """Poll for ISO14443A tags. Returns list of UIDs (max 2 — PN532-Limit).
+
+        Reihenfolge entspricht der Antwort des Readers. Mehrere Tags sind nur
+        verlässlich, wenn die Antikollision sie sauber trennt — einzelne Misses
+        sind möglich und sollten vom Aufrufer mit einem Grace-Counter abgefangen
+        werden.
         """
+        if max_targets < 1 or max_targets > 2:
+            raise ValueError("PN532 unterstützt nur 1 oder 2 Targets pro Poll")
+
         response = self._send_command(
             _CMD_INLISTPASSIVETARGET,
-            [0x01, 0x00],   # maxTg=1, BrTy=ISO14443A
+            [max_targets, 0x00],   # MaxTg, BrTy=ISO14443A
             timeout=timeout,
         )
         if not response or len(response) < 3:
-            return None
+            return []
 
-        # response[0] = TFI (0xD5), response[1] = 0x4B
-        # response[2] = number of targets
+        # response: TFI(1) + 0x4B(1) + num_targets(1) + per-target blocks
         num_targets = response[2]
         if num_targets == 0:
-            return None
+            return []
 
-        # response[7] = UID length, response[8:] = UID bytes
-        if len(response) < 9:
-            return None
-        uid_length = response[7]
-        uid_bytes = response[8: 8 + uid_length]
-        uid = ":".join(f"{b:02X}" for b in uid_bytes)
-        logger.debug("Tag detected: %s", uid)
-        return uid
+        uids: list[str] = []
+        pos = 3
+        for _ in range(num_targets):
+            # Block: target_num(1) + sens_res(2) + sel_res(1) + uid_len(1) + uid_bytes
+            if pos + 5 > len(response):
+                break
+            uid_len = response[pos + 4]
+            if uid_len == 0 or pos + 5 + uid_len > len(response):
+                break
+            uid_bytes = response[pos + 5: pos + 5 + uid_len]
+            uids.append(":".join(f"{b:02X}" for b in uid_bytes))
+            pos += 5 + uid_len
+            # Hinweis: ATS-Daten (Type-4-Cards) werden ignoriert. Mifare/NTAG
+            # haben kein ATS, daher passt der Block-Offset für unsere Chips.
+
+        return uids
 
     def close(self) -> None:
         self._bus.close()

@@ -21,6 +21,13 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Config with secrets
+# Config with secrets / local state
 device/config.local.json
+device/config.json
 device/box_identity.json
+
+# Lokal heruntergeladene Audio-Dateien (Cache vom Backend) — gehört nicht ins Repo
+device/audio_cache/
+
+# pytest cache
+.pytest_cache/
