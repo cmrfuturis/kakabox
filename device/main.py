@@ -41,6 +41,14 @@ from hardware.nfc import PN532
 from hardware.rotary_encoder import Encoder as RotaryEncoder
 from network import Backend, BackendError
 
+# Optional: REST-API (von Max) — startet eine FastAPI parallel zum main-Loop.
+# Wird best-effort geladen; falls Modul fehlt oder Port belegt ist, läuft die
+# Box weiter ohne API.
+try:
+    from api.routes import start as start_api  # noqa: F401
+except Exception as _api_err:
+    start_api = None  # type: ignore
+
 CONFIG_PATH = Path(__file__).parent / "config.json"
 IDENTITY_PATH = Path(__file__).parent / "box_identity.json"
 VOLUME_STEP = 5            # Encoder-Klick = 5 Prozentpunkte
@@ -171,6 +179,15 @@ class Kakabox:
         if self.backend and self.backend.is_connected:
             threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat").start()
             threading.Thread(target=self._audio_sync_loop, daemon=True, name="audio-sync").start()
+
+        # REST-API (Max's Feature) optional starten. Port-Konflikte oder
+        # fehlendes Modul sollen die Box nicht crashen lassen.
+        if start_api is not None:
+            try:
+                start_api(self)
+                logger.info("REST API started on http://0.0.0.0:8000")
+            except Exception as e:
+                logger.warning("REST API konnte nicht gestartet werden: %s", e)
 
         logger.info("Kakabox bereit. Chip auflegen oder Knopf drücken!")
         try:
