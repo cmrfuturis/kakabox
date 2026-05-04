@@ -10,7 +10,7 @@ Setup so, dass eine frisch entpackte Kakabox **ohne Bildschirm/Tastatur** ins He
 | `kakabox-comitup-callback` | Wird von comitup bei Statuswechsel HOTSPOT/CONNECTING/CONNECTED aufgerufen. Spielt Audio-Ansagen ab und startet/stoppt `kakabox.service`. |
 | `branding/templates/*.html` | Captive-Portal-Seiten mit Kakabox-Branding (deutsch, lila Theme). Ersetzen die Default-Comitup-Templates. |
 | `kakabox.service` | systemd-Unit für den main-Loop. Wird **nicht** beim Boot gestartet — sondern erst, wenn comitup meldet, dass das Heim-WLAN steht. |
-| `kakabox-reset-watcher.py` + `kakabox-reset.service` | Watcher auf den **roten Knopf**. 10 Sekunden gehalten → alle WLAN-Profile gelöscht + Reboot → kommt im Hotspot-Modus hoch. |
+| `kakabox-wifi-nuke` + `sudoers-kakabox` | Helper-Script (Root-only) das alle WLAN-Profile löscht und rebootet. main.py ruft es via NOPASSWD-sudo, wenn der **rote Knopf** ≥ 10 s gehalten wird. Sudoers ist eng eingegrenzt auf genau diesen Pfad. |
 | `install-wifi-onboarding.sh` | Master-Installer. Idempotent. |
 
 ## Installation

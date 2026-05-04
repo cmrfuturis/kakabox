@@ -8,7 +8,7 @@
 #   3. Generiert Audio-Ansagen (deutsch, via espeak-ng) für Hotspot/Connected
 #   4. Installiert State-Callback-Script und ersetzt comitup-Templates mit
 #      Kakabox-Branding
-#   5. Installiert systemd-Units kakabox.service + kakabox-reset.service
+#   5. Installiert systemd-Unit kakabox.service (nicht enabled — startet via Callback)
 #
 # WICHTIG — VOR DEM AUSFÜHREN LESEN:
 #   • Beim ersten Start nach Installation öffnet die Box einen offenen Hotspot
@@ -20,8 +20,10 @@
 #     gespeichertes WLAN erreichbar ist.
 #
 # RESET (zurück in Hotspot-Modus):
-#   • Roter Knopf 10 Sekunden gedrückt halten → kakabox-reset.service löscht
-#     alle WLAN-Profile und rebootet → Hotspot beim Hochfahren.
+#   • Roter Knopf 10 Sekunden gedrückt halten — main.py erkennt das via
+#     gpiozero hold_time und triggert /usr/local/bin/kakabox-wifi-nuke
+#     (sudoers-Drop-in erlaubt riffi NOPASSWD nur für genau diesen Pfad).
+#   • Helper löscht alle 802-11-wireless-Profile und rebootet → Hotspot.
 #
 # AUSFÜHREN:
 #   sudo bash device/setup/install-wifi-onboarding.sh
@@ -61,6 +63,16 @@ install -m 0644 "$SCRIPT_DIR/comitup.conf" "$COMITUP_CONF"
 step "Callback-Script installieren ($CALLBACK_PATH)"
 install -m 0755 "$SCRIPT_DIR/kakabox-comitup-callback" "$CALLBACK_PATH"
 
+step "WiFi-Nuke-Helper installieren (/usr/local/bin/kakabox-wifi-nuke)"
+install -m 0755 "$SCRIPT_DIR/kakabox-wifi-nuke" /usr/local/bin/kakabox-wifi-nuke
+install -m 0440 "$SCRIPT_DIR/sudoers-kakabox" /etc/sudoers.d/kakabox
+# Validate sudoers (sicher gegen kaputte Datei)
+visudo -cf /etc/sudoers.d/kakabox >/dev/null || {
+    echo "⚠ sudoers-Datei invalid — entferne sie wieder, um System nicht zu blocken"
+    rm -f /etc/sudoers.d/kakabox
+    exit 1
+}
+
 # ──────────────────────────────────────────────────────────────────────────
 # 3. Captive-Portal-Branding
 # ──────────────────────────────────────────────────────────────────────────
@@ -95,12 +107,17 @@ chmod 644 "$PROMPTS_DIR"/*.wav
 # 5. systemd-Units
 # ──────────────────────────────────────────────────────────────────────────
 step "5/6 systemd-Units installieren"
-install -m 0644 "$SCRIPT_DIR/kakabox.service"       "$SYSTEMD_DIR/kakabox.service"
-install -m 0644 "$SCRIPT_DIR/kakabox-reset.service" "$SYSTEMD_DIR/kakabox-reset.service"
-systemctl daemon-reload
+install -m 0644 "$SCRIPT_DIR/kakabox.service" "$SYSTEMD_DIR/kakabox.service"
 
-# Reset-Watcher startet immer (wenig Risiko, kann nur durch 10s Druck triggern)
-systemctl enable kakabox-reset.service
+# Alter separater Reset-Watcher wurde durch hold-Logik in main.py + dem
+# /usr/local/bin/kakabox-wifi-nuke Helper ersetzt. Vorhandene Installation
+# entfernen, falls schon mal ausgerollt.
+if [[ -f "$SYSTEMD_DIR/kakabox-reset.service" ]]; then
+    systemctl stop kakabox-reset.service 2>/dev/null || true
+    systemctl disable kakabox-reset.service 2>/dev/null || true
+    rm -f "$SYSTEMD_DIR/kakabox-reset.service"
+fi
+systemctl daemon-reload
 
 # kakabox.service NICHT enabled — wird via comitup-Callback gestartet, wenn
 # WLAN steht. So gibt's keinen "halben" Start ohne Netzwerk.
@@ -122,9 +139,8 @@ if [[ "${ANS,,}" != "j" && "${ANS,,}" != "y" ]]; then
     exit 0
 fi
 systemctl restart comitup
-
-# Reset-Watcher hochfahren (Kakabox.service kommt über Callback wenn WLAN da ist)
-systemctl restart kakabox-reset.service
+# kakabox.service wird vom comitup-Callback automatisch hochgefahren,
+# sobald comitup CONNECTED meldet — wir starten ihn hier nicht manuell.
 
 cat <<'EOF'
 

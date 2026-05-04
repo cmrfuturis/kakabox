@@ -1,0 +1,4 @@
+# Erlaubt main.py (User riffi) das WiFi-Nuke-Script ohne Passwort auszuführen.
+# Sehr eng eingegrenzt: NUR der eine, festgesetzte Pfad.
+# Wird vom Installer nach /etc/sudoers.d/kakabox installiert.
+riffi ALL=(root) NOPASSWD: /usr/local/bin/kakabox-wifi-nuke

@@ -157,6 +157,7 @@ class Kakabox:
             return
         self.buttons.on_green(self._on_green_pressed)
         self.buttons.on_red(self._on_red_pressed)
+        self.buttons.on_red_held(self._on_red_held)
         self.buttons.on_push(self._on_push_pressed)
 
     def _wire_encoder(self) -> None:
@@ -469,12 +470,28 @@ class Kakabox:
             playlist.previous()
 
     def _on_red_pressed(self) -> None:
-        """Rot: Nächster Track mit Loop."""
+        """Rot kurz: Nächster Track mit Loop."""
         logger.info("🔴 Rot")
         with self._playlist_lock:
             playlist = self._current_playlist
         if playlist:
             playlist.next()
+
+    def _on_red_held(self) -> None:
+        """Rot ≥ 10s: WLAN-Profile löschen + Reboot → Box kommt im Hotspot-Modus hoch.
+
+        Die eigentliche privilegierte Arbeit (nmcli delete + reboot) macht das
+        Helper-Script /usr/local/bin/kakabox-wifi-nuke. Sudoers-Drop-in
+        /etc/sudoers.d/kakabox erlaubt riffi NOPASSWD nur für genau diesen Pfad.
+        """
+        logger.warning("🔴🔴🔴 Rot 10s gehalten — WLAN-Reset wird ausgelöst.")
+        try:
+            subprocess.run(
+                ["sudo", "-n", "/usr/local/bin/kakabox-wifi-nuke"],
+                check=False, timeout=10,
+            )
+        except Exception as e:
+            logger.error("Reset fehlgeschlagen: %s", e)
 
     def _on_push_pressed(self) -> None:
         """Encoder-Druck: Pause/Resume-Toggle."""
