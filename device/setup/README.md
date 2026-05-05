@@ -10,7 +10,7 @@ Setup so, dass eine frisch entpackte Kakabox **ohne Bildschirm/Tastatur** ins He
 | `kakabox-comitup-callback` | Wird von comitup bei Statuswechsel HOTSPOT/CONNECTING/CONNECTED aufgerufen. Spielt nur die passenden Audio-Ansagen ab — der `kakabox.service` läuft unabhängig davon. |
 | `branding/templates/*.html` | Captive-Portal-Seiten mit Kakabox-Branding (deutsch, lila Theme). Ersetzen die Default-Comitup-Templates. |
 | `kakabox.service` | systemd-Unit für den main-Loop. Startet beim Boot (enabled) — Box muss auch ohne WLAN mit gecachten Kakas spielbar sein. |
-| `kakabox-wifi-nuke` + `sudoers-kakabox` | Helper-Script (Root-only) das alle WLAN-Profile löscht und rebootet. main.py ruft es via NOPASSWD-sudo, wenn der **rote Knopf** ≥ 10 s gehalten wird. Sudoers ist eng eingegrenzt auf genau diesen Pfad ohne Argumente. |
+| `kakabox-poweroff` + `kakabox-wifi-clear` + `sudoers-kakabox` | Zwei Helper-Scripts (Root-only): `kakabox-poweroff` macht `systemctl poweroff` (rot ≥ 10 s = Box aus), `kakabox-wifi-clear` löscht WLAN-Profile + restartet comitup ohne Reboot (grün ≥ 10 s = WLAN zurücksetzen, Box bleibt an). main.py ruft beide via NOPASSWD-sudo. Sudoers ist eng eingegrenzt auf genau diese zwei Pfade ohne Argumente. |
 | `install-wifi-onboarding.sh` | Master-Installer. Idempotent. |
 
 ## Installation
@@ -39,8 +39,16 @@ Was passiert:
 7. Hotspot schaltet ab, Box ist im Heim-WLAN — der bereits laufende `kakabox.service` kann jetzt mit dem Backend reden (Heartbeat / Audio-Sync). Aktuell muss der Service nach dem Online-Gehen einmal neugestartet werden, damit die Backend-Connection erneut versucht wird; siehe „Wenn etwas schiefgeht".
 
 ### WLAN ändern (Reset)
-1. **Roten Knopf 10 Sekunden halten** (auch im laufenden Betrieb)
-2. Box rebootet → kommt im Hotspot-Modus hoch → wie Erstinbetriebnahme
+1. **Grünen Knopf 10 Sekunden halten** (auch im laufenden Betrieb)
+2. Alle WLAN-Profile werden gelöscht, comitup wird neugestartet — Box bleibt **an** und öffnet wieder den Hotspot, wie bei Erstinbetriebnahme
+3. Im Captive-Portal neues WLAN auswählen → Verbindung wird ohne Reboot übernommen
+
+### Box ausschalten
+1. **Roten Knopf 10 Sekunden halten**
+2. Box fährt herunter (`systemctl poweroff`)
+
+### Box wieder einschalten
+Auf dem Pi 5: **physische PWR-Taste auf dem Board** drücken (Pi-5-Standard). Die Knöpfe der Box (grün/rot/encoder) sind normale GPIO-Inputs — die wachen den Pi nicht aus dem Halt-Zustand auf, weil im Halt der GPIO-Eventloop nicht mehr läuft. Wer den grünen Knopf als Wake-Trigger verwenden will, braucht eine Hardware-Anpassung (siehe „Wake-on-Green" weiter unten).
 
 ### Im Heim-Netz finden
 Nach erfolgreichem Onboarding ist die Box per mDNS unter `kakabox.local` erreichbar. Die lokale REST-API hängt an Port `8001` (Auth nötig — siehe unten).
@@ -110,6 +118,38 @@ Environment=KAKABOX_BACKEND=https://kakaland.de
 | `device/box_identity.json` | `0600` | Backend-Token, Seriennummer, Activation-Code |
 
 Beide sind in `.gitignore` und werden niemals committed.
+
+### Wake-on-Green (offen)
+
+**Ziel:** Box ist aus, Kind drückt den grünen Knopf, Box geht an.
+
+**Problem:** Auf dem Pi 5 läuft im Halt-Zustand kein Linux mehr. Nur die
+RP1-Peripherie und die PWR-Logik sind aktiv. „GPIO16 wird LOW → wake" ist
+nicht out-of-the-box möglich — der Standard-Mechanismus ist die
+**physische PWR-Taste** auf dem Board.
+
+Drei Wege das umzusetzen, alle mit Trade-off:
+
+1. **PWR-Taste durchschleifen** (empfohlen). Die PWR-Pads des Pi 5 sind
+   exponiert (J2). Daran einen kleinen Taster löten, im Gehäuse versteckt
+   oder als „Geheimknopf" hinten. Drücken im Halt → wake; drücken
+   während Lauf → Shutdown-Menü von systemd-logind. Kein Software-Konflikt
+   mit dem grünen Knopf.
+
+2. **`gpio-shutdown` overlay auf GREEN_PIN.** Würde in `/boot/firmware/config.txt`
+   `dtoverlay=gpio-shutdown,gpio_pin=16,active_low=1,gpio_pull=up` hinzufügen.
+   Folge: GPIO16 weckt zwar den Pi aus dem Halt — aber während des
+   Betriebs triggert *jeder* Druck Shutdown via Kernel. Die existierende
+   Track-Zurück-Funktion und der 10s-WLAN-Reset auf grün sind dann tot.
+   Eindeutig schlechter als Variante 1.
+
+3. **Externe Wake-HAT** (z. B. WittyPi, UPS-HAT). Overkill für den
+   Use-Case, aber sauber wenn man eh schon ein Power-Management-Board
+   einplant.
+
+Aktueller Code-Stand: `kakabox-poweroff` + Pi-5-PWR-Taste reichen für
+Erst-Iteration. Wenn ihr Variante 1 baut, ist auf Software-Seite **nichts
+zu ändern** — die PWR-Taste interagiert direkt mit dem Pi-Bootloader.
 
 ### Akzeptierte Restrisiken
 

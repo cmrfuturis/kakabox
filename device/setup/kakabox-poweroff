@@ -1,0 +1,13 @@
+#!/bin/bash
+# Kakabox Power-Off — wird von main.py via sudo aufgerufen, wenn der rote
+# Knopf 10s gehalten wird.
+#
+# Sudoers-Drop-in (siehe install-wifi-onboarding.sh) erlaubt riffi NOPASSWD
+# nur für genau diesen Pfad ohne Argumente.
+set -u
+
+LOG=/var/log/kakabox-poweroff.log
+echo "$(date -Is) Power-Off ausgelöst" >> "$LOG"
+
+sync
+exec systemctl poweroff

@@ -1,0 +1,24 @@
+#!/bin/bash
+# Kakabox WLAN-Clear — löscht alle WLAN-Profile und startet comitup neu, so
+# dass die Box in den Hotspot-Modus wechselt — OHNE Reboot. Eltern können
+# sich danach via Captive-Portal direkt neu einloggen.
+#
+# Wird von main.py via sudo aufgerufen, wenn der grüne Knopf 10s gehalten
+# wird. Sudoers-Drop-in erlaubt riffi NOPASSWD nur für genau diesen Pfad.
+set -u
+
+LOG=/var/log/kakabox-wifi-clear.log
+echo "$(date -Is) WLAN-Clear ausgelöst" >> "$LOG"
+
+# Alle 802-11-wireless-Connections aus NetworkManager entfernen
+nmcli -t -f TYPE,UUID connection show 2>/dev/null \
+| awk -F: '$1=="802-11-wireless"{print $2}' \
+| while read -r uuid; do
+    echo "$(date -Is) delete uuid=$uuid" >> "$LOG"
+    nmcli connection delete "$uuid" >> "$LOG" 2>&1 || true
+done
+
+# Comitup neu starten — ohne bekanntes WLAN-Profil geht es automatisch in
+# den Hotspot-Modus.
+echo "$(date -Is) systemctl restart comitup" >> "$LOG"
+exec systemctl restart comitup

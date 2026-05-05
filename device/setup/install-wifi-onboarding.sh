@@ -63,8 +63,11 @@ install -m 0644 "$SCRIPT_DIR/comitup.conf" "$COMITUP_CONF"
 step "Callback-Script installieren ($CALLBACK_PATH)"
 install -m 0755 "$SCRIPT_DIR/kakabox-comitup-callback" "$CALLBACK_PATH"
 
-step "WiFi-Nuke-Helper installieren (/usr/local/bin/kakabox-wifi-nuke)"
-install -m 0755 "$SCRIPT_DIR/kakabox-wifi-nuke" /usr/local/bin/kakabox-wifi-nuke
+step "Hardware-Helper installieren (poweroff + wifi-clear)"
+install -m 0755 "$SCRIPT_DIR/kakabox-poweroff"   /usr/local/bin/kakabox-poweroff
+install -m 0755 "$SCRIPT_DIR/kakabox-wifi-clear" /usr/local/bin/kakabox-wifi-clear
+# Alten wifi-nuke entfernen, falls aus früherer Installation noch da
+rm -f /usr/local/bin/kakabox-wifi-nuke
 install -m 0440 "$SCRIPT_DIR/sudoers-kakabox" /etc/sudoers.d/kakabox
 # Validate sudoers (sicher gegen kaputte Datei)
 visudo -cf /etc/sudoers.d/kakabox >/dev/null || {

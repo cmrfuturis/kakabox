@@ -6,7 +6,10 @@ Eingaben:
     NFC-Tag auflegen → Backend-Lookup → spielt zugeordnete Lieder ab
     NFC-Tag entfernen → Wiedergabe stoppt; Position wird gemerkt für Resume
     🟢 Grün-Knopf       → Track zurück, oder Neustart wenn Track > 5s läuft (loop)
+    🟢 Grün ≥ 10s halten → WLAN-Profile löschen (kein Reboot — Box bleibt an,
+                          comitup öffnet Hotspot zum Re-Onboarding)
     🔴 Rot-Knopf        → Nächster Track (loop)
+    🔴 Rot ≥ 10s halten → Box ausschalten (poweroff)
     🟦 Encoder-Push    → Pause/Play-Toggle
     🟦 Encoder im UZS  → Lauter
     🟦 Encoder gegen UZS → Leiser
@@ -189,6 +192,7 @@ class Kakabox:
         if self.buttons is None:
             return
         self.buttons.on_green(self._on_green_pressed)
+        self.buttons.on_green_held(self._on_green_held)
         self.buttons.on_red(self._on_red_pressed)
         self.buttons.on_red_held(self._on_red_held)
         self.buttons.on_push(self._on_push_pressed)
@@ -514,20 +518,37 @@ class Kakabox:
             playlist.next()
 
     def _on_red_held(self) -> None:
-        """Rot ≥ 10s: WLAN-Profile löschen + Reboot → Box kommt im Hotspot-Modus hoch.
+        """Rot ≥ 10s: Box ausschalten (poweroff).
 
-        Die eigentliche privilegierte Arbeit (nmcli delete + reboot) macht das
-        Helper-Script /usr/local/bin/kakabox-wifi-nuke. Sudoers-Drop-in
-        /etc/sudoers.d/kakabox erlaubt riffi NOPASSWD nur für genau diesen Pfad.
+        Die privilegierte Arbeit macht /usr/local/bin/kakabox-poweroff. Der
+        sudoers-Drop-in erlaubt riffi NOPASSWD nur für genau diesen Pfad.
         """
-        logger.warning("🔴🔴🔴 Rot 10s gehalten — WLAN-Reset wird ausgelöst.")
+        logger.warning("🔴🔴🔴 Rot 10s gehalten — Box wird ausgeschaltet.")
         try:
             subprocess.run(
-                ["sudo", "-n", "/usr/local/bin/kakabox-wifi-nuke"],
+                ["sudo", "-n", "/usr/local/bin/kakabox-poweroff"],
                 check=False, timeout=10,
             )
         except Exception as e:
-            logger.error("Reset fehlgeschlagen: %s", e)
+            logger.error("Power-off fehlgeschlagen: %s", e)
+
+    def _on_green_held(self) -> None:
+        """Grün ≥ 10s: WLAN-Profile löschen, OHNE Reboot.
+
+        Comitup wird neu gestartet — weil dann kein WLAN-Profil mehr da ist,
+        geht es automatisch in den Hotspot-Modus (Box bleibt eingeschaltet,
+        Eltern können sich neu mit dem Captive-Portal verbinden).
+
+        Die privilegierte Arbeit macht /usr/local/bin/kakabox-wifi-clear.
+        """
+        logger.warning("🟢🟢🟢 Grün 10s gehalten — WLAN-Reset (ohne Reboot).")
+        try:
+            subprocess.run(
+                ["sudo", "-n", "/usr/local/bin/kakabox-wifi-clear"],
+                check=False, timeout=15,
+            )
+        except Exception as e:
+            logger.error("WLAN-Clear fehlgeschlagen: %s", e)
 
     def _on_push_pressed(self) -> None:
         """Encoder-Druck: Pause/Resume-Toggle."""

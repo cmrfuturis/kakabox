@@ -1,4 +1,5 @@
-# Erlaubt main.py (User riffi) das WiFi-Nuke-Script ohne Passwort auszuführen.
-# Sehr eng eingegrenzt: NUR der eine, festgesetzte Pfad.
+# Erlaubt main.py (User riffi) zwei Hardware-Aktionen ohne Passwort.
+# Sehr eng eingegrenzt: NUR diese zwei festen Pfade ohne Argumente.
 # Wird vom Installer nach /etc/sudoers.d/kakabox installiert.
-riffi ALL=(root) NOPASSWD: /usr/local/bin/kakabox-wifi-nuke
+riffi ALL=(root) NOPASSWD: /usr/local/bin/kakabox-poweroff
+riffi ALL=(root) NOPASSWD: /usr/local/bin/kakabox-wifi-clear
