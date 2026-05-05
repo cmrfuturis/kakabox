@@ -1,0 +1,8 @@
+# Optional voice/ASR dependencies — install in den venv mit:
+#   .venv/bin/pip install -r device/requirements-voice.txt
+#
+# Vosk zieht numpy nach (~30 MB Wheel). Auf Pi 5 dauert die Installation
+# ca. 2–3 Minuten. Wer den Voice-Layer nicht nutzt, lässt das einfach weg —
+# device/voice/asr.py importiert Vosk lazy und wirft VoiceUnavailable, wenn
+# das Paket fehlt.
+vosk==0.3.45

@@ -22,13 +22,13 @@ def identity_path(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def backend(identity_path: Path) -> Backend:
-    return Backend(identity_path=identity_path, base_url="http://test")
+    return Backend(identity_path=identity_path, base_url="https://test")
 
 
 @responses.activate
 def test_tag_scan_provider_paired(backend):
     responses.post(
-        "http://test/api/box/tag-scan",
+        "https://test/api/box/tag-scan",
         json={
             "status": "paired",
             "kind": "provider",
@@ -49,7 +49,7 @@ def test_tag_scan_provider_paired(backend):
 @responses.activate
 def test_tag_scan_unknown_returns_dict(backend):
     responses.post(
-        "http://test/api/box/tag-scan",
+        "https://test/api/box/tag-scan",
         json={"status": "unknown", "message": "Tag ist nicht angelernt."},
         status=404,
     )
@@ -60,7 +60,7 @@ def test_tag_scan_unknown_returns_dict(backend):
 @responses.activate
 def test_tag_scan_foreign_household(backend):
     responses.post(
-        "http://test/api/box/tag-scan",
+        "https://test/api/box/tag-scan",
         json={"status": "foreign_household"},
         status=403,
     )
@@ -71,7 +71,7 @@ def test_tag_scan_foreign_household(backend):
 @responses.activate
 def test_tag_scan_invalid_token_clears_local_token(backend, identity_path):
     responses.post(
-        "http://test/api/box/tag-scan",
+        "https://test/api/box/tag-scan",
         json={"error": "Ungültiger API-Token."},
         status=401,
     )
@@ -87,7 +87,7 @@ def test_tag_scan_invalid_token_clears_local_token(backend, identity_path):
 @responses.activate
 def test_audio_manifest_returns_parsed_response(backend):
     responses.get(
-        "http://test/api/box/audio-manifest",
+        "https://test/api/box/audio-manifest",
         json={
             "manifest": [{"content_id": 1, "title": "Lied", "file_hash": "h", "priority": "high"}],
             "total_files": 1,
@@ -103,7 +103,7 @@ def test_audio_manifest_returns_parsed_response(backend):
 def test_download_audio_writes_file_atomically(backend, tmp_path):
     payload = b"\xff\xfb\x90\x44 fake mp3 content"
     responses.get(
-        "http://test/api/box/audio/42/download",
+        "https://test/api/box/audio/42/download",
         body=payload,
         status=200,
     )
@@ -120,7 +120,7 @@ def test_download_audio_writes_file_atomically(backend, tmp_path):
 @responses.activate
 def test_report_audio_cached_posts_hash(backend):
     responses.post(
-        "http://test/api/box/audio/7/cached",
+        "https://test/api/box/audio/7/cached",
         json={"status": "ok"},
         status=200,
     )
@@ -132,7 +132,7 @@ def test_report_audio_cached_posts_hash(backend):
 @responses.activate
 def test_report_storage_posts_mb_values(backend):
     responses.post(
-        "http://test/api/box/storage-status",
+        "https://test/api/box/storage-status",
         json={"status": "ok"},
         status=200,
     )
