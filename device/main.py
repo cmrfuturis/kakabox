@@ -51,6 +51,7 @@ except Exception as _api_err:
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 IDENTITY_PATH = Path(__file__).parent / "box_identity.json"
+PROMPTS_DIR = Path("/usr/share/kakabox/prompts")  # vom Installer befüllt
 VOLUME_STEP = 5            # Encoder-Klick = 5 Prozentpunkte
 HEARTBEAT_INTERVAL = 30
 AUDIO_SYNC_INTERVAL = 300  # 5 Minuten
@@ -148,6 +149,22 @@ class Kakabox:
             logger.warning("%s unavailable: %s — feature disabled", label, e)
             return None
 
+    def _play_prompt(self, filename: str) -> None:
+        """Spielt eine Boot-/Status-Ansage über den Player (gleiches ALSA-Device wie mpv).
+
+        Wird verwendet bevor irgendeine Playlist läuft — der EOF-Callback des Players
+        ist dann ein No-Op. Fehlt die Datei (Installer nicht durchgelaufen), wird
+        leise übergangen.
+        """
+        path = PROMPTS_DIR / filename
+        if not path.is_file():
+            logger.debug("Prompt nicht gefunden: %s", path)
+            return
+        try:
+            self.player.play_file(str(path), title=path.stem)
+        except Exception as e:
+            logger.warning("Prompt-Wiedergabe fehlgeschlagen (%s): %s", filename, e)
+
     # ------------------------------------------------------------------
     # Input-Verdrahtung
     # ------------------------------------------------------------------
@@ -181,16 +198,19 @@ class Kakabox:
             threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat").start()
             threading.Thread(target=self._audio_sync_loop, daemon=True, name="audio-sync").start()
 
-        # REST-API (Max's Feature) optional starten. Port-Konflikte oder
-        # fehlendes Modul sollen die Box nicht crashen lassen.
+        # REST-API (Max's Feature) optional starten. Auf Port 8001, damit der
+        # Pi-Backend-Client (KAKABOX_BACKEND, default localhost:8000) weiterhin
+        # mit der Laravel-Webapp auf 8000 sprechen kann ohne Konflikt. Wer die
+        # API von außen ansprechen will, nutzt http://kakabox.local:8001.
         if start_api is not None:
             try:
-                start_api(self)
-                logger.info("REST API started on http://0.0.0.0:8000")
+                start_api(self, host="0.0.0.0", port=8001)
+                logger.info("REST API started on http://0.0.0.0:8001")
             except Exception as e:
                 logger.warning("REST API konnte nicht gestartet werden: %s", e)
 
         logger.info("Kakabox bereit. Chip auflegen oder Knopf drücken!")
+        self._play_prompt("ready_to_rumble.wav")
         try:
             while self._running:
                 time.sleep(0.5)

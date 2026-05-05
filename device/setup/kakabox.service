@@ -1,15 +1,16 @@
 # systemd-Unit für die Kakabox-Hauptanwendung.
 #
-# Wird NICHT per Default beim Boot gestartet — sondern erst wenn comitup
-# meldet, dass das Heim-WLAN steht (siehe kakabox-comitup-callback).
+# Startet beim Boot (enabled), unabhängig vom WLAN — die Box soll auch ohne
+# Internet mit den lokal gecachten Kakas funktionieren. Backend-Funktionen
+# (Sync, Heartbeat) sind innerhalb von main.py best-effort und legen lahm,
+# wenn kein WLAN da ist.
 #
 # Manuell:
 #   sudo systemctl start kakabox.service
 #   sudo journalctl -u kakabox -f
 [Unit]
 Description=Kakabox device main loop
-After=network-online.target sound.target
-Wants=network-online.target
+After=sound.target
 
 [Service]
 Type=simple

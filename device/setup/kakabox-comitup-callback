@@ -3,8 +3,11 @@
 # Argument: HOTSPOT | CONNECTING | CONNECTED
 #
 # Verantwortung:
-#   - Audio-Feedback abspielen
-#   - kakabox.service starten/stoppen je nach WLAN-Status
+#   - Audio-Feedback zum WLAN-Status abspielen
+#
+# Der kakabox.service läuft unabhängig vom WLAN-Status (enabled beim Boot),
+# damit die Box auch offline mit gecachten Kakas spielbar ist. Dieser Callback
+# spielt nur die passende Ansage; Start/Stop des Service macht er nicht mehr.
 #
 # Wird aus /etc/comitup.conf via external_callback geladen.
 
@@ -26,17 +29,15 @@ play_prompt() {
 
 case "$STATE" in
     HOTSPOT)
-        log "Hotspot-Modus aktiv — kakabox.service stoppen"
-        systemctl stop kakabox.service 2>>"$LOG" || true
+        log "Hotspot-Modus aktiv — Setup-Ansage"
         play_prompt setup_active.wav
         ;;
     CONNECTING)
         log "Verbindungsversuch ..."
         ;;
     CONNECTED)
-        log "Mit Heim-WLAN verbunden — kakabox.service starten"
+        log "Mit Heim-WLAN verbunden"
         play_prompt wifi_connected.wav
-        systemctl start kakabox.service 2>>"$LOG" || true
         ;;
     *)
         log "Unbekannter State: $STATE"

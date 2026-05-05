@@ -101,6 +101,10 @@ espeak-ng -v de -s 145 -p 50 -w "$PROMPTS_DIR/setup_active.wav" \
 espeak-ng -v de -s 145 -p 50 -w "$PROMPTS_DIR/wifi_connected.wav" \
     "WLAN ist verbunden. Die Kakabox ist jetzt einsatzbereit."
 
+# Boot-Greeting — wird von main.py beim Service-Start abgespielt (englisch, kurz, "Box-Ansager"-Style)
+espeak-ng -v en -s 140 -p 35 -w "$PROMPTS_DIR/ready_to_rumble.wav" \
+    "Ready to rumble!"
+
 chmod 644 "$PROMPTS_DIR"/*.wav
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -119,10 +123,10 @@ if [[ -f "$SYSTEMD_DIR/kakabox-reset.service" ]]; then
 fi
 systemctl daemon-reload
 
-# kakabox.service NICHT enabled — wird via comitup-Callback gestartet, wenn
-# WLAN steht. So gibt's keinen "halben" Start ohne Netzwerk.
-# Manueller Test trotzdem mit: sudo systemctl start kakabox.service
-systemctl disable kakabox.service 2>/dev/null || true
+# kakabox.service beim Boot starten — Box muss auch ohne WLAN spielen können
+# (lokal gecachte Kakas). Backend-Sync läuft automatisch sobald WLAN da ist
+# bzw. beim nächsten Restart.
+systemctl enable kakabox.service 2>/dev/null || true
 
 # ──────────────────────────────────────────────────────────────────────────
 # 6. Comitup neu starten
