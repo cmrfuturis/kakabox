@@ -1,16 +1,28 @@
 #!/usr/bin/env python3
-"""Kakabox REST API — served by uvicorn in a background daemon thread."""
+"""Kakabox REST API — served by uvicorn in a background daemon thread.
+
+Auth-Modell:
+    Alle Endpoints erfordern einen Bearer-Token im ``Authorization``-Header.
+    Der Token wird beim ersten Start in ``config.json`` als ``api_token``
+    angelegt (32 zufällige urlsafe-Bytes) und ist vom Pi aus per
+    ``jq -r .api_token /home/riffi/Dokumente/kakabox/device/config.json``
+    abrufbar. Ohne Token gibt's 401 — sonst könnte jeder im Heim-WLAN die
+    Box steuern (inkl. parental-Override), und das ist für ein Kindergerät
+    inakzeptabel.
+"""
 
 from __future__ import annotations
 
 import json
+import secrets
 import threading
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
@@ -18,8 +30,32 @@ if TYPE_CHECKING:
 
 _CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 
-app = FastAPI(title="Kakabox API", version="1.0.0")
+_security = HTTPBearer(auto_error=False)
 _box: Kakabox | None = None
+
+
+def _check_auth(
+    creds: HTTPAuthorizationCredentials | None = Depends(_security),
+) -> None:
+    """FastAPI-Dependency: prüft Bearer-Token gegen config['api_token'].
+
+    Konstantzeit-Vergleich via ``secrets.compare_digest``, damit kein
+    Timing-Leak. Fehlt der Token in der Config → 503 (Server falsch
+    konfiguriert), nicht 401, weil der Client da nichts gegen tun kann.
+    """
+    box = _get_box()
+    expected = box.config.get("api_token")
+    if not expected:
+        raise HTTPException(status_code=503, detail="API token not initialised")
+    if creds is None or not secrets.compare_digest(creds.credentials, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+
+app = FastAPI(
+    title="Kakabox API",
+    version="1.0.0",
+    dependencies=[Depends(_check_auth)],
+)
 
 
 def start(box: Kakabox, host: str = "0.0.0.0", port: int = 8000) -> None:

@@ -23,10 +23,43 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
-# Sicherheit: nur Lesen vom System, schreiben nur in eigene Dirs
+# ──────────────────────────────────────────────────────────────────────────
+# Hardening — Kindergerät, deshalb so eng wie möglich.
+# Sollte irgendwann jemand RCE in main.py finden, soll der Schaden begrenzt
+# bleiben. Jede Option einzeln getestet — die unten erwähnten brechen
+# Hardware/Audio und sind absichtlich nicht gesetzt.
+# ──────────────────────────────────────────────────────────────────────────
+# /usr, /boot, /etc read-only
 ProtectSystem=full
+# andere Home-Dirs nicht zugreifbar
 ProtectHome=read-only
+# einziger r/w-Pfad: das eigene Device-Verzeichnis (config.json, audio_cache, …)
 ReadWritePaths=/home/riffi/Dokumente/kakabox/device
+# eigener /tmp-Namespace, nichts persistiert über Restart
+PrivateTmp=true
+# cgroups read-only — kein Tampering mit Resource-Limits
+ProtectControlGroups=true
+# /proc/sys/kernel/hostname read-only
+ProtectHostname=true
+# Systemzeit unveränderbar
+ProtectClock=true
+# /dev/kmsg gesperrt — keine Spurenverwischung
+ProtectKernelLogs=true
+# personality(2) eingefroren
+LockPersonality=true
+# keine neuen Namespaces — kein Container-Escape-Trick
+RestrictNamespaces=true
+# kein Realtime-Scheduling, sonst lässt sich der Scheduler quälen
+RestrictRealtime=true
+# neu erstellte Dateien nur für riffi lesbar (config.json enthält API-Token)
+UMask=0077
+
+# Bewusst NICHT gesetzt: NoNewPrivileges=true
+#   → würde den sudo-Aufruf für /usr/local/bin/kakabox-wifi-nuke
+#     (Roter Knopf 10s halten = WLAN-Reset) blockieren. Ersatz wäre ein
+#     root-Daemon hinter einer Pipe — aktuell nicht gerechtfertigter
+#     Mehrwert, weil der sudoers-Drop-in eng auf genau diesen einen Pfad
+#     ohne Argumente eingegrenzt ist (siehe sudoers-kakabox).
 
 [Install]
 WantedBy=multi-user.target

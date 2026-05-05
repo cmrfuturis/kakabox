@@ -21,6 +21,7 @@ Resume-on-Replace:
 """
 import json
 import logging
+import secrets
 import signal
 import subprocess
 import sys
@@ -96,6 +97,7 @@ class Kakabox:
     def __init__(self):
         logger.info("Starting Kakabox...")
         self.config = load_config()
+        self._ensure_api_token()
 
         self.library = scan()
         logger.info(
@@ -140,6 +142,20 @@ class Kakabox:
         # Hardware-Inputs verdrahten
         self._wire_buttons()
         self._wire_encoder()
+
+    def _ensure_api_token(self) -> None:
+        """Erzeugt einmalig einen Bearer-Token für die lokale REST-API.
+
+        Ohne Token wäre die FastAPI auf Port 8001 für jeden im Heim-WLAN voll
+        steuerbar (inkl. parental-Override) — siehe api/routes.py. 32 urlsafe-
+        Bytes (~256 bit) reichen, der Token bleibt für die Lifetime der Box
+        in config.json liegen.
+        """
+        if self.config.get("api_token"):
+            return
+        self.config["api_token"] = secrets.token_urlsafe(32)
+        save_config(self.config)
+        logger.info("Neuer API-Token in config.json angelegt.")
 
     @staticmethod
     def _safe_init(label: str, factory):

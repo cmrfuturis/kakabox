@@ -29,6 +29,31 @@ class NotConnected(BackendError):
     """Raised when an authenticated call is made before the box has a token."""
 
 
+def _validate_url(url: str) -> str:
+    """Lehnt unsichere Backend-URLs ab.
+
+    Plain HTTP würde Bearer-Token, Tag-Scans und MP3-Manifeste durchs Heim-WLAN
+    klartext schicken — und damit auch die Hash-Verifikation kompromittieren
+    (MITM kann Manifest + Datei kohärent austauschen). Erlaubt sind nur:
+
+    - ``https://*`` für Produktion
+    - ``http://localhost`` / ``http://127.0.0.1`` für lokales Dev (Pi spricht
+      mit Webapp auf demselben Host — kein Netz dazwischen).
+
+    Bei unzulässiger URL → ``BackendError``. Wird in ``main.py`` per try/except
+    gefangen → Box läuft offline weiter, statt unsicher rauszutelefonieren.
+    """
+    url = url.rstrip("/")
+    if url.startswith("https://"):
+        return url
+    if url.startswith(("http://localhost", "http://127.0.0.1")):
+        return url
+    raise BackendError(
+        f"Refusing insecure backend URL '{url}'. "
+        "Use https:// for production or http://localhost for local dev."
+    )
+
+
 class Backend:
     def __init__(
         self,
@@ -37,7 +62,7 @@ class Backend:
         timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
         self._identity_path = Path(identity_path)
-        self._base_url = (base_url or DEFAULT_BACKEND_URL).rstrip("/")
+        self._base_url = _validate_url(base_url or DEFAULT_BACKEND_URL)
         self._timeout = timeout
         self._identity: dict[str, Any] = self._load_identity()
 
