@@ -61,6 +61,15 @@ HEARTBEAT_INTERVAL = 30
 AUDIO_SYNC_INTERVAL = 300  # 5 Minuten
 TAG_REMOVAL_THRESHOLD = 2  # NFC: aufeinanderfolgende Leer-Reads bis "Chip entfernt"
 
+# Geheimer Speed-Mode (Easter Egg): 4× Encoder-Push in 3s während Wiedergabe →
+# danach steuert der Encoder die Wiedergabegeschwindigkeit statt Lautstärke.
+# Exit: nochmal Push, oder Chip vom Reader nehmen.
+SPEED_BURST_COUNT = 4
+SPEED_BURST_WINDOW = 3.0
+SPEED_STEP = 0.1
+SPEED_MIN = 0.5
+SPEED_MAX = 2.0
+
 
 def read_wifi_ssid() -> str | None:
     try:
@@ -139,6 +148,11 @@ class Kakabox:
         self._last_kaka_memory: Optional[KakaMemory] = None
         self._playlist_lock = threading.Lock()
 
+        # Speed-Mode-State (siehe SPEED_* Konstanten)
+        self._speed_mode = False
+        self._speed = 1.0
+        self._push_times: list[float] = []
+
         # Track-Ende-Callback an Player binden
         self.player.on_track_end(self._on_track_end)
 
@@ -203,8 +217,22 @@ class Kakabox:
         # gpiozero "clockwise" entspricht der physischen Drehung im Uhrzeigersinn
         # (mit CLK=GPIO17, DT=GPIO27 stimmt das hier; in einem früheren Test war
         # ich kurz verwirrt — diese Variante ist die richtige).
-        self.encoder.on_clockwise(lambda: self._adjust_volume(+VOLUME_STEP))
-        self.encoder.on_counterclockwise(lambda: self._adjust_volume(-VOLUME_STEP))
+        # Im Speed-Mode steuert der Encoder die Wiedergabegeschwindigkeit
+        # statt der Lautstärke — siehe _on_encoder_*.
+        self.encoder.on_clockwise(self._on_encoder_cw)
+        self.encoder.on_counterclockwise(self._on_encoder_ccw)
+
+    def _on_encoder_cw(self) -> None:
+        if self._speed_mode:
+            self._adjust_speed(+SPEED_STEP)
+        else:
+            self._adjust_volume(+VOLUME_STEP)
+
+    def _on_encoder_ccw(self) -> None:
+        if self._speed_mode:
+            self._adjust_speed(-SPEED_STEP)
+        else:
+            self._adjust_volume(-VOLUME_STEP)
 
     # ------------------------------------------------------------------
     # Run
@@ -452,6 +480,11 @@ class Kakabox:
 
     def _on_tag_removed(self, uid: Optional[str]) -> None:
         """Aktiver Chip vom Reader weg → Snapshot speichern + Wiedergabe stoppen."""
+        # Speed-Mode beenden — Snapshot/Resume soll mit Normalgeschwindigkeit
+        # weiterlaufen, nicht im 200%-Chipmunk-Modus.
+        if self._speed_mode:
+            self._exit_speed_mode()
+
         with self._playlist_lock:
             playlist = self._current_playlist
             self._current_playlist = None
@@ -551,9 +584,60 @@ class Kakabox:
             logger.error("WLAN-Clear fehlgeschlagen: %s", e)
 
     def _on_push_pressed(self) -> None:
-        """Encoder-Druck: Pause/Resume-Toggle."""
+        """Encoder-Druck.
+
+        Normalfall: Pause/Resume-Toggle.
+        Im Speed-Mode: einmal drücken = zurück in den Normal-Modus.
+        4× drücken in 3s während Wiedergabe: Speed-Mode betreten.
+        """
+        now = time.monotonic()
+
+        if self._speed_mode:
+            logger.info("🟦 Push — exit Speed-Mode")
+            self._exit_speed_mode()
+            return
+
+        # Sliding-Window: nur Pushes der letzten SPEED_BURST_WINDOW behalten
+        self._push_times.append(now)
+        self._push_times = [t for t in self._push_times if t > now - SPEED_BURST_WINDOW]
+
+        playlist_active = False
+        with self._playlist_lock:
+            playlist_active = self._current_playlist is not None
+
+        if len(self._push_times) >= SPEED_BURST_COUNT and playlist_active:
+            logger.info("🟦×%d → Speed-Mode aktiv", SPEED_BURST_COUNT)
+            self._push_times.clear()
+            self._enter_speed_mode()
+            return
+
         logger.info("🟦 Push (Pause/Play)")
         self.player.toggle_pause()
+
+    def _enter_speed_mode(self) -> None:
+        self._speed_mode = True
+        self._speed = 1.0
+        self.player.set_speed(1.0)
+        # Während des 4-Burst hat sich der Pause-Toggle u. U. ungeradzahlig
+        # umgestellt — sicherstellen, dass die Wiedergabe wirklich läuft.
+        if self.player.get_state().paused:
+            self.player.resume()
+
+    def _exit_speed_mode(self) -> None:
+        self._speed_mode = False
+        self._speed = 1.0
+        self.player.set_speed(1.0)
+        logger.info("⏩ Speed zurück auf 100%%")
+
+    def _adjust_speed(self, delta: float) -> None:
+        # Auf 2 Nachkommastellen runden, sonst bekommen wir durch float-Drift
+        # Werte wie 1.0999999 statt 1.10.
+        new_speed = round(max(SPEED_MIN, min(SPEED_MAX, self._speed + delta)), 2)
+        if abs(new_speed - self._speed) < 1e-6:
+            return
+        self._speed = new_speed
+        self.player.set_speed(new_speed)
+        logger.info("⏩ Speed: %d%%", int(round(new_speed * 100)))
 
     def _adjust_volume(self, delta: int) -> None:
         new_vol = max(0, min(100, self._volume + delta))

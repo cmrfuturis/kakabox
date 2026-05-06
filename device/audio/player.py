@@ -145,6 +145,15 @@ class Player:
         self._state.volume = volume
         self._mpv.volume = volume
 
+    def set_speed(self, speed: float) -> None:
+        """Wiedergabegeschwindigkeit (1.0 = normal). Nur fürs Speed-Mode-
+        Easter-Egg gedacht — Kinder finden die Tonhöhenverschiebung lustig."""
+        speed = max(0.25, min(4.0, float(speed)))
+        try:
+            self._mpv.speed = speed
+        except Exception as e:
+            logger.warning("set_speed failed: %s", e)
+
     def get_state(self) -> PlaybackState:
         return self._state
 

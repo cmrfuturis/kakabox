@@ -11,6 +11,11 @@
 [Unit]
 Description=Kakabox device main loop
 After=sound.target
+# StartLimit-Fenster auf Unit-Ebene: höchstens 10 Restart-Versuche in 2 Min,
+# danach lässt systemd den Service "failed". Verhindert Endlos-Restart-Loops,
+# falls main.py beim Start sauber crasht (z.B. kaputte config.json).
+StartLimitBurst=10
+StartLimitIntervalSec=120
 
 [Service]
 Type=simple
@@ -18,7 +23,10 @@ User=riffi
 Group=riffi
 WorkingDirectory=/home/riffi/Dokumente/kakabox/device
 ExecStart=/home/riffi/Dokumente/kakabox/device/.venv/bin/python /home/riffi/Dokumente/kakabox/device/main.py
-Restart=on-failure
+# Always: auch bei sauberem Exit neu starten (z.B. unerwartetes return aus
+# main()). systemd supervised PID-event-driven — kein Polling, keine
+# Performance-Kosten. Manuelles 'systemctl stop' wird respektiert.
+Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal

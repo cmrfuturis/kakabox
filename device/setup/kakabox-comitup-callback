@@ -3,11 +3,22 @@
 # Argument: HOTSPOT | CONNECTING | CONNECTED
 #
 # Verantwortung:
-#   - Audio-Feedback zum WLAN-Status abspielen
+#   - Audio-Feedback zum WLAN-Status abspielen — aber nur dann, wenn der
+#     Nutzer es wirklich braucht. Wenn die Box mit bekanntem WLAN bootet,
+#     wechselt comitup kurz durch HOTSPOT bevor sie sich verbindet. Wir
+#     wollen dann KEINEN "bitte verbinden"-Prompt — und auch kein "WLAN
+#     verbunden", denn main.py spielt schon "Ready to rumble" beim Boot.
 #
-# Der kakabox.service läuft unabhängig vom WLAN-Status (enabled beim Boot),
-# damit die Box auch offline mit gecachten Kakas spielbar ist. Dieser Callback
-# spielt nur die passende Ansage; Start/Stop des Service macht er nicht mehr.
+# Strategie:
+#   - HOTSPOT: Prompt um 12s verzögern (Hintergrund). Wenn bis dahin
+#     CONNECTING oder CONNECTED feuert, wird der pending-Prompt gecancelt.
+#   - CONNECTED: nur dann "WLAN verbunden" abspielen, wenn vorher der
+#     HOTSPOT-Prompt tatsächlich lief (= echter Onboarding-Flow, nicht
+#     Auto-Connect beim Boot).
+#
+# Lautstärke: Wir respektieren die in config.json gespeicherte Volume —
+# sonst sind die Prompts ungewollt laut, weil sie sonst die System-
+# Standard-Lautstärke nehmen würden.
 #
 # Wird aus /etc/comitup.conf via external_callback geladen.
 
@@ -16,28 +27,81 @@ set -u
 STATE="${1:-}"
 LOG=/var/log/kakabox-callback.log
 PROMPTS=/usr/share/kakabox/prompts
+STATE_DIR=/run/kakabox
+CONFIG=/home/riffi/Dokumente/kakabox/device/config.json
+HOTSPOT_DELAY=12
+
+mkdir -p "$STATE_DIR"
 
 log() { echo "$(date -Is) [$STATE] $*" >> "$LOG"; }
+
+apply_user_volume() {
+    # Volume aus config.json lesen (default 50 wenn fehlt/kaputt). Card 0 +
+    # PCM-Control entsprechen dem, was main.py nutzt (hardware/audio_output.py).
+    local vol
+    vol=$(python3 -c "
+import json, sys
+try:
+    print(int(json.load(open('$CONFIG')).get('volume', 50)))
+except Exception:
+    print(50)
+" 2>/dev/null || echo 50)
+    amixer -c 0 sset PCM "${vol}%" >/dev/null 2>&1 || true
+    log "ALSA PCM auf ${vol}% gesetzt"
+}
 
 play_prompt() {
     local file="$PROMPTS/$1"
     [ -f "$file" ] || { log "prompt missing: $file"; return; }
+    apply_user_volume
     # Auf MAX98357A direkt — hartkodiert, weil wir den Card-Index zur Boot-Zeit
     # nicht kennen, aber den Kartennamen
     aplay -q -D plughw:CARD=MAX98357A,DEV=0 "$file" 2>&1 | tee -a "$LOG"
 }
 
+cancel_pending_hotspot() {
+    if [ -f "$STATE_DIR/hotspot_pid" ]; then
+        local pid
+        pid=$(cat "$STATE_DIR/hotspot_pid" 2>/dev/null || true)
+        if [ -n "${pid:-}" ]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$STATE_DIR/hotspot_pid"
+    fi
+    rm -f "$STATE_DIR/hotspot_pending"
+}
+
 case "$STATE" in
     HOTSPOT)
-        log "Hotspot-Modus aktiv — Setup-Ansage"
-        play_prompt setup_active.wav
+        log "Hotspot-Modus aktiv — Setup-Ansage in ${HOTSPOT_DELAY}s (falls wir bis dahin nicht verbunden sind)"
+        # Vorherige State-Marker putzen — neuer HOTSPOT-Zyklus
+        rm -f "$STATE_DIR/hotspot_announced"
+        cancel_pending_hotspot
+        touch "$STATE_DIR/hotspot_pending"
+        (
+            sleep "$HOTSPOT_DELAY"
+            # Marker noch da? Dann waren wir die ganze Zeit im Hotspot.
+            if [ -f "$STATE_DIR/hotspot_pending" ]; then
+                rm -f "$STATE_DIR/hotspot_pending" "$STATE_DIR/hotspot_pid"
+                touch "$STATE_DIR/hotspot_announced"
+                play_prompt setup_active.wav
+            fi
+        ) &
+        echo $! > "$STATE_DIR/hotspot_pid"
         ;;
     CONNECTING)
-        log "Verbindungsversuch ..."
+        log "Verbindungsversuch — pending Hotspot-Prompt verwerfen"
+        cancel_pending_hotspot
         ;;
     CONNECTED)
         log "Mit Heim-WLAN verbunden"
-        play_prompt wifi_connected.wav
+        cancel_pending_hotspot
+        if [ -f "$STATE_DIR/hotspot_announced" ]; then
+            rm -f "$STATE_DIR/hotspot_announced"
+            play_prompt wifi_connected.wav
+        else
+            log "Auto-Connect ohne vorherigen Hotspot-Prompt — keine Ansage"
+        fi
         ;;
     *)
         log "Unbekannter State: $STATE"
