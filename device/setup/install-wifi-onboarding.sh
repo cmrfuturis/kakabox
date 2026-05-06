@@ -88,27 +88,60 @@ if [[ -d "$COMITUP_TEMPLATES_DIR" ]]; then
     install -m 0644 "$SCRIPT_DIR/branding/templates/index.html" "$COMITUP_TEMPLATES_DIR/index.html"
     install -m 0644 "$SCRIPT_DIR/branding/templates/confirm.html" "$COMITUP_TEMPLATES_DIR/confirm.html"
     install -m 0644 "$SCRIPT_DIR/branding/templates/connect.html" "$COMITUP_TEMPLATES_DIR/connect.html"
+
+    # Fredoka-Font für Captive-Portal lokal ablegen — der Hotspot hat kein
+    # Internet, deshalb wird der Font einmalig beim Install heruntergeladen.
+    # Ablage unter css/, weil comitupweb.py nur /css /js /img als statische
+    # Routen exposiert (siehe send_from_directory in comitupweb.py). Variable
+    # Font, latin subset, Gewichte 300-700 in einer Datei (~30KB).
+    FREDOKA_DEST="$COMITUP_TEMPLATES_DIR/css/Fredoka.woff2"
+    FREDOKA_URL="https://cdn.jsdelivr.net/npm/@fontsource-variable/fredoka/files/fredoka-latin-wght-normal.woff2"
+    if curl --fail --silent --show-error --location --retry 2 --max-time 20 \
+            -o "$FREDOKA_DEST" "$FREDOKA_URL"; then
+        chmod 0644 "$FREDOKA_DEST"
+        echo "  ✓ Fredoka.woff2 ($(stat -c%s "$FREDOKA_DEST") Bytes) abgelegt"
+    else
+        echo "  ⚠ Fredoka konnte nicht geladen werden — Templates fallen auf system-ui zurück"
+        rm -f "$FREDOKA_DEST"
+    fi
 else
     echo "⚠ Templates-Dir $COMITUP_TEMPLATES_DIR nicht gefunden — Branding übersprungen"
 fi
 
 # ──────────────────────────────────────────────────────────────────────────
-# 4. Audio-Ansagen via espeak-ng
+# 4. Audio-Ansagen
+#    Bevorzugt eigene WAV-Dateien aus branding/audio/ (von Hand eingesprochen).
+#    Fehlt eine Datei dort, generiert espeak-ng eine TTS-Variante als Fallback,
+#    damit die Box auch ohne Custom-Audio funktioniert.
 # ──────────────────────────────────────────────────────────────────────────
-step "4/6 Audio-Ansagen generieren"
+step "4/6 Audio-Ansagen installieren"
 mkdir -p "$PROMPTS_DIR"
 
-espeak-ng -v de -s 145 -p 50 -w "$PROMPTS_DIR/setup_active.wav" \
+AUDIO_SRC="$SCRIPT_DIR/branding/audio"
+
+# Mapping: Quelldatei (im Repo) → Zielname (von main.py + comitup-callback erwartet)
+#   espeak-Fallback-Args: -v <lang> -s <speed> -p <pitch> "<text>"
+install_prompt() {
+    local src_name="$1" dest_name="$2" lang="$3" speed="$4" pitch="$5" text="$6"
+    local src="$AUDIO_SRC/$src_name"
+    local dest="$PROMPTS_DIR/$dest_name"
+    if [[ -f "$src" ]]; then
+        install -m 0644 "$src" "$dest"
+        echo "  ✓ $dest_name (aus branding/audio/$src_name)"
+    else
+        espeak-ng -v "$lang" -s "$speed" -p "$pitch" -w "$dest" "$text"
+        echo "  ⚠ $dest_name (espeak-Fallback — branding/audio/$src_name fehlt)"
+    fi
+}
+
+install_prompt "Offline mit Wlan verbinden.wav" setup_active.wav    de 145 50 \
     "Hallo. Ich bin im Einrichtungsmodus. Bitte verbinde dich mit dem WLAN Kakabox und öffne den Browser, um dein WLAN auszuwählen."
 
-espeak-ng -v de -s 145 -p 50 -w "$PROMPTS_DIR/wifi_connected.wav" \
+install_prompt "Wlan verbunden.wav"             wifi_connected.wav  de 145 50 \
     "WLAN ist verbunden. Die Kakabox ist jetzt einsatzbereit."
 
-# Boot-Greeting — wird von main.py beim Service-Start abgespielt (englisch, kurz, "Box-Ansager"-Style)
-espeak-ng -v en -s 140 -p 35 -w "$PROMPTS_DIR/ready_to_rumble.wav" \
+install_prompt "ready to rumble.wav"            ready_to_rumble.wav en 140 35 \
     "Ready to rumble!"
-
-chmod 644 "$PROMPTS_DIR"/*.wav
 
 # ──────────────────────────────────────────────────────────────────────────
 # 5. systemd-Units

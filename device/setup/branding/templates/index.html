@@ -1,69 +1,145 @@
 <!DOCTYPE html>
-<html lang="de" class="uk-height-1-1">
+<html lang="de">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Kakabox einrichten</title>
     <link rel="icon" href="img/favicon.ico">
-    <link rel="stylesheet" type="text/css" href="css/uikit.css">
-    <script src="js/blink.js"></script>
     <style>
-        body { background: linear-gradient(135deg, #7c5cfc 0%, #4338ca 100%); font-family: 'Helvetica Neue', sans-serif; color: #fff; }
-        .kb-card { background: #fff; color: #1f2937; border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,0.15); padding: 2rem 1.5rem; }
-        .kb-emoji { font-size: 3rem; line-height: 1; }
-        .kb-title { font-size: 1.5rem; font-weight: 700; color: #111827; }
-        .kb-subtitle { color: #6b7280; font-size: 0.95rem; }
-        .uk-button-primary { background-color: #7c5cfc; border-color: #7c5cfc; }
-        .uk-button-primary:hover { background-color: #4338ca; border-color: #4338ca; }
-        .kb-help { font-size: 0.8rem; color: #9ca3af; margin-top: 1.25rem; line-height: 1.4; }
+        /* Fredoka — vom Installer nach /css/Fredoka.woff2 gelegt. Variable
+           Font (Gewichte 300-700 in einer Datei, latin-subset, ~30KB). Fallback
+           auf system-ui, falls der Download beim Install fehlschlug. */
+        @font-face {
+            font-family: 'Fredoka';
+            src: url('css/Fredoka.woff2') format('woff2-variations'),
+                 url('css/Fredoka.woff2') format('woff2');
+            font-weight: 300 700;
+            font-style: normal;
+            font-display: swap;
+        }
+        :root {
+            --bg-solid: #f5f3ff;
+            --surface: #ffffff;
+            --ink: #1e1b4b;
+            --ink-2: #475569;
+            --line: #e2e8f0;
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #8b5cf6;
+            --accent: #a78bfa;
+            --radius-sm: 12px;
+            --radius: 20px;
+            --grad-sunset: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+            --grad-soft: linear-gradient(180deg, #f5f3ff 0%, #e0e7ff 100%);
+            --shadow-sm: 0 2px 12px rgba(30, 27, 75, 0.06);
+            --shadow: 0 12px 40px rgba(99, 102, 241, 0.15);
+            --shadow-lg: 0 24px 60px rgba(139, 92, 246, 0.22);
+        }
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; height: 100%; }
+        body {
+            background: var(--grad-soft);
+            color: var(--ink);
+            font-family: 'Fredoka', system-ui, -apple-system, 'Segoe UI', 'Helvetica Neue', sans-serif;
+            -webkit-font-smoothing: antialiased;
+            line-height: 1.5;
+        }
+        .wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px 16px; }
+        .stack { width: 100%; max-width: 460px; }
+        .card {
+            background: var(--surface);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            padding: 28px 24px;
+        }
+        .pill {
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 6px 14px; border-radius: 999px;
+            background: var(--surface);
+            border: 1px solid var(--line);
+            color: var(--ink-2);
+            font-size: 0.82rem; font-weight: 500;
+            box-shadow: var(--shadow-sm);
+        }
+        .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--primary); }
+        .head { text-align: center; margin-bottom: 22px; }
+        h1 { font-size: 1.6rem; font-weight: 700; margin: 14px 0 6px; color: var(--ink); letter-spacing: -0.01em; }
+        .lead { color: var(--ink-2); font-size: 0.95rem; margin: 0; }
+        .accent { background: var(--grad-sunset); -webkit-background-clip: text; background-clip: text; color: transparent; }
+        .wifi-list { display: flex; flex-direction: column; gap: 8px; margin: 18px 0 6px; }
+        .wifi {
+            display: flex; align-items: center; gap: 10px;
+            padding: 13px 18px; border-radius: 999px;
+            background: var(--surface); border: 1.5px solid var(--line);
+            color: var(--ink); text-decoration: none;
+            font-weight: 500; font-size: 0.95rem;
+            transition: border-color 0.15s ease, transform 0.15s ease, box-shadow 0.2s ease;
+        }
+        .wifi:hover { border-color: var(--primary); transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+        .wifi .lock { color: var(--secondary); font-size: 1rem; line-height: 1; }
+        .divider { display: flex; align-items: center; gap: 12px; color: var(--ink-2); font-size: 0.82rem; margin: 18px 0 10px; }
+        .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+        .row { display: flex; gap: 8px; }
+        .input {
+            flex: 1; min-width: 0;
+            padding: 12px 18px;
+            border: 1.5px solid var(--line); border-radius: 999px;
+            font: inherit; color: var(--ink); background: var(--surface);
+            outline: none; transition: border-color 0.15s ease;
+        }
+        .input:focus { border-color: var(--primary); }
+        .btn {
+            display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+            padding: 12px 22px; border-radius: 999px;
+            font: inherit; font-weight: 600; font-size: 0.95rem;
+            border: 0; cursor: pointer; text-decoration: none;
+            transition: transform 0.15s ease, box-shadow 0.2s ease;
+            white-space: nowrap;
+        }
+        .btn-primary { background: var(--grad-sunset); color: #fff; box-shadow: var(--shadow); }
+        .btn-primary:hover { transform: translateY(-1px); box-shadow: var(--shadow-lg); }
+        .btn-ghost { background: transparent; color: var(--ink); border: 1.5px solid var(--line); }
+        .btn-ghost:hover { border-color: var(--primary); }
+        .help { font-size: 0.82rem; color: var(--ink-2); margin-top: 16px; line-height: 1.55; padding: 12px 14px; background: var(--bg-solid); border-radius: var(--radius-sm); }
+        .help strong { color: var(--ink); }
+        .footer { text-align: center; margin-top: 16px; font-size: 0.78rem; color: var(--ink-2); opacity: 0.8; }
+        .footer a { color: var(--secondary); text-decoration: none; font-weight: 500; }
     </style>
 </head>
-<body class="uk-height-1-1">
-<div class="uk-flex uk-flex-center uk-flex-middle" style="min-height: 100vh;">
-    <div class="uk-width-large uk-padding-small">
-        <div class="kb-card">
-            <div class="uk-text-center uk-margin-bottom">
-                <div class="kb-emoji">📦</div>
-                <div class="kb-title uk-margin-small-top">Kakabox einrichten</div>
-                <div class="kb-subtitle">Wähle dein Heim-WLAN aus der Liste</div>
+<body>
+<div class="wrap">
+    <div class="stack">
+        <div class="card">
+            <div class="head">
+                <span class="pill"><span class="dot"></span> Kakabox · Einrichtung</span>
+                <h1>Verbinde mit deinem <span class="accent">Heim-WLAN</span></h1>
+                <p class="lead">Wähle dein Netz aus der Liste.</p>
             </div>
 
-            <div class="uk-margin">
+            <div class="wifi-list">
                 {% for point in points %}
-                    {% if point.security == 'encrypted' %}
-                        <a href="confirm?ssid={{ point.ssid_encoded }}&encrypted={{ point.security }}">
-                            <button class="uk-button uk-button-primary uk-width-1-1 uk-margin-small-bottom" style="text-transform: none;"><span uk-icon="icon: lock"></span> {{ point.ssid }}</button>
-                        </a>
-                    {% else %}
-                        <a href="confirm?ssid={{ point.ssid_encoded }}&encrypted={{ point.security }}">
-                            <button class="uk-button uk-button-primary uk-width-1-1 uk-margin-small-bottom" style="text-transform: none;">{{ point.ssid }}</button>
-                        </a>
-                    {% endif %}
+                    <a class="wifi" href="confirm?ssid={{ point.ssid_encoded }}&encrypted={{ point.security }}">
+                        {% if point.security == 'encrypted' %}<span class="lock">🔒</span>{% endif %}
+                        <span>{{ point.ssid }}</span>
+                    </a>
                 {% endfor %}
             </div>
 
+            <div class="divider">oder manuell</div>
+
             <form action="/confirm">
-                <div class="uk-text-small uk-text-muted uk-margin-small">Oder manuell eintragen:</div>
-                <div class="uk-grid uk-grid-small uk-margin-small">
-                    <div class="uk-width-2-3@s">
-                        <input class="uk-input" type="text" name="ssid" placeholder="WLAN-Name (SSID)" required>
-                    </div>
-                    <div class="uk-width-1-3@s">
-                        <button class="uk-button uk-button-default uk-width-1-1" type="submit">Weiter</button>
-                    </div>
+                <div class="row">
+                    <input class="input" type="text" name="ssid" placeholder="WLAN-Name (SSID)" required>
+                    <button class="btn btn-primary" type="submit">Weiter</button>
                 </div>
                 <input type="hidden" name="encrypted" value="encrypted">
             </form>
 
-            <div class="kb-help">
-                <strong>Tipp:</strong> Wenn dein WLAN nicht erscheint, schalte den Router kurz aus und wieder an oder gib es manuell ein.
-                Sobald die Kakabox verbunden ist, schaltet sich dieser Hotspot ab und du kannst dieses Browserfenster schließen.
+            <div class="help">
+                <strong>Tipp:</strong> Sobald die Kakabox verbunden ist, schaltet sich dieser Hotspot ab — du kannst dieses Browserfenster dann schließen.
             </div>
         </div>
-
-        <div class="uk-text-center uk-margin-top" style="opacity: 0.85;">
-            <span class="uk-text-small">Kakabox &middot; powered by <a href="https://davesteele.github.io/comitup/" style="color: #fff; text-decoration: underline;">Comitup</a></span>
-        </div>
+        <div class="footer">Kakabox · powered by <a href="https://davesteele.github.io/comitup/">Comitup</a></div>
     </div>
 </div>
 </body>
