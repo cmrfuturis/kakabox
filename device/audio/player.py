@@ -126,6 +126,33 @@ class Player:
         self._state.current_track = None
         logger.info("Stopped")
 
+    def wait_until_idle(self, timeout: float = 8.0) -> None:
+        """Blockt bis mpv die laufende Wiedergabe beendet hat (oder Timeout).
+
+        Genutzt vom Bye-Prompt-Flow vor dem Poweroff: ohne dieses Warten
+        würde systemctl poweroff mpv abschießen, bevor der Prompt fertig ist.
+        Das kurze Anlauffenster (0.5s) deckt den Zeitraum zwischen play_file()
+        und dem mpv-internen Wechsel idle→playing ab — sonst würde die
+        Hauptwarte sofort zurückkehren, weil idle_active noch True ist.
+        """
+        start_deadline = time.monotonic() + 0.5
+        while time.monotonic() < start_deadline:
+            try:
+                if not self._mpv.idle_active:
+                    break
+            except Exception:
+                return
+            time.sleep(0.05)
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if self._mpv.idle_active:
+                    return
+            except Exception:
+                return
+            time.sleep(0.1)
+
     def next_track(self) -> None:
         album = self._state.current_album
         if album and self._state.track_index < len(album.tracks) - 1:

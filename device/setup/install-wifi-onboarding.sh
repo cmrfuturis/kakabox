@@ -143,6 +143,9 @@ install_prompt "Wlan verbunden.wav"             wifi_connected.wav  de 145 50 \
 install_prompt "ready to rumble.wav"            ready_to_rumble.wav en 140 35 \
     "Ready to rumble!"
 
+install_prompt "tschau kakau.wav"               tschau_kakau.wav    de 145 50 \
+    "Tschau Kakau!"
+
 # ──────────────────────────────────────────────────────────────────────────
 # 5. systemd-Units
 # ──────────────────────────────────────────────────────────────────────────

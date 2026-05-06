@@ -551,12 +551,28 @@ class Kakabox:
             playlist.next()
 
     def _on_red_held(self) -> None:
-        """Rot ≥ 10s: Box ausschalten (poweroff).
+        """Rot ≥ 10s: Bye-Prompt → poweroff.
 
         Die privilegierte Arbeit macht /usr/local/bin/kakabox-poweroff. Der
         sudoers-Drop-in erlaubt riffi NOPASSWD nur für genau diesen Pfad.
+
+        Vor dem Poweroff wird tschau_kakau.wav abgespielt. Dafür müssen wir
+        die laufende Playlist hart räumen, sonst feuert der EOF-Callback
+        nach dem Bye-Prompt und versucht den nächsten Kaka-Track zu starten —
+        die Box würde dann mitten im Lied ausgehen statt sauber zu verabschieden.
         """
         logger.warning("🔴🔴🔴 Rot 10s gehalten — Box wird ausgeschaltet.")
+
+        with self._playlist_lock:
+            playlist = self._current_playlist
+            self._current_playlist = None
+            self._active_tag_uid = None
+        if playlist:
+            playlist.stop()
+
+        self._play_prompt("tschau_kakau.wav")
+        self.player.wait_until_idle(timeout=8.0)
+
         try:
             subprocess.run(
                 ["sudo", "-n", "/usr/local/bin/kakabox-poweroff"],
