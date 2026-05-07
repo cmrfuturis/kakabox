@@ -427,12 +427,16 @@ class Kakabox:
             try:
                 uids = self.nfc.read_tags(timeout=0.5, max_targets=1)
             except Exception as e:
-                logger.error("NFC error: %s", e)
-                time.sleep(0.2)
-                continue
+                # Hardware-Glitch (I2C busy, Timeout, …) darf nicht dazu
+                # führen, dass die Box weiterspielt obwohl der Chip schon
+                # weg ist. Behandle wie "kein Tag gesehen" — die Misses
+                # zählen unten regulär weiter.
+                logger.warning("NFC error: %s — werte als leere Lesung", e)
+                uids = []
 
             now = time.monotonic()
             current = set(uids)
+            logger.debug("NFC poll: uids=%s seen=%s active=%s", uids, list(seen_at), active_uid)
 
             for uid in uids:
                 if uid not in seen_at:
@@ -446,6 +450,7 @@ class Kakabox:
                     continue
                 misses[uid] = misses.get(uid, 0) + 1
                 if misses[uid] >= TAG_REMOVAL_THRESHOLD:
+                    logger.info("NFC: Chip %s nach %d Misses verloren.", uid, misses[uid])
                     del seen_at[uid]
                     misses.pop(uid, None)
 
