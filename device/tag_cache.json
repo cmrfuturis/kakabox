@@ -1,0 +1,32 @@
+{
+  "84:08:50:06": {
+    "fingerprint": "1f87d5c1b09c058e3174e3a49587da366284fa9a2f4f6b2e4de8920e069be151",
+    "kaka": {
+      "name": "Schlafdongel",
+      "contents": [
+        {
+          "id": 1,
+          "title": "Probiers mal mit Gemütlichkeit",
+          "duration_seconds": 200,
+          "audio_file": "audio/Das Dschungelbuch - Probiers mal mit Gemütlichkeit - Balu und Mogli.mp3",
+          "file_size_bytes": 3066440,
+          "file_hash": "6ba816701ec68d387720ce72d93a5b731854c434e23a55fae0b8d55c3e0fccdd",
+          "download_url": "https://kakaland.de/api/box/audio/1/download",
+          "cached_locally": false,
+          "sort_order": 1
+        },
+        {
+          "id": 2,
+          "title": "Die Katze tanzt allein",
+          "duration_seconds": 180,
+          "audio_file": "audio/Die Katze tanzt allein - HipPo-Pop feat. Nilpferd  Kinderlieder.mp3",
+          "file_size_bytes": 5503593,
+          "file_hash": "ec04f84c895d3f643eef591cb7f5d6387bbd0c167068ff0711d7c7f9c40426e2",
+          "download_url": "https://kakaland.de/api/box/audio/2/download",
+          "cached_locally": false,
+          "sort_order": 2
+        }
+      ]
+    }
+  }
+}

@@ -22,6 +22,7 @@ Resume-on-Replace:
     Wird die zuletzt aktive Kaka kurz darauf wieder aufgelegt → läuft am
     gleichen Track + Position weiter. Andere Kaka → Memory wird verworfen.
 """
+import hashlib
 import json
 import logging
 import secrets
@@ -55,6 +56,7 @@ except Exception as _api_err:
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 IDENTITY_PATH = Path(__file__).parent / "box_identity.json"
+TAG_CACHE_PATH = Path(__file__).parent / "tag_cache.json"
 PROMPTS_DIR = Path("/usr/share/kakabox/prompts")  # vom Installer befüllt
 VOLUME_STEP = 5            # Encoder-Klick = 5 Prozentpunkte
 HEARTBEAT_INTERVAL = 30
@@ -97,6 +99,26 @@ def save_config(config: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False))
 
 
+def kaka_fingerprint(kaka: dict) -> str:
+    """Stabiler Hash über die abspielrelevanten Felder einer Kaka.
+
+    Reihenfolge, Hinzufügen oder Entfernen eines Liedes ändert den Hash —
+    stimmt der Server-Fingerprint mit dem lokalen überein, kann der Tag-
+    Cache unverändert bleiben (kein Resync).
+    """
+    items = [
+        (
+            int(c.get("id") or 0),
+            int(c.get("sort_order") or 0),
+            (c.get("file_hash") or "").lower(),
+        )
+        for c in kaka.get("contents") or []
+    ]
+    items.sort()
+    payload = json.dumps(items, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 @dataclass
 class KakaMemory:
     """Zwischengespeicherter Wiedergabe-Stand der zuletzt entfernten Kaka."""
@@ -110,6 +132,7 @@ class Kakabox:
         logger.info("Starting Kakabox...")
         self.config = load_config()
         self._ensure_api_token()
+        self._tag_cache = self._load_tag_cache()
 
         self.library = scan()
         logger.info(
@@ -159,6 +182,53 @@ class Kakabox:
         # Hardware-Inputs verdrahten
         self._wire_buttons()
         self._wire_encoder()
+
+    def _load_tag_cache(self) -> dict:
+        if not TAG_CACHE_PATH.exists():
+            return {}
+        try:
+            data = json.loads(TAG_CACHE_PATH.read_text())
+            return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Tag-Cache nicht ladbar: %s — starte leer.", e)
+            return {}
+
+    def _save_tag_cache(self) -> None:
+        try:
+            TAG_CACHE_PATH.write_text(
+                json.dumps(self._tag_cache, indent=2, ensure_ascii=False)
+            )
+        except OSError as e:
+            logger.warning("Tag-Cache speichern fehlgeschlagen: %s", e)
+
+    def _update_tag_cache(self, uid: str, kaka: dict) -> None:
+        """Cache-Eintrag schreiben, wenn sich der Fingerprint geändert hat.
+
+        Stimmt Server- und Local-Fingerprint überein → keine Schreibarbeit.
+        Bei Änderung wird der Eintrag komplett ersetzt; das deckt Reihenfolge,
+        Hinzufügen und Löschen einzelner Lieder ab.
+        """
+        fingerprint = kaka_fingerprint(kaka)
+        entry = self._tag_cache.get(uid)
+        if entry and entry.get("fingerprint") == fingerprint:
+            return
+        self._tag_cache[uid] = {
+            "fingerprint": fingerprint,
+            "kaka": {
+                "name": kaka.get("name", ""),
+                "contents": kaka.get("contents", []),
+            },
+        }
+        self._save_tag_cache()
+        logger.info(
+            "Tag-Cache: %s aktualisiert (%d Lieder, fingerprint=%s…)",
+            uid, len(kaka.get("contents") or []), fingerprint[:8],
+        )
+
+    def _drop_tag_cache(self, uid: str) -> None:
+        if self._tag_cache.pop(uid, None) is not None:
+            self._save_tag_cache()
+            logger.info("Tag-Cache: %s entfernt", uid)
 
     def _ensure_api_token(self) -> None:
         """Erzeugt einmalig einen Bearer-Token für die lokale REST-API.
@@ -329,6 +399,18 @@ class Kakabox:
                 else:
                     self.backend.report_audio_cached(content_id, file_hash)
 
+        # Veraltete Dateien entfernen — der Manifest ist die Quelle der Wahrheit.
+        # So werden Lieder, die in der Web-App aus allen Kakas entfernt wurden,
+        # auch lokal aufgeräumt.
+        keep_ids = {
+            entry.get("content_id")
+            for entry in files
+            if entry.get("content_id")
+        }
+        deleted = self.audio_cache.cleanup(keep_ids)
+        if deleted:
+            logger.info("Sync: %d veraltete Audio-Dateien entfernt", deleted)
+
         total_mb, free_mb = self.audio_cache.storage_stats_mb()
         self.backend.report_storage(total_mb, free_mb)
 
@@ -413,15 +495,19 @@ class Kakabox:
 
         if status == "play":
             logger.info("Tag %s → spiele '%s'", uid, kaka_name)
+            self._update_tag_cache(uid, kaka)
             self._start_kaka_playlist(uid, kaka)
         elif status == "paired":
             kind = response.get("kind", "?")
             logger.info("Tag %s angelernt (kind=%s, name='%s')", uid, kind, kaka_name)
+            self._update_tag_cache(uid, kaka)
             self._start_kaka_playlist(uid, kaka)
         elif status == "unknown":
             logger.info("Tag %s unbekannt. Auto-Pairing in der App aktivieren.", uid)
+            self._drop_tag_cache(uid)
         elif status == "foreign_household":
             logger.warning("Tag %s gehört zu einem anderen Haushalt.", uid)
+            self._drop_tag_cache(uid)
         else:
             logger.warning("Tag %s: unerwartete Backend-Antwort: %s", uid, response)
 
@@ -455,7 +541,7 @@ class Kakabox:
             playlist = Playlist(
                 contents=contents,
                 cache=self.audio_cache,
-                download_fn=lambda cid, path: self.backend.download_audio(cid, path),
+                download_fn=lambda cid, path: bool(self.backend) and self.backend.download_audio(cid, path),
                 play_fn=self.player.play_file,
                 stop_fn=self.player.stop,
                 position_fn=self.player.current_position_seconds,
@@ -517,6 +603,36 @@ class Kakabox:
             playlist.on_track_end()
 
     def _fallback_local_lookup(self, uid: str) -> None:
+        """Backend nicht erreichbar → erst Tag-Cache, dann Legacy-Album-Mapping.
+
+        Tag-Cache wird beim erfolgreichen Online-Scan gepflegt; offline können
+        wir damit ohne Backend abspielen, solange die Audio-Dateien im
+        audio_cache liegen.
+        """
+        entry = self._tag_cache.get(uid)
+        if entry:
+            kaka = entry.get("kaka") or {}
+            contents = kaka.get("contents") or []
+            available = [
+                c for c in contents
+                if self.audio_cache.is_cached(int(c.get("id") or 0), c.get("file_hash"))
+            ]
+            if not available:
+                logger.warning(
+                    "Offline: Kaka '%s' bekannt (%d Lieder), aber keines lokal vorhanden.",
+                    kaka.get("name", "?"), len(contents),
+                )
+                return
+            if len(available) < len(contents):
+                logger.info(
+                    "Offline: %d von %d Liedern lokal verfügbar — Rest übersprungen.",
+                    len(available), len(contents),
+                )
+            logger.info("Offline-Modus: spiele Kaka '%s' aus Tag-Cache.", kaka.get("name", "?"))
+            self._start_kaka_playlist(uid, {**kaka, "contents": available})
+            return
+
+        # Legacy: alte uid → album_id-Zuordnung aus config.json
         album_id = self.config["tags"].get(uid)
         if not album_id:
             return
