@@ -29,5 +29,8 @@ device/box_identity.json
 # Lokal heruntergeladene Audio-Dateien (Cache vom Backend) — gehört nicht ins Repo
 device/audio_cache/
 
+# Box-individueller Tag-Cache (Zuordnung Tag-UID → Kaka) — gehört nicht ins Repo
+device/tag_cache.json
+
 # pytest cache
 .pytest_cache/
