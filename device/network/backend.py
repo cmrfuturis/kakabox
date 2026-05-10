@@ -18,6 +18,11 @@ logger = logging.getLogger("kakabox.network")
 
 DEFAULT_BACKEND_URL = os.environ.get("KAKABOX_BACKEND", "http://localhost:8000")
 DEFAULT_TIMEOUT = 5.0
+# Tag-Scan ist im User-kritischen Pfad (Wartezeit zwischen Auflegen und Ton).
+# Bei Cache-Hit läuft die Wiedergabe schon im Hintergrund weiter, daher kann
+# der synchrone Pfad einen kürzeren Timeout vertragen — fällt sonst auf den
+# lokalen Cache zurück, statt 5 s zu blockieren.
+DEFAULT_TAG_SCAN_TIMEOUT = 2.0
 DEFAULT_DOWNLOAD_TIMEOUT = 60.0  # MP3-Downloads dürfen länger dauern
 
 
@@ -65,6 +70,10 @@ class Backend:
         self._base_url = _validate_url(base_url or DEFAULT_BACKEND_URL)
         self._timeout = timeout
         self._identity: dict[str, Any] = self._load_identity()
+        # Persistente HTTP-Session: hält die TCP/TLS-Verbindung am Leben,
+        # sodass tag_scan/heartbeat/manifest ohne erneuten Handshake laufen.
+        # Auf einem Pi über WLAN spart das pro Call ~100–500 ms.
+        self._session = requests.Session()
 
     # ------------------------------------------------------------------
     # Identity persistence
@@ -114,7 +123,7 @@ class Backend:
 
         url = f"{self._base_url}/api/box/connect"
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 url,
                 json={"serial_number": serial, "activation_code": code},
                 timeout=self._timeout,
@@ -145,7 +154,7 @@ class Backend:
         if not self.is_connected:
             return False
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._base_url}/api/box/heartbeat",
                 json=payload,
                 headers=self._auth_headers(),
@@ -168,17 +177,17 @@ class Backend:
     # Tag-Scan
     # ------------------------------------------------------------------
 
-    def tag_scan(self, uid: str) -> dict[str, Any] | None:
+    def tag_scan(self, uid: str, timeout: float | None = None) -> dict[str, Any] | None:
         """Return parsed JSON, or None on transport error."""
         if not self.is_connected:
             raise NotConnected("device has no api_token; call ensure_connected() first")
 
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._base_url}/api/box/tag-scan",
                 json={"tag_uid": uid.upper()},
                 headers=self._auth_headers(),
-                timeout=self._timeout,
+                timeout=timeout if timeout is not None else DEFAULT_TAG_SCAN_TIMEOUT,
             )
         except requests.RequestException as e:
             logger.warning("tag_scan transport error: %s", e)
@@ -204,7 +213,7 @@ class Backend:
         if not self.is_connected:
             return None
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 f"{self._base_url}/api/box/audio-manifest",
                 headers=self._auth_headers(),
                 timeout=self._timeout,
@@ -233,7 +242,7 @@ class Backend:
         tmp_path = target_path.with_suffix(target_path.suffix + ".part")
 
         try:
-            with requests.get(
+            with self._session.get(
                 f"{self._base_url}/api/box/audio/{content_id}/download",
                 headers=self._auth_headers(),
                 timeout=DEFAULT_DOWNLOAD_TIMEOUT,
@@ -263,7 +272,7 @@ class Backend:
         if not self.is_connected:
             return False
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._base_url}/api/box/audio/{content_id}/cached",
                 json={"file_hash": file_hash},
                 headers=self._auth_headers(),
@@ -278,7 +287,7 @@ class Backend:
         if not self.is_connected:
             return False
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._base_url}/api/box/storage-status",
                 json={"total_mb": total_mb, "free_mb": free_mb},
                 headers=self._auth_headers(),
@@ -297,7 +306,7 @@ class Backend:
         if not self.is_connected:
             return []
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 f"{self._base_url}/api/box/commands",
                 headers=self._auth_headers(),
                 timeout=self._timeout,
@@ -316,7 +325,7 @@ class Backend:
         if not self.is_connected:
             return False
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._base_url}/api/box/commands/{command_id}/ack",
                 headers=self._auth_headers(),
                 timeout=self._timeout,

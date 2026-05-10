@@ -425,7 +425,7 @@ class Kakabox:
 
         while self._running:
             try:
-                uids = self.nfc.read_tags(timeout=0.5, max_targets=1)
+                uids = self.nfc.read_tags(timeout=0.2, max_targets=1)
             except Exception as e:
                 # Hardware-Glitch (I2C busy, Timeout, …) darf nicht dazu
                 # führen, dass die Box weiterspielt obwohl der Chip schon
@@ -469,7 +469,7 @@ class Kakabox:
                     self._handle_tag(new_active)
                 active_uid = new_active
 
-            time.sleep(0.2)
+            time.sleep(0.05)
 
     # ------------------------------------------------------------------
     # Tag-Handling
@@ -477,6 +477,25 @@ class Kakabox:
 
     def _handle_tag(self, uid: str) -> None:
         logger.info("NFC tag erkannt: %s", uid)
+
+        # Cache-first: bekannter Tag mit allen Audios lokal → sofort spielen,
+        # Backend-Sync läuft im Hintergrund (siehe _refresh_tag_in_background).
+        # So entfällt der HTTP-Roundtrip im User-kritischen Pfad — auf einem Pi
+        # über WLAN macht das den Unterschied zwischen ~0.5 s und mehreren
+        # Sekunden bis zum ersten Ton.
+        cached = self._tag_cache.get(uid)
+        if cached and self._kaka_fully_local(cached.get("kaka") or {}):
+            kaka = cached["kaka"]
+            logger.info("Cache-Hit für %s → spiele '%s' sofort.", uid, kaka.get("name", "?"))
+            self._start_kaka_playlist(uid, kaka)
+            if self.backend and self.backend.is_connected:
+                threading.Thread(
+                    target=self._refresh_tag_in_background,
+                    args=(uid,),
+                    daemon=True,
+                    name="tag-refresh",
+                ).start()
+            return
 
         if not self.backend or not self.backend.is_connected:
             self._fallback_local_lookup(uid)
@@ -490,10 +509,13 @@ class Kakabox:
             return
 
         if response is None:
-            logger.warning("Tag %s: Backend nicht erreichbar.", uid)
+            logger.warning("Tag %s: Backend nicht erreichbar — versuche Cache.", uid)
             self._fallback_local_lookup(uid)
             return
 
+        self._apply_tag_scan_response(uid, response)
+
+    def _apply_tag_scan_response(self, uid: str, response: dict) -> None:
         status = response.get("status")
         kaka = response.get("kaka") or {}
         kaka_name = kaka.get("name", "?")
@@ -515,6 +537,65 @@ class Kakabox:
             self._drop_tag_cache(uid)
         else:
             logger.warning("Tag %s: unerwartete Backend-Antwort: %s", uid, response)
+
+    def _kaka_fully_local(self, kaka: dict) -> bool:
+        """True, wenn alle Lieder einer Kaka lokal im audio_cache liegen.
+
+        Voraussetzung für den Cache-first-Sofortstart — sobald ein Track fehlt,
+        bräuchten wir frische download_urls vom Server, also lieber den
+        normalen Backend-Pfad nehmen.
+        """
+        contents = kaka.get("contents") or []
+        if not contents:
+            return False
+        for c in contents:
+            cid = int(c.get("id") or 0)
+            if not cid:
+                return False
+            if not self.audio_cache.is_cached(cid, c.get("file_hash")):
+                return False
+        return True
+
+    def _refresh_tag_in_background(self, uid: str) -> None:
+        """Validiert den Cache nach Instant-Play gegen das Backend.
+
+        - Bei ``play``/``paired``: Cache-Eintrag aktualisieren (greift beim
+          nächsten Auflegen, falls sich der Inhalt geändert hat).
+        - Bei ``unknown``/``foreign_household``: Tag wurde inzwischen vom
+          Server abgelehnt — Wiedergabe stoppen, Cache verwerfen.
+        - Bei Transport-Fehler: alles bleibt wie es ist (wir spielen ja
+          schon, kein Schaden).
+        """
+        try:
+            response = self.backend.tag_scan(uid)
+        except BackendError as e:
+            logger.warning("tag-refresh: %s", e)
+            return
+        if response is None:
+            return
+
+        status = response.get("status")
+        kaka = response.get("kaka") or {}
+
+        if status in ("play", "paired"):
+            self._update_tag_cache(uid, kaka)
+            return
+
+        if status in ("unknown", "foreign_household"):
+            logger.warning("tag-refresh: Tag %s ist nun '%s' — stoppe Wiedergabe.", uid, status)
+            self._drop_tag_cache(uid)
+            with self._playlist_lock:
+                still_active = self._active_tag_uid == uid
+                playlist = self._current_playlist if still_active else None
+                if still_active:
+                    self._current_playlist = None
+                    self._active_tag_uid = None
+            if playlist:
+                playlist.stop()
+                try:
+                    self.player.stop()
+                except Exception as e:
+                    logger.warning("Player.stop fehlgeschlagen: %s", e)
 
     def _start_kaka_playlist(self, uid: str, kaka: dict) -> None:
         contents_data = kaka.get("contents", [])
