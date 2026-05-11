@@ -32,5 +32,9 @@ device/audio_cache/
 # Box-individueller Tag-Cache (Zuordnung Tag-UID → Kaka) — gehört nicht ins Repo
 device/tag_cache.json
 
+# Box-individueller Voice-Catalog (vom Audio-Sync mit Songs+Aliasen
+# geschrieben, ändert sich pro Backend-Stand) — gehört nicht ins Repo
+device/voice_catalog.json
+
 # pytest cache
 .pytest_cache/

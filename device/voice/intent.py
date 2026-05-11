@@ -44,11 +44,16 @@ class Candidate:
     "Eiskönigin" statt "Frozen". Die Aliase werden im Webapp-Backend
     pro Song gepflegt und kommen via audio-manifest auf die Box. Beim
     Matching zählt der höchste Score über alle Namen+Aliase.
+
+    ``content_ids`` enthält die Backend-Content-IDs, die abgespielt werden,
+    wenn dieser Kandidat triggert: bei kind="track" eine einzelne ID, bei
+    kind="artist" mehrere (Reihenfolge entscheidet die Wiedergabe-Reihenfolge).
     """
     id: str
     name: str
-    kind: str  # "album" | "kaka" | "track"
+    kind: str  # "album" | "kaka" | "track" | "artist"
     aliases: tuple[str, ...] = ()
+    content_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -46,6 +46,10 @@ from hardware.buttons import Buttons
 from hardware.nfc import PN532
 from hardware.rotary_encoder import Encoder as RotaryEncoder
 from network import Backend, BackendError
+from voice.asr import Recognizer, VoiceUnavailable
+from voice.catalog import build_catalog_from_file
+from voice.intent import Candidate, parse_play_command
+from voice.recorder import MicRecorder, RecorderError
 
 # Optional: REST-API (von Max) — startet eine FastAPI parallel zum main-Loop.
 # Wird best-effort geladen; falls Modul fehlt oder Port belegt ist, läuft die
@@ -74,6 +78,13 @@ SPEED_BURST_WINDOW = 3.0
 SPEED_STEP = 0.1
 SPEED_MIN = 0.5
 SPEED_MAX = 2.0
+
+# Voice-Push-to-Talk: Encoder ≥ 1s gehalten → Padamm → Aufnehmen → Match.
+# VAD-light bricht die Aufnahme automatisch ab, sobald 1s am Stück Stille
+# (nach erster erkannter Sprache) erreicht ist — sonst hartes Cap bei 5s,
+# damit die Box nicht endlos auf jemanden wartet, der gerade gar nichts sagt.
+VOICE_MAX_SECONDS = 5.0
+VOICE_SILENCE_SECONDS = 1.0
 
 
 def _kill_aplay_prompt() -> bool:
@@ -224,6 +235,13 @@ class Kakabox:
         self._speed = 1.0
         self._push_times: list[float] = []
 
+        # Voice-Stack (Lazy-Modell-Load erst beim ersten Push-Hold).
+        # Recognizer instanziieren ist billig; das eigentliche Vosk-Modell
+        # (~50 MB → ~3s Load) wird erst in transcribe_wav nachgezogen.
+        self._recognizer = Recognizer()
+        self._mic_recorder = MicRecorder()
+        self._voice_lock = threading.Lock()  # nur eine Voice-Session gleichzeitig
+
         # Track-Ende-Callback an Player binden
         self.player.on_track_end(self._on_track_end)
 
@@ -329,6 +347,7 @@ class Kakabox:
         self.buttons.on_red(self._on_red_pressed)
         self.buttons.on_red_held(self._on_red_held)
         self.buttons.on_push(self._on_push_pressed)
+        self.buttons.on_push_held(self._on_push_held)
 
     def _wire_encoder(self) -> None:
         if self.encoder is None:
@@ -966,6 +985,140 @@ class Kakabox:
 
         logger.info("🟦 Push (Pause/Play)")
         self.player.toggle_pause()
+
+    def _on_push_held(self) -> None:
+        """Encoder ≥ 1s gehalten → Voice-Push-to-Talk.
+
+        Läuft in einem Hintergrund-Thread: der Hold-Callback von gpiozero ist
+        zwar schon nicht im GPIO-IRQ-Kontext, aber 3s blocken hieße auch, dass
+        ein zweites Hold-Event nicht durchkommt und der Pause/Play-Pfad beim
+        Loslassen erst nach unserer Aufnahme fortgesetzt wird.
+        """
+        if self._abort_prompt_if_playing():
+            return
+        if self._speed_mode:
+            # Nicht intuitiv, parallel Voice und Speed-Mode zu mischen — Hold
+            # während Speed-Mode beendet einfach den Speed-Mode (alt-Verhalten),
+            # statt Voice zu triggern.
+            self._exit_speed_mode()
+            return
+        if not self._voice_lock.acquire(blocking=False):
+            logger.info("Voice bereits aktiv — Trigger ignoriert.")
+            return
+        threading.Thread(
+            target=self._run_voice_activation,
+            daemon=True,
+            name="voice-ptt",
+        ).start()
+
+    def _run_voice_activation(self) -> None:
+        """Padamm → Aufnehmen → ASR → Match → Wiedergabe. Lock-protected."""
+        try:
+            self._stop_for_voice()
+            self._play_prompt("listening.wav")
+            # Padamm zu Ende abspielen, sonst mischt's sich in die Aufnahme.
+            self.player.wait_until_idle(timeout=2.0)
+
+            try:
+                wav = self._mic_recorder.record_until_silence(
+                    max_seconds=VOICE_MAX_SECONDS,
+                    silence_seconds=VOICE_SILENCE_SECONDS,
+                )
+            except RecorderError as e:
+                logger.warning("Voice-Aufnahme fehlgeschlagen: %s", e)
+                return
+
+            try:
+                # Grammar bewusst NICHT setzen — das kleine DE-Vosk-Modell
+                # kennt viele Eigennamen (DIKKA, Bibi, Captain) nicht und
+                # würde sie im Grammar-Modus komplett ignorieren. Der freie
+                # Decoder transkribiert phonetisch, der Fuzzy-Match findet
+                # den Song.
+                text = self._recognizer.transcribe_wav(wav)
+            except VoiceUnavailable as e:
+                logger.warning("ASR nicht verfügbar: %s", e)
+                return
+
+            logger.info("Voice transkribiert: «%s»", text)
+            catalog = build_catalog_from_file(VOICE_CATALOG_PATH)
+            if not catalog:
+                logger.warning("Voice-Catalog leer — kein Match möglich.")
+                return
+
+            cmd = parse_play_command(text, catalog)
+            if cmd is None:
+                logger.info("Voice: kein Match für «%s»", text)
+                return
+
+            logger.info(
+                "Voice match: kind=%s name='%s' score=%.2f query='%s'",
+                cmd.target.kind, cmd.target.name, cmd.score, cmd.query,
+            )
+            self._play_voice_target(cmd.target)
+        finally:
+            self._voice_lock.release()
+
+    def _stop_for_voice(self) -> None:
+        """Räumt vor der Aufnahme: laufende Playlist stoppen, Tag-State leeren.
+
+        Sonst nimmt das Mic den laufenden Track mit auf (MAX98357A hat kein
+        Echo-Cancellation) und der NFC-Loop würde später beim Tag-Removal
+        unsere frisch gestartete Voice-Playlist abräumen.
+        """
+        with self._playlist_lock:
+            playlist = self._current_playlist
+            self._current_playlist = None
+            self._active_tag_uid = None
+        if playlist:
+            playlist.stop()
+        try:
+            self.player.stop()
+        except Exception as e:
+            logger.warning("Player.stop vor Voice fehlgeschlagen: %s", e)
+
+    def _play_voice_target(self, target: Candidate) -> None:
+        """Spielt den per Voice gewählten Target ab.
+
+        ``kind="track"`` → einzelne Datei aus dem Cache; ``kind="artist"`` →
+        alle Tracks des Künstlers als Playlist. Nicht-gecachte Tracks werden
+        übersprungen (kein Online-Download während des Voice-Flows).
+        """
+        if not target.content_ids:
+            logger.warning("Voice-Target ohne content_ids: %s", target.name)
+            return
+
+        contents: list[KakaContent] = []
+        for cid in target.content_ids:
+            path = self.audio_cache.path_for(cid)
+            if not path.is_file():
+                logger.warning("Voice: Track %d nicht im Cache (%s)", cid, path)
+                continue
+            contents.append(KakaContent(
+                content_id=cid,
+                title=target.name,
+                file_hash=None,
+                download_url=None,
+                cached_locally=True,
+                sort_order=0,
+            ))
+        if not contents:
+            logger.warning("Voice: keine spielbaren Tracks für '%s'", target.name)
+            return
+
+        with self._playlist_lock:
+            playlist = Playlist(
+                contents=contents,
+                cache=self.audio_cache,
+                download_fn=lambda cid, p: bool(self.backend) and self.backend.download_audio(cid, p),
+                play_fn=self.player.play_file,
+                stop_fn=self.player.stop,
+                position_fn=self.player.current_position_seconds,
+                seek_fn=self.player.seek_to,
+            )
+            self._current_playlist = playlist
+
+        if not playlist.start():
+            logger.warning("Voice-Playlist konnte nicht starten.")
 
     def _enter_speed_mode(self) -> None:
         self._speed_mode = True

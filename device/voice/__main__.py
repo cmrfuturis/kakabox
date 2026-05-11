@@ -13,13 +13,13 @@ Beispiele:
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
 # Die importierende Stelle muss device/ im sys.path haben — Aufruf via
 # ``python -m voice`` aus device/ heraus funktioniert.
 from audio.library import scan
+from voice.catalog import build_catalog_from_file
 from voice.intent import Candidate, parse_play_command
 
 # Vom Hauptloop nach jedem Audio-Sync geschrieben (siehe main._write_voice_catalog).
@@ -36,42 +36,14 @@ def _build_album_catalog() -> list[Candidate]:
     ]
 
 
-def _build_backend_catalog() -> list[Candidate]:
-    """Liest songs+aliases aus dem vom Audio-Sync geschriebenen Catalog."""
-    if not _BACKEND_CATALOG.is_file():
-        return []
-    try:
-        data = json.loads(_BACKEND_CATALOG.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    out: list[Candidate] = []
-    for song in data.get("songs", []):
-        cid = song.get("content_id")
-        title = song.get("title") or ""
-        if not cid or not title:
-            continue
-        aliases = tuple(
-            str(a).strip()
-            for a in (song.get("aliases") or [])
-            if str(a).strip()
-        )
-        out.append(Candidate(
-            id=str(cid),
-            name=title,
-            kind="track",
-            aliases=aliases,
-        ))
-    return out
-
-
 def _build_default_catalog() -> list[Candidate]:
-    """Lokale Library + Backend-Songs (mit Aliasen) zusammen.
+    """Lokale Library + Backend-Songs (mit Aliasen + Artist-Candidates) zusammen.
 
     Beides nebeneinander, damit auch ein offline-gebootetes Setup mit lokal
     abgelegten MP3s funktioniert, und ein normal verbundenes Setup zusätzlich
-    Alias-Aufrufe der Webapp-Songs versteht.
+    Alias-Aufrufe + Künstler-Match der Webapp-Songs versteht.
     """
-    return _build_album_catalog() + _build_backend_catalog()
+    return _build_album_catalog() + build_catalog_from_file(_BACKEND_CATALOG)
 
 
 def _load_catalog_file(path: Path) -> list[Candidate]:
@@ -109,6 +81,15 @@ def main() -> int:
         default=0.55,
         help="Match-Score-Schwelle (0..1; niedriger = toleranter)",
     )
+    p.add_argument(
+        "--grammar",
+        action="store_true",
+        help=(
+            "Vosk auf das Catalog-Vokabular beschränken. "
+            "Nur sinnvoll, wenn alle Titel-Wörter im DE-Sprachmodell sind — "
+            "bei Eigennamen wie 'DIKKA' werden Wörter ignoriert."
+        ),
+    )
     args = p.parse_args()
 
     catalog = (
@@ -126,11 +107,9 @@ def main() -> int:
     if args.wav:
         from voice.asr import Recognizer, VoiceUnavailable
         rec = Recognizer()
+        grammar = [c.name for c in catalog] if (args.grammar and catalog) else None
         try:
-            text = rec.transcribe_wav(
-                args.wav,
-                grammar=[c.name for c in catalog] if catalog else None,
-            )
+            text = rec.transcribe_wav(args.wav, grammar=grammar)
         except VoiceUnavailable as e:
             print(f"ASR nicht verfügbar: {e}", file=sys.stderr)
             return 2

@@ -1,13 +1,13 @@
 """GPIO-Buttons der Kakabox.
 
 Verdrahtung (KY-Module + GND, Pi 5):
-  - GPIO16  = Grün  (Track-zurück — kurzer Druck; WLAN-Reset bei Halten ≥ 10s)
-  - GPIO25  = Rot   (Track-vor   — kurzer Druck; Power-Off    bei Halten ≥ 10s)
-  - GPIO22  = Encoder-Push (Pause/Play-Toggle)
+  - GPIO16  = Grün         (Track-zurück — kurzer Druck; WLAN-Reset bei Halten ≥ 10s)
+  - GPIO25  = Rot          (Track-vor    — kurzer Druck; Power-Off  bei Halten ≥ 10s)
+  - GPIO22  = Encoder-Push (Pause/Play-Toggle — kurz; Voice-Push-to-Talk bei Halten ≥ 1s)
 
 Alle Buttons sind gegen GND verdrahtet, interner Pull-up — gedrückt = LOW.
 
-Grün und Rot haben Doppelfunktion (kurz vs ≥10s halten):
+Grün, Rot und Push haben Doppelfunktion (kurz vs gehalten):
   ``when_held`` feuert nach dem Hold-Timeout. Wir merken uns intern, ob held
   aktiv war, und triggern die normale Press-Aktion erst in ``when_released``
   und NUR wenn nicht gehalten wurde — sonst würden bei einem Hold beide
@@ -30,7 +30,8 @@ RED_PIN = 25
 ENCODER_PUSH_PIN = 22
 
 DEBOUNCE_S = 0.05
-HOLD_SECONDS = 10.0  # gilt für grün und rot identisch
+HOLD_SECONDS = 10.0      # grün und rot
+PUSH_HOLD_SECONDS = 1.0  # Encoder-Push: ≥ 1s = Voice-Push-to-Talk
 
 
 class Buttons:
@@ -41,7 +42,10 @@ class Buttons:
         self.red = GpioButton(
             RED_PIN, pull_up=True, bounce_time=DEBOUNCE_S, hold_time=HOLD_SECONDS
         )
-        self.push = GpioButton(ENCODER_PUSH_PIN, pull_up=True, bounce_time=DEBOUNCE_S)
+        self.push = GpioButton(
+            ENCODER_PUSH_PIN, pull_up=True, bounce_time=DEBOUNCE_S,
+            hold_time=PUSH_HOLD_SECONDS,
+        )
 
         # Doppelfunktion grün
         self._green_press_cb: Optional[Callable[[], None]] = None
@@ -57,9 +61,18 @@ class Buttons:
         self.red.when_held = self._on_red_internal_held
         self.red.when_released = self._on_red_internal_released
 
+        # Doppelfunktion push (kurz = Pause/Play, lang = Voice-PTT)
+        self._push_press_cb: Optional[Callable[[], None]] = None
+        self._push_held_cb: Optional[Callable[[], None]] = None
+        self._push_was_held: bool = False
+        self.push.when_held = self._on_push_internal_held
+        self.push.when_released = self._on_push_internal_released
+
         logger.info(
-            "Buttons ready: green=GPIO%d red=GPIO%d push=GPIO%d (held ≥ %ds = special)",
-            GREEN_PIN, RED_PIN, ENCODER_PUSH_PIN, int(HOLD_SECONDS),
+            "Buttons ready: green=GPIO%d red=GPIO%d push=GPIO%d "
+            "(green/red held ≥ %ds, push held ≥ %.1fs = voice)",
+            GREEN_PIN, RED_PIN, ENCODER_PUSH_PIN,
+            int(HOLD_SECONDS), PUSH_HOLD_SECONDS,
         )
 
     def on_green(self, callback: Callable[[], None]) -> None:
@@ -79,7 +92,12 @@ class Buttons:
         self._red_held_cb = callback
 
     def on_push(self, callback: Callable[[], None]) -> None:
-        self.push.when_pressed = callback
+        """Kurzer Push (< PUSH_HOLD_SECONDS) — z.B. Pause/Play-Toggle."""
+        self._push_press_cb = callback
+
+    def on_push_held(self, callback: Callable[[], None]) -> None:
+        """Push ≥ PUSH_HOLD_SECONDS — z.B. Voice-Push-to-Talk."""
+        self._push_held_cb = callback
 
     # ---- Internals -------------------------------------------------------
 
@@ -120,6 +138,25 @@ class Buttons:
                 self._red_press_cb()
             except Exception as e:
                 logger.exception("on_red callback failed: %s", e)
+
+    def _on_push_internal_held(self) -> None:
+        self._push_was_held = True
+        if self._push_held_cb:
+            try:
+                self._push_held_cb()
+            except Exception as e:
+                logger.exception("on_push_held callback failed: %s", e)
+
+    def _on_push_internal_released(self) -> None:
+        was_held = self._push_was_held
+        self._push_was_held = False
+        if was_held:
+            return
+        if self._push_press_cb:
+            try:
+                self._push_press_cb()
+            except Exception as e:
+                logger.exception("on_push callback failed: %s", e)
 
     def close(self) -> None:
         for b in (self.green, self.red, self.push):
