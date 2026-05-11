@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+from pathlib import Path
 import mpv
 from dataclasses import dataclass
 from typing import Optional, Callable
@@ -35,6 +36,14 @@ class Player:
         self._state = PlaybackState()
         self._on_track_end: Optional[Callable] = None
 
+        # Prompt-Mode: temporäre Wiedergabe von System-Sounds (Boot-Jingle,
+        # Bye-Sound). Während eines Prompts wird mpv auf system_volume gestellt
+        # und nach Track-Ende auf die User-Lautstärke zurück. Buttons können den
+        # Prompt via stop() jederzeit abwürgen — der Volume-Restore passiert dort
+        # genauso.
+        self._prompt_active: bool = False
+        self._volume_before_prompt: Optional[int] = None
+
         # Track-Ende-Erkennung via Polling auf idle-active. Robuster als der
         # eof-reached Property-Observer (der nach play() nicht zuverlässig feuerte
         # und bei Auto-Advance-Tracks komplett ausfiel).
@@ -64,6 +73,43 @@ class Player:
         self._state.paused = False
         self._mpv.play(track.path)
         logger.info("Playing: %s", track.title)
+
+    def play_prompt(self, path: str, volume: int) -> None:
+        """Spielt einen System-Prompt (Boot, WLAN, Bye) bei separater Lautstärke.
+
+        Vor dem Abspielen wird die aktuelle mpv-Lautstärke gemerkt und auf
+        ``volume`` (0-100) gesetzt. Beim Track-Ende (oder bei stop()) wird sie
+        wiederhergestellt. ``is_prompt_playing`` wird währenddessen True — die
+        Knopf-Handler im Main-Loop nutzen das, um Prompts per Druck abzubrechen
+        statt zu pausieren.
+        """
+        volume = max(0, min(100, int(volume)))
+        if not self._prompt_active:
+            self._volume_before_prompt = self._state.volume
+        self._prompt_active = True
+        try:
+            self._mpv.volume = volume
+        except Exception as e:
+            logger.warning("Prompt-Volume konnte nicht gesetzt werden: %s", e)
+        # play_file kümmert sich um das eigentliche Abspielen + State-Reset.
+        self.play_file(path, title=Path(path).stem)
+
+    def is_prompt_playing(self) -> bool:
+        return self._prompt_active
+
+    def _restore_after_prompt(self) -> None:
+        """Setzt mpv-Lautstärke nach Prompt-Ende auf den User-Wert zurück."""
+        if not self._prompt_active:
+            return
+        target = self._volume_before_prompt
+        self._prompt_active = False
+        self._volume_before_prompt = None
+        if target is None:
+            return
+        try:
+            self._mpv.volume = target
+        except Exception as e:
+            logger.warning("Volume-Restore nach Prompt fehlgeschlagen: %s", e)
 
     def play_file(self, path: str, title: str = "", start_seconds: float = 0.0) -> None:
         """Play an arbitrary file path (used by playlist with locally cached audio).
@@ -124,6 +170,10 @@ class Player:
         self._state.playing = False
         self._state.paused = False
         self._state.current_track = None
+        # Wenn ein Prompt per Knopfdruck abgebrochen wird, muss die User-
+        # Lautstärke wieder greifen — sonst klebt das System-Volume auch an
+        # der nächsten Musik-Wiedergabe.
+        self._restore_after_prompt()
         logger.info("Stopped")
 
     def wait_until_idle(self, timeout: float = 8.0) -> None:
@@ -226,10 +276,17 @@ class Player:
                 self._state.current_track = None
                 logger.info("Track-Ende erkannt (mpv idle).")
 
+                # War das ein System-Prompt? Dann User-Lautstärke wieder her —
+                # bevor der Callback ggf. einen neuen Track startet.
+                was_prompt = self._prompt_active
+                self._restore_after_prompt()
+
                 # Callback-Aufruf außerhalb des Lock-State, damit der Callback
-                # neue play_file()-Aufrufe machen kann.
+                # neue play_file()-Aufrufe machen kann. Bei Prompts gibt's keine
+                # Playlist-Logik zu triggern — der Callback prüft selbst, ob er
+                # was zu tun hat.
                 cb = self._on_track_end
-                if cb:
+                if cb and not was_prompt:
                     try:
                         cb()
                     except Exception as e:

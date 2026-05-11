@@ -37,10 +37,18 @@ _TOKEN_SPLIT = re.compile(r"[^\wäöüß]+", flags=re.IGNORECASE)
 
 @dataclass(frozen=True)
 class Candidate:
-    """Ein Eintrag, der per Voice angesprochen werden kann."""
+    """Ein Eintrag, der per Voice angesprochen werden kann.
+
+    ``aliases`` ergänzt ``name`` um zusätzliche Aufrufnamen (z.B.
+    Spitznamen, alternative Schreibweisen, Filmtitel) — Kinder rufen
+    "Eiskönigin" statt "Frozen". Die Aliase werden im Webapp-Backend
+    pro Song gepflegt und kommen via audio-manifest auf die Box. Beim
+    Matching zählt der höchste Score über alle Namen+Aliase.
+    """
     id: str
     name: str
     kind: str  # "album" | "kaka" | "track"
+    aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -124,7 +132,11 @@ def parse_play_command(
 
     best: tuple[float, Candidate] | None = None
     for cand in catalog:
+        # Bester Score über Haupt-Name + alle Aliase. Aliase sind gleichwertig
+        # zum Namen — wer "eiskönigin" sagt, soll genauso treffen wie "frozen".
         score = _ratio(query, cand.name)
+        for alias in cand.aliases:
+            score = max(score, _ratio(query, alias))
         if best is None or score > best[0]:
             best = (score, cand)
     if best is None or best[0] < threshold:

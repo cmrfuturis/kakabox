@@ -13,6 +13,7 @@ Beispiele:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -21,6 +22,11 @@ from pathlib import Path
 from audio.library import scan
 from voice.intent import Candidate, parse_play_command
 
+# Vom Hauptloop nach jedem Audio-Sync geschrieben (siehe main._write_voice_catalog).
+# Enthält Titel + Aliase aller Backend-Songs. Wenn nicht vorhanden (z.B. noch
+# nie online gesynct), fällt das CLI auf die lokale Library zurück.
+_BACKEND_CATALOG = Path(__file__).resolve().parent.parent / "voice_catalog.json"
+
 
 def _build_album_catalog() -> list[Candidate]:
     lib = scan()
@@ -28,6 +34,44 @@ def _build_album_catalog() -> list[Candidate]:
         Candidate(id=a.id, name=a.name, kind="album")
         for a in lib.albums
     ]
+
+
+def _build_backend_catalog() -> list[Candidate]:
+    """Liest songs+aliases aus dem vom Audio-Sync geschriebenen Catalog."""
+    if not _BACKEND_CATALOG.is_file():
+        return []
+    try:
+        data = json.loads(_BACKEND_CATALOG.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    out: list[Candidate] = []
+    for song in data.get("songs", []):
+        cid = song.get("content_id")
+        title = song.get("title") or ""
+        if not cid or not title:
+            continue
+        aliases = tuple(
+            str(a).strip()
+            for a in (song.get("aliases") or [])
+            if str(a).strip()
+        )
+        out.append(Candidate(
+            id=str(cid),
+            name=title,
+            kind="track",
+            aliases=aliases,
+        ))
+    return out
+
+
+def _build_default_catalog() -> list[Candidate]:
+    """Lokale Library + Backend-Songs (mit Aliasen) zusammen.
+
+    Beides nebeneinander, damit auch ein offline-gebootetes Setup mit lokal
+    abgelegten MP3s funktioniert, und ein normal verbundenes Setup zusätzlich
+    Alias-Aufrufe der Webapp-Songs versteht.
+    """
+    return _build_album_catalog() + _build_backend_catalog()
 
 
 def _load_catalog_file(path: Path) -> list[Candidate]:
@@ -70,7 +114,7 @@ def main() -> int:
     catalog = (
         _load_catalog_file(args.catalog_file)
         if args.catalog_file
-        else _build_album_catalog()
+        else _build_default_catalog()
     )
     if not catalog:
         print(

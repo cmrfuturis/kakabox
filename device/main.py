@@ -25,6 +25,7 @@ Resume-on-Replace:
 import hashlib
 import json
 import logging
+import os
 import secrets
 import signal
 import subprocess
@@ -57,7 +58,9 @@ except Exception as _api_err:
 CONFIG_PATH = Path(__file__).parent / "config.json"
 IDENTITY_PATH = Path(__file__).parent / "box_identity.json"
 TAG_CACHE_PATH = Path(__file__).parent / "tag_cache.json"
+VOICE_CATALOG_PATH = Path(__file__).parent / "voice_catalog.json"
 PROMPTS_DIR = Path("/usr/share/kakabox/prompts")  # vom Installer befüllt
+APLAY_PROMPT_PID = Path("/run/kakabox/prompt_pid")  # vom Comitup-Callback geschrieben
 VOLUME_STEP = 5            # Encoder-Klick = 5 Prozentpunkte
 HEARTBEAT_INTERVAL = 30
 AUDIO_SYNC_INTERVAL = 300  # 5 Minuten
@@ -71,6 +74,42 @@ SPEED_BURST_WINDOW = 3.0
 SPEED_STEP = 0.1
 SPEED_MIN = 0.5
 SPEED_MAX = 2.0
+
+
+def _kill_aplay_prompt() -> bool:
+    """Bricht einen WLAN-Status-Prompt ab, der per ``aplay`` aus dem Comitup-
+    Callback läuft (setup_active.wav / wifi_connected.wav).
+
+    Der Callback schreibt seinen aplay-PID in /run/kakabox/prompt_pid; wir
+    lesen ihn, schicken SIGTERM und räumen die Datei. Gibt True zurück, wenn
+    tatsächlich ein Prompt gekillt wurde (Button-Handler nutzen den Wert, um
+    zu wissen, dass der Druck "verbraucht" ist).
+    """
+    if not APLAY_PROMPT_PID.exists():
+        return False
+    try:
+        pid_text = APLAY_PROMPT_PID.read_text().strip()
+        pid = int(pid_text) if pid_text else 0
+    except (OSError, ValueError):
+        APLAY_PROMPT_PID.unlink(missing_ok=True)
+        return False
+    if pid <= 0:
+        APLAY_PROMPT_PID.unlink(missing_ok=True)
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+        logger.info("WLAN-Prompt (aplay pid=%d) per Knopfdruck abgebrochen.", pid)
+        APLAY_PROMPT_PID.unlink(missing_ok=True)
+        return True
+    except ProcessLookupError:
+        APLAY_PROMPT_PID.unlink(missing_ok=True)
+        return False
+    except PermissionError as e:
+        logger.warning("Kein Recht zum Killen von aplay pid=%d: %s", pid, e)
+        return False
+    except Exception as e:
+        logger.warning("Konnte aplay-Prompt nicht killen: %s", e)
+        return False
 
 
 def read_wifi_ssid() -> str | None:
@@ -89,10 +128,18 @@ logging.basicConfig(
 logger = logging.getLogger("kakabox")
 
 
+DEFAULT_SYSTEM_VOLUME = 60  # Lautstärke für Boot-/WLAN-/Bye-Prompts
+
+
 def load_config() -> dict:
     if CONFIG_PATH.exists():
         return json.loads(CONFIG_PATH.read_text())
-    return {"volume": 70, "tags": {}, "parental": {"disabled_albums": []}}
+    return {
+        "volume": 70,
+        "system_volume": DEFAULT_SYSTEM_VOLUME,
+        "tags": {},
+        "parental": {"disabled_albums": []},
+    }
 
 
 def save_config(config: dict) -> None:
@@ -159,6 +206,7 @@ class Kakabox:
             self.backend = None
 
         self._volume = self.config.get("volume", 70)
+        self._system_volume = int(self.config.get("system_volume", DEFAULT_SYSTEM_VOLUME))
         try:
             set_volume(self._volume)
         except Exception as e:
@@ -255,16 +303,17 @@ class Kakabox:
     def _play_prompt(self, filename: str) -> None:
         """Spielt eine Boot-/Status-Ansage über den Player (gleiches ALSA-Device wie mpv).
 
-        Wird verwendet bevor irgendeine Playlist läuft — der EOF-Callback des Players
-        ist dann ein No-Op. Fehlt die Datei (Installer nicht durchgelaufen), wird
-        leise übergangen.
+        Nutzt ``player.play_prompt`` mit ``self._system_volume`` — so klebt die
+        oft-zu-laute Default-Lautstärke nicht an Boot-/Bye-Sounds. Der Knopf-
+        Druck während eines Prompts bricht ihn via ``player.stop()`` ab (siehe
+        Button-Handler).
         """
         path = PROMPTS_DIR / filename
         if not path.is_file():
             logger.debug("Prompt nicht gefunden: %s", path)
             return
         try:
-            self.player.play_file(str(path), title=path.stem)
+            self.player.play_prompt(str(path), self._system_volume)
         except Exception as e:
             logger.warning("Prompt-Wiedergabe fehlgeschlagen (%s): %s", filename, e)
 
@@ -413,6 +462,65 @@ class Kakabox:
 
         total_mb, free_mb = self.audio_cache.storage_stats_mb()
         self.backend.report_storage(total_mb, free_mb)
+
+        # Voice-Catalog aus dem Manifest neu schreiben — pro Song Titel + Aliase.
+        # Wird vom voice/-Modul gelesen, damit "spiele eiskönigin" auch
+        # Backend-Songs trifft (nicht nur die lokale Library).
+        self._write_voice_catalog(files)
+
+        # Per-Box-Settings aus dem Backend übernehmen (z.B. system_volume vom
+        # Webapp-Override). Fehlt das Feld → bei aktuellem Wert bleiben.
+        self._apply_settings_from_manifest(manifest.get("settings") or {})
+
+    def _write_voice_catalog(self, files: list[dict]) -> None:
+        """Schreibt eine kompakte Liste (content_id, title, aliases) für Voice-Match.
+
+        Best-effort: bei IO-Fehlern (read-only FS, Disk voll) wird nur gewarnt —
+        Voice-Match fällt dann auf den letzten gültigen Stand zurück.
+        """
+        songs = []
+        for entry in files:
+            cid = entry.get("content_id")
+            if not cid:
+                continue
+            songs.append({
+                "content_id": int(cid),
+                "title": entry.get("title") or "",
+                "aliases": list(entry.get("aliases") or []),
+            })
+        payload = {
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "songs": songs,
+        }
+        try:
+            VOICE_CATALOG_PATH.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            logger.warning("Voice-Catalog konnte nicht geschrieben werden: %s", e)
+
+    def _apply_settings_from_manifest(self, settings: dict) -> None:
+        """Übernimmt Per-Box-Settings (aktuell: system_volume) aus dem Manifest.
+
+        Override-Logik: Webapp-Wert gewinnt, wird in config.json gespiegelt
+        damit ein Neustart nach Offline-Phase den letzten Stand behält. Fehlende
+        oder ungültige Werte werden ignoriert (kein Reset auf Default).
+        """
+        sys_vol = settings.get("system_volume")
+        if sys_vol is None:
+            return
+        try:
+            sys_vol = int(sys_vol)
+        except (TypeError, ValueError):
+            return
+        sys_vol = max(0, min(100, sys_vol))
+        if sys_vol == self._system_volume:
+            return
+        logger.info("system_volume vom Backend: %d → %d", self._system_volume, sys_vol)
+        self._system_volume = sys_vol
+        self.config["system_volume"] = sys_vol
+        save_config(self.config)
 
     # ------------------------------------------------------------------
     # NFC-Loop (mit Multi-Chip-Tracking)
@@ -736,9 +844,31 @@ class Kakabox:
     # Knopf-Handler
     # ------------------------------------------------------------------
 
+    def _abort_prompt_if_playing(self) -> bool:
+        """Wenn ein System-Prompt läuft → abbrechen und True zurück.
+
+        Wird von allen Button-Handlern als erstes aufgerufen: Ein Druck soll
+        Boot-/WLAN-/Bye-Sounds direkt stoppen statt die normale Aktion
+        auszulösen (sonst pausiert man z.B. den ready_to_rumble statt ihn zu
+        stoppen). Deckt mpv-Prompts UND die per aplay laufenden WLAN-Prompts ab.
+        """
+        aborted = False
+        if self.player.is_prompt_playing():
+            logger.info("Prompt per Knopfdruck abgebrochen.")
+            try:
+                self.player.stop()
+            except Exception as e:
+                logger.warning("Player.stop nach Prompt-Abbruch fehlgeschlagen: %s", e)
+            aborted = True
+        if _kill_aplay_prompt():
+            aborted = True
+        return aborted
+
     def _on_green_pressed(self) -> None:
         """Grün: Track zurück, oder Neustart wenn schon > 5s gelaufen, mit Loop."""
         logger.info("🟢 Grün")
+        if self._abort_prompt_if_playing():
+            return
         with self._playlist_lock:
             playlist = self._current_playlist
         if playlist:
@@ -747,6 +877,8 @@ class Kakabox:
     def _on_red_pressed(self) -> None:
         """Rot kurz: Nächster Track mit Loop."""
         logger.info("🔴 Rot")
+        if self._abort_prompt_if_playing():
+            return
         with self._playlist_lock:
             playlist = self._current_playlist
         if playlist:
@@ -808,6 +940,9 @@ class Kakabox:
         Im Speed-Mode: einmal drücken = zurück in den Normal-Modus.
         4× drücken in 3s während Wiedergabe: Speed-Mode betreten.
         """
+        if self._abort_prompt_if_playing():
+            return
+
         now = time.monotonic()
 
         if self._speed_mode:
