@@ -3,15 +3,18 @@
 Kakabox — Hauptloop.
 
 Eingaben:
-    NFC-Tag auflegen → Backend-Lookup → spielt zugeordnete Lieder ab
-    NFC-Tag entfernen → Wiedergabe stoppt; Position wird gemerkt für Resume
+    NFC-Tag auflegen   → Backend-Lookup → spielt zugeordnete Lieder ab
+    NFC-Tag entfernen  → Wiedergabe stoppt; Position wird gemerkt für Resume
     🟢 Grün-Knopf       → Track zurück, oder Neustart wenn Track > 5s läuft (loop)
-    🟢 Grün ≥ 10s halten → WLAN-Profile löschen (kein Reboot — Box bleibt an,
-                          comitup öffnet Hotspot zum Re-Onboarding)
+    🟢 Grün ≥ 1s        → STOP: Wiedergabe beenden + Resume-Position vergessen
+    🟢 Grün ≥ 5s        → Box ausschalten (poweroff, tschau-Kakau-Prompt)
     🔴 Rot-Knopf        → Nächster Track (loop)
-    🔴 Rot ≥ 10s halten → Box ausschalten (poweroff)
-    🟦 Encoder-Push    → Pause/Play-Toggle
-    🟦 Encoder im UZS  → Lauter
+    🔴 Rot ≥ 1s         → STOP: Wiedergabe beenden + Resume-Position vergessen
+    🔴 Rot ≥ 5s         → WLAN-Profile löschen (kein Reboot — Box bleibt an,
+                          comitup öffnet Hotspot zum Re-Onboarding)
+    🟦 Encoder-Push      → Pause/Play-Toggle
+    🟦 Encoder-Push ≥ 1s → Voice-Push-to-Talk ("spiele bitte XY")
+    🟦 Encoder im UZS    → Lauter
     🟦 Encoder gegen UZS → Leiser
 
 Auto-Pairing:
@@ -343,8 +346,10 @@ class Kakabox:
         if self.buttons is None:
             return
         self.buttons.on_green(self._on_green_pressed)
+        self.buttons.on_green_stop(self._on_green_stop)
         self.buttons.on_green_held(self._on_green_held)
         self.buttons.on_red(self._on_red_pressed)
+        self.buttons.on_red_stop(self._on_red_stop)
         self.buttons.on_red_held(self._on_red_held)
         self.buttons.on_push(self._on_push_pressed)
         self.buttons.on_push_held(self._on_push_held)
@@ -903,8 +908,44 @@ class Kakabox:
         if playlist:
             playlist.next()
 
-    def _on_red_held(self) -> None:
-        """Rot ≥ 10s: Bye-Prompt → poweroff.
+    def _on_green_stop(self) -> None:
+        """Grün ≥ 1s: Wiedergabe komplett stoppen + Resume-Position vergessen."""
+        logger.info("🟢⏵ Grün 1s — STOP")
+        if self._abort_prompt_if_playing():
+            return
+        self._full_stop("Grün 1s")
+
+    def _on_red_stop(self) -> None:
+        """Rot ≥ 1s: Wiedergabe komplett stoppen + Resume-Position vergessen."""
+        logger.info("🔴⏵ Rot 1s — STOP")
+        if self._abort_prompt_if_playing():
+            return
+        self._full_stop("Rot 1s")
+
+    def _full_stop(self, reason: str) -> None:
+        """Hard-Stop: aktuelle Wiedergabe beenden + Resume-Memory leeren.
+
+        Im Gegensatz zu ``_on_tag_removed`` wird hier KEIN Snapshot gemacht
+        und ``_last_kaka_memory`` aktiv auf None gesetzt — ein danach
+        aufgelegter Tag startet damit von vorne, statt an der alten
+        Position weiterzulaufen. Genau so vom User gewünscht: Knopf-Stop
+        ist final.
+        """
+        with self._playlist_lock:
+            playlist = self._current_playlist
+            self._current_playlist = None
+            self._active_tag_uid = None
+        if playlist:
+            playlist.stop()
+        try:
+            self.player.stop()
+        except Exception as e:
+            logger.warning("Player.stop nach Full-Stop fehlgeschlagen: %s", e)
+        self._last_kaka_memory = None
+        logger.info("Full stop (%s) — Memory geleert.", reason)
+
+    def _on_green_held(self) -> None:
+        """Grün ≥ 5s: Bye-Prompt → Poweroff.
 
         Die privilegierte Arbeit macht /usr/local/bin/kakabox-poweroff. Der
         sudoers-Drop-in erlaubt riffi NOPASSWD nur für genau diesen Pfad.
@@ -914,7 +955,7 @@ class Kakabox:
         nach dem Bye-Prompt und versucht den nächsten Kaka-Track zu starten —
         die Box würde dann mitten im Lied ausgehen statt sauber zu verabschieden.
         """
-        logger.warning("🔴🔴🔴 Rot 10s gehalten — Box wird ausgeschaltet.")
+        logger.warning("🟢🟢🟢 Grün 5s gehalten — Box wird ausgeschaltet.")
 
         with self._playlist_lock:
             playlist = self._current_playlist
@@ -934,8 +975,8 @@ class Kakabox:
         except Exception as e:
             logger.error("Power-off fehlgeschlagen: %s", e)
 
-    def _on_green_held(self) -> None:
-        """Grün ≥ 10s: WLAN-Profile löschen, OHNE Reboot.
+    def _on_red_held(self) -> None:
+        """Rot ≥ 5s: WLAN-Profile löschen, OHNE Reboot.
 
         Comitup wird neu gestartet — weil dann kein WLAN-Profil mehr da ist,
         geht es automatisch in den Hotspot-Modus (Box bleibt eingeschaltet,
@@ -943,7 +984,7 @@ class Kakabox:
 
         Die privilegierte Arbeit macht /usr/local/bin/kakabox-wifi-clear.
         """
-        logger.warning("🟢🟢🟢 Grün 10s gehalten — WLAN-Reset (ohne Reboot).")
+        logger.warning("🔴🔴🔴 Rot 5s gehalten — WLAN-Reset (ohne Reboot).")
         try:
             subprocess.run(
                 ["sudo", "-n", "/usr/local/bin/kakabox-wifi-clear"],
