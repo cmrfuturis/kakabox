@@ -79,6 +79,15 @@ def has_play_intent(text: str) -> bool:
     return any(_is_play_verb(t) for t in _tokenize(text))
 
 
+def has_magic_word(text: str, word: str = "bitte") -> bool:
+    """True, wenn ``word`` als eigenständiges Token im Transkript steht.
+
+    Case-insensitive, robust gegen Punctuation. Für den Zauberwort-Modus:
+    ohne "bitte" wird nicht abgespielt, sondern der Frage-Prompt kommt.
+    """
+    return word.lower() in _tokenize(text)
+
+
 def extract_query(text: str) -> str:
     """Stripe Kommando-Stopwords und gib das verbleibende Entity-Fragment.
 

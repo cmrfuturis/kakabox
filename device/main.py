@@ -48,7 +48,7 @@ from hardware.rotary_encoder import Encoder as RotaryEncoder
 from network import Backend, BackendError
 from voice.asr import Recognizer, VoiceUnavailable
 from voice.catalog import build_catalog_from_file
-from voice.intent import Candidate, parse_play_command
+from voice.intent import Candidate, has_magic_word, parse_play_command
 from voice.recorder import MicRecorder, RecorderError
 
 # Optional: REST-API (von Max) — startet eine FastAPI parallel zum main-Loop.
@@ -1040,6 +1040,16 @@ class Kakabox:
                 return
 
             logger.info("Voice transkribiert: «%s»", text)
+
+            # Zauberwort-Modus: nur abspielen, wenn "bitte" im Transkript steht.
+            # Sonst Prompt "Wie heißt das Zauberwort?" — Kind muss den Befehl
+            # nochmal mit Höflichkeit wiederholen. Der Modus wird per API
+            # (POST /zauberwort/enable) oder direkt in config.json geschaltet.
+            if self.config.get("zauberwort_mode_enabled") and not has_magic_word(text):
+                logger.info("Zauberwort fehlt in «%s» — Prompt statt Match.", text)
+                self._play_prompt("zauberwort.wav")
+                return
+
             catalog = build_catalog_from_file(VOICE_CATALOG_PATH)
             if not catalog:
                 logger.warning("Voice-Catalog leer — kein Match möglich.")

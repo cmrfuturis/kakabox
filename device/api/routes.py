@@ -256,3 +256,34 @@ def enable_album(album_id: str):
         disabled.remove(album_id)
         _save()
     return {"ok": True, "disabled_albums": disabled}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Zauberwort-Modus
+# Mit aktivem Modus muss der Voice-Command "bitte" enthalten — sonst
+# spielt die Box den Prompt "Wie heißt das Zauberwort?" ab statt zu
+# matchen. Erzieht zur Höflichkeit ohne den Spaß-Faktor zu killen.
+# ──────────────────────────────────────────────────────────────────────
+
+@app.get("/zauberwort", summary="Get zauberwort mode state")
+def get_zauberwort():
+    """Returns whether the magic-word mode is currently enabled."""
+    return {"enabled": bool(_get_box().config.get("zauberwort_mode_enabled", False))}
+
+
+@app.post("/zauberwort/enable", summary="Enable zauberwort mode")
+def enable_zauberwort():
+    """Voice-Commands müssen ab jetzt 'bitte' enthalten, sonst Prompt."""
+    box = _get_box()
+    box.config["zauberwort_mode_enabled"] = True
+    _save()
+    return {"ok": True, "enabled": True}
+
+
+@app.post("/zauberwort/disable", summary="Disable zauberwort mode")
+def disable_zauberwort():
+    """Voice-Commands greifen wieder ohne 'bitte'."""
+    box = _get_box()
+    box.config["zauberwort_mode_enabled"] = False
+    _save()
+    return {"ok": True, "enabled": False}

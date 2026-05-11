@@ -146,6 +146,12 @@ install_prompt "ready to rumble.wav"            ready_to_rumble.wav en 140 35 \
 install_prompt "tschau kakau.wav"               tschau_kakau.wav    de 145 50 \
     "Tschau Kakau!"
 
+install_prompt "listening.wav"                  listening.wav       de 145 50 \
+    "Bitte sprich jetzt."
+
+install_prompt "Wie-heißt-das-Zauberwort.wav"   zauberwort.wav      de 145 50 \
+    "Wie heißt das Zauberwort?"
+
 # ──────────────────────────────────────────────────────────────────────────
 # 5. systemd-Units
 # ──────────────────────────────────────────────────────────────────────────
