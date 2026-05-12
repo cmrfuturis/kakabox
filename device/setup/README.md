@@ -189,6 +189,7 @@ systemd-analyze security kakabox.service
 | API-Calls liefern 503 „API token not initialised" | Erster Service-Start hat config.json nicht schreiben können (Permissions). `ls -la device/config.json` prüfen — sollte `riffi:riffi 0600` sein. |
 | Backend-Connect schlägt mit `BackendError: Refusing insecure backend URL` fehl | `KAKABOX_BACKEND` zeigt auf plain-HTTP außerhalb von localhost. Auf `https://…` umstellen oder für lokales Dev `http://localhost:8000`. |
 | Roter Knopf 10s lässt sich nicht halten | `journalctl -u kakabox.service` nach „WLAN-Reset wird ausgelöst". Wenn nichts: `cat /etc/sudoers.d/kakabox` muss riffi NOPASSWD für den Wifi-Nuke geben. |
+| Box fällt sporadisch in Hotspot, kommt nach 2–5 Min wieder | Pi-WLAN-Power-Save oder Dual-Band-Roaming-Glitch. Erst prüfen: `iwconfig wlan0 \| grep Management` → muss `off` sein (sonst greift `wifi-powersave-off.conf` nicht). Wenn weiterhin: in NM-Log nach `Authentication … timed out` + `REGDOM-CHANGE` rund um den Drop suchen — wenn ja, hat der Router Dual-Band-APs (`5240 MHz` + `2412 MHz` mit gleicher SSID) und der Pi pingpongt. Fix: WLAN-Profil auf 2,4 GHz pinnen: `nmcli connection modify <ssid> 802-11-wireless.band bg && nmcli connection up <ssid>`. Site-spezifisch, deshalb nicht im Installer. |
 
 ## Referenzen
 

@@ -101,21 +101,32 @@ cancel_pending_hotspot() {
 
 case "$STATE" in
     HOTSPOT)
-        log "Hotspot-Modus aktiv — Setup-Ansage in ${HOTSPOT_DELAY}s (falls wir bis dahin nicht verbunden sind)"
-        # Vorherige State-Marker putzen — neuer HOTSPOT-Zyklus
-        rm -f "$STATE_DIR/hotspot_announced"
-        cancel_pending_hotspot
-        touch "$STATE_DIR/hotspot_pending"
-        (
-            sleep "$HOTSPOT_DELAY"
-            # Marker noch da? Dann waren wir die ganze Zeit im Hotspot.
-            if [ -f "$STATE_DIR/hotspot_pending" ]; then
-                rm -f "$STATE_DIR/hotspot_pending" "$STATE_DIR/hotspot_pid"
-                touch "$STATE_DIR/hotspot_announced"
-                play_prompt setup_active.wav
-            fi
-        ) &
-        echo $! > "$STATE_DIR/hotspot_pid"
+        # User-Reset (Rot 5s) hat vorher den Marker gesetzt — main.py spielt
+        # die Reset-Ansage selbst und sofort, der 12s-Callback-Prompt würde
+        # nur kollidieren. hotspot_announced wird gesetzt, damit beim späteren
+        # CONNECTED-Übergang die "WLAN verbunden"-Ansage normal kommt.
+        if [ -f "$STATE_DIR/skip_hotspot_prompt" ]; then
+            log "Hotspot-Modus aktiv — User-Reset erkannt, Callback-Prompt übersprungen"
+            rm -f "$STATE_DIR/skip_hotspot_prompt"
+            cancel_pending_hotspot
+            touch "$STATE_DIR/hotspot_announced"
+        else
+            log "Hotspot-Modus aktiv — Setup-Ansage in ${HOTSPOT_DELAY}s (falls wir bis dahin nicht verbunden sind)"
+            # Vorherige State-Marker putzen — neuer HOTSPOT-Zyklus
+            rm -f "$STATE_DIR/hotspot_announced"
+            cancel_pending_hotspot
+            touch "$STATE_DIR/hotspot_pending"
+            (
+                sleep "$HOTSPOT_DELAY"
+                # Marker noch da? Dann waren wir die ganze Zeit im Hotspot.
+                if [ -f "$STATE_DIR/hotspot_pending" ]; then
+                    rm -f "$STATE_DIR/hotspot_pending" "$STATE_DIR/hotspot_pid"
+                    touch "$STATE_DIR/hotspot_announced"
+                    play_prompt setup_active.wav
+                fi
+            ) &
+            echo $! > "$STATE_DIR/hotspot_pid"
+        fi
         ;;
     CONNECTING)
         log "Verbindungsversuch — pending Hotspot-Prompt verwerfen"

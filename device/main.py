@@ -49,7 +49,7 @@ from hardware.buttons import Buttons
 from hardware.nfc import PN532
 from hardware.rotary_encoder import Encoder as RotaryEncoder
 from network import Backend, BackendError
-from voice.asr import Recognizer, VoiceUnavailable
+from voice.asr import VoiceUnavailable, build_recognizer
 from voice.catalog import build_catalog_from_file
 from voice.intent import Candidate, has_magic_word, parse_play_command
 from voice.recorder import MicRecorder, RecorderError
@@ -238,10 +238,17 @@ class Kakabox:
         self._speed = 1.0
         self._push_times: list[float] = []
 
-        # Voice-Stack (Lazy-Modell-Load erst beim ersten Push-Hold).
-        # Recognizer instanziieren ist billig; das eigentliche Vosk-Modell
-        # (~50 MB → ~3s Load) wird erst in transcribe_wav nachgezogen.
-        self._recognizer = Recognizer()
+        # Voice-Stack. Backend (vosk|whisper) kommt aus config.json → "voice.backend".
+        # Recognizer instanziieren ist billig; das eigentliche Modell wird in einem
+        # Daemon-Thread vorgeladen (Warmup), sodass die erste Push-to-Talk-Session
+        # nicht auf den 1–3 s Modell-Load warten muss. Schlägt der Warmup fehl
+        # (Paket/Modell fehlt), bleibt der bestehende Lazy-Load-Pfad in
+        # transcribe_wav als Fallback aktiv und der echte Push-to-Talk wirft den
+        # Fehler dann sichtbar.
+        self._recognizer = build_recognizer(self.config.get("voice"))
+        threading.Thread(
+            target=self._warmup_recognizer, daemon=True, name="asr-warmup"
+        ).start()
         self._mic_recorder = MicRecorder()
         self._voice_lock = threading.Lock()  # nur eine Voice-Session gleichzeitig
 
@@ -983,6 +990,15 @@ class Kakabox:
         Eltern können sich neu mit dem Captive-Portal verbinden).
 
         Die privilegierte Arbeit macht /usr/local/bin/kakabox-wifi-clear.
+
+        Direkt danach spielen wir ``setup_active.wav`` ab — sofortiges
+        Feedback "ich bin offline, bitte neu einrichten". Der Marker
+        ``/run/kakabox/skip_hotspot_prompt`` (von kakabox-wifi-clear gesetzt)
+        sorgt dafür, dass der comitup-Callback seinen sonst 12s verzögerten
+        Hotspot-Prompt überspringt — sonst gäbe es eine Doppelansage.
+        Der Prompt läuft über ``_play_prompt`` → respektiert ``system_volume``
+        aus config.json und ist mit jedem Knopfdruck via
+        ``_abort_prompt_if_playing`` abbrechbar.
         """
         logger.warning("🔴🔴🔴 Rot 5s gehalten — WLAN-Reset (ohne Reboot).")
         try:
@@ -992,6 +1008,8 @@ class Kakabox:
             )
         except Exception as e:
             logger.error("WLAN-Clear fehlgeschlagen: %s", e)
+            return
+        self._play_prompt("setup_active.wav")
 
     def _on_push_pressed(self) -> None:
         """Encoder-Druck.
@@ -1026,6 +1044,29 @@ class Kakabox:
 
         logger.info("🟦 Push (Pause/Play)")
         self.player.toggle_pause()
+
+    def _warmup_recognizer(self) -> None:
+        """Lädt das ASR-Modell beim Service-Start in den RAM.
+
+        Läuft in einem Daemon-Thread, damit der Boot nicht blockiert und der
+        Rest der Box (NFC-Loop, Buttons, Heartbeat) sofort verfügbar ist.
+        Spart ~1–3 s beim ersten Push-to-Talk. Bei Paket/Modell-Fehlern wird
+        nur geloggt — der Lazy-Load-Pfad in ``transcribe_wav`` greift dann
+        beim echten Trigger und der Fehler wird dort sichtbar.
+        """
+        try:
+            t0 = time.monotonic()
+            self._recognizer.warmup()
+            logger.info(
+                "ASR-Modell vorgeladen (%s, %.1fs)",
+                self._recognizer.backend, time.monotonic() - t0,
+            )
+        except VoiceUnavailable as e:
+            logger.info("ASR-Warmup übersprungen: %s", e)
+        except Exception:
+            # Unerwarteter Fehler — den fangen wir bewusst weit, damit
+            # ein Modell-Lade-Crash NIE den Box-Start kaputt macht.
+            logger.exception("ASR-Warmup unerwartet fehlgeschlagen")
 
     def _on_push_held(self) -> None:
         """Encoder ≥ 1s gehalten → Voice-Push-to-Talk.

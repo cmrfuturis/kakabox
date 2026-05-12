@@ -3,5 +3,16 @@
   "tags": {},
   "parental": {
     "disabled_albums": []
+  },
+  "voice": {
+    "backend": "whisper",
+    "whisper": {
+      "model_path": "/usr/share/kakabox/voice/ggml-base.bin",
+      "language": "de",
+      "n_threads": 4
+    },
+    "vosk": {
+      "model_dir": "/usr/share/kakabox/voice/vosk-model-small-de-0.15"
+    }
   }
 }

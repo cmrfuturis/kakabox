@@ -85,10 +85,16 @@ def main() -> int:
         "--grammar",
         action="store_true",
         help=(
-            "Vosk auf das Catalog-Vokabular beschränken. "
-            "Nur sinnvoll, wenn alle Titel-Wörter im DE-Sprachmodell sind — "
-            "bei Eigennamen wie 'DIKKA' werden Wörter ignoriert."
+            "ASR auf das Catalog-Vokabular hinten anlehnen. "
+            "Vosk: hartes Vokabular (Eigennamen wie 'DIKKA' werden ignoriert). "
+            "Whisper: weicher initial_prompt-Bias."
         ),
+    )
+    p.add_argument(
+        "--backend",
+        choices=["vosk", "whisper"],
+        default="vosk",
+        help="ASR-Backend (default: vosk). Whisper braucht ggml-base.bin.",
     )
     args = p.parse_args()
 
@@ -106,7 +112,7 @@ def main() -> int:
 
     if args.wav:
         from voice.asr import Recognizer, VoiceUnavailable
-        rec = Recognizer()
+        rec = Recognizer(backend=args.backend)
         grammar = [c.name for c in catalog] if (args.grammar and catalog) else None
         try:
             text = rec.transcribe_wav(args.wav, grammar=grammar)

@@ -8,7 +8,15 @@
 set -u
 
 LOG=/var/log/kakabox-wifi-clear.log
+STATE_DIR=/run/kakabox
 echo "$(date -Is) WLAN-Clear ausgelöst" >> "$LOG"
+
+# Marker setzen, damit der comitup-Callback den 12s-verzögerten Hotspot-
+# Prompt überspringt — main.py spielt die Ansage direkt selbst, sobald
+# `kakabox-wifi-clear` zurückkehrt. Sonst gäbe es nach dem User-Reset zwei
+# Ansagen kurz hintereinander (eine sofort, eine 12s später vom Callback).
+mkdir -p "$STATE_DIR"
+touch "$STATE_DIR/skip_hotspot_prompt"
 
 # Alle 802-11-wireless-Connections aus NetworkManager entfernen
 nmcli -t -f TYPE,UUID connection show 2>/dev/null \

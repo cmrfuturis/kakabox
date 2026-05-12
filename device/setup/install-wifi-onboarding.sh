@@ -60,6 +60,12 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
 step "2/6 /etc/comitup.conf installieren"
 install -m 0644 "$SCRIPT_DIR/comitup.conf" "$COMITUP_CONF"
 
+# WLAN-Power-Save abschalten — sonst kappt der Pi-Treiber bei mittlerem
+# Signal regelmäßig die Verbindung und comitup fällt auf Hotspot zurück.
+step "WLAN-Power-Save deaktivieren (/etc/NetworkManager/conf.d/wifi-powersave.conf)"
+install -m 0644 "$SCRIPT_DIR/wifi-powersave-off.conf" \
+    /etc/NetworkManager/conf.d/wifi-powersave.conf
+
 step "Callback-Script installieren ($CALLBACK_PATH)"
 install -m 0755 "$SCRIPT_DIR/kakabox-comitup-callback" "$CALLBACK_PATH"
 
