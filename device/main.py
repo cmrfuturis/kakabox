@@ -359,7 +359,8 @@ class Kakabox:
         self.buttons.on_red_stop(self._on_red_stop)
         self.buttons.on_red_held(self._on_red_held)
         self.buttons.on_push(self._on_push_pressed)
-        self.buttons.on_push_held(self._on_push_held)
+        self.buttons.on_yellow(self._on_yellow_pressed)
+        self.buttons.on_blue(self._on_blue_pressed)
 
     def _wire_encoder(self) -> None:
         if self.encoder is None:
@@ -1012,27 +1013,26 @@ class Kakabox:
         self._play_prompt("setup_active.wav")
 
     def _on_push_pressed(self) -> None:
-        """Encoder-Druck.
+        """Encoder-Druck — ausschließlich für Speed-Mode-Gestik.
 
-        Normalfall: Pause/Resume-Toggle.
-        Im Speed-Mode: einmal drücken = zurück in den Normal-Modus.
-        4× drücken in 3s während Wiedergabe: Speed-Mode betreten.
+        - Im Speed-Mode: ein Druck verlässt den Modus.
+        - Sonst: zählt zum Burst-Sliding-Window. 4× innerhalb SPEED_BURST_WINDOW
+          während Wiedergabe → Speed-Mode an.
+        - Kein Pause/Play mehr (das macht gelb), kein Voice (das macht blau).
         """
         if self._abort_prompt_if_playing():
             return
-
-        now = time.monotonic()
 
         if self._speed_mode:
             logger.info("🟦 Push — exit Speed-Mode")
             self._exit_speed_mode()
             return
 
+        now = time.monotonic()
         # Sliding-Window: nur Pushes der letzten SPEED_BURST_WINDOW behalten
         self._push_times.append(now)
         self._push_times = [t for t in self._push_times if t > now - SPEED_BURST_WINDOW]
 
-        playlist_active = False
         with self._playlist_lock:
             playlist_active = self._current_playlist is not None
 
@@ -1040,9 +1040,12 @@ class Kakabox:
             logger.info("🟦×%d → Speed-Mode aktiv", SPEED_BURST_COUNT)
             self._push_times.clear()
             self._enter_speed_mode()
-            return
 
-        logger.info("🟦 Push (Pause/Play)")
+    def _on_yellow_pressed(self) -> None:
+        """Gelb — Pause/Play-Toggle."""
+        if self._abort_prompt_if_playing():
+            return
+        logger.info("🟡 Gelb (Pause/Play)")
         self.player.toggle_pause()
 
     def _warmup_recognizer(self) -> None:
@@ -1068,20 +1071,18 @@ class Kakabox:
             # ein Modell-Lade-Crash NIE den Box-Start kaputt macht.
             logger.exception("ASR-Warmup unerwartet fehlgeschlagen")
 
-    def _on_push_held(self) -> None:
-        """Encoder ≥ 1s gehalten → Voice-Push-to-Talk.
+    def _on_blue_pressed(self) -> None:
+        """Blau gedrückt → Voice-Push-to-Talk.
 
-        Läuft in einem Hintergrund-Thread: der Hold-Callback von gpiozero ist
-        zwar schon nicht im GPIO-IRQ-Kontext, aber 3s blocken hieße auch, dass
-        ein zweites Hold-Event nicht durchkommt und der Pause/Play-Pfad beim
-        Loslassen erst nach unserer Aufnahme fortgesetzt wird.
+        Läuft in einem Hintergrund-Thread, weil die Aufnahme + ASR mehrere
+        Sekunden blocken kann — der Button-Handler darf nicht stehenbleiben,
+        sonst kommt kein zweites Event durch.
         """
         if self._abort_prompt_if_playing():
             return
         if self._speed_mode:
-            # Nicht intuitiv, parallel Voice und Speed-Mode zu mischen — Hold
-            # während Speed-Mode beendet einfach den Speed-Mode (alt-Verhalten),
-            # statt Voice zu triggern.
+            # Während Speed-Mode beendet ein blauer Druck den Modus statt
+            # Voice zu triggern — Voice + Speed-Mode parallel ist unintuitiv.
             self._exit_speed_mode()
             return
         if not self._voice_lock.acquire(blocking=False):

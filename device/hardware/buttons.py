@@ -5,7 +5,9 @@ Verdrahtung (KY-Module + GND, Pi 5):
                              STOP bei Halten ≥ 1s; Power-Off bei Halten ≥ 5s)
   - GPIO25  = Rot          (Track-vor   — kurzer Druck;
                              STOP bei Halten ≥ 1s; WLAN-Reset bei Halten ≥ 5s)
-  - GPIO22  = Encoder-Push (Pause/Play-Toggle — kurz; Voice-Push-to-Talk bei Halten ≥ 1s)
+  - GPIO22  = Encoder-Push (nur noch Speed-Mode-Burst: 4× drücken in 3s)
+  - GPIO5   = Blau         (Voice-Push-to-Talk — single-press)
+  - GPIO24  = Gelb         (Pause/Play-Toggle — single-press)
 
 Alle Buttons sind gegen GND verdrahtet, interner Pull-up — gedrückt = LOW.
 
@@ -15,7 +17,9 @@ Grün und Rot haben drei Stufen: kurz (< 1s) → press, ≥ 1s → stop, ≥ 5s 
 Button noch gedrückt ist. Beim Release entscheidet ein Flag, ob Press, Stop
 oder Held bereits triggerte — und unterdrückt Press in den anderen Fällen.
 
-Push hat zwei Stufen (kurz vs ≥ 1s = Voice-PTT), gleiches Released-Flag-Schema.
+Gelb, Blau und Encoder-Push sind single-press (kein Hold-Verhalten relevant).
+Encoder-Push hat keinen eigenen Callback mehr — main.py wertet die Sequenz
+selbst aus (4× in 3s während Wiedergabe → Speed-Mode).
 """
 from __future__ import annotations
 
@@ -33,11 +37,12 @@ logger = logging.getLogger(__name__)
 GREEN_PIN = 16
 RED_PIN = 25
 ENCODER_PUSH_PIN = 22
+BLUE_PIN = 5        # Voice-Push-to-Talk (Aufnahme)
+YELLOW_PIN = 24     # Pause/Play-Toggle
 
 DEBOUNCE_S = 0.05
 STOP_HOLD_SECONDS = 1.0   # grün/rot ≥ 1s = STOP (Playlist + Memory weg)
 HOLD_SECONDS = 5.0        # grün ≥ 5s = Power-Off; rot ≥ 5s = WLAN-Reset
-PUSH_HOLD_SECONDS = 1.0   # Encoder-Push ≥ 1s = Voice-PTT
 
 
 class Buttons:
@@ -52,7 +57,12 @@ class Buttons:
         )
         self.push = GpioButton(
             ENCODER_PUSH_PIN, pull_up=True, bounce_time=DEBOUNCE_S,
-            hold_time=PUSH_HOLD_SECONDS,
+        )
+        self.yellow = GpioButton(
+            YELLOW_PIN, pull_up=True, bounce_time=DEBOUNCE_S,
+        )
+        self.blue = GpioButton(
+            BLUE_PIN, pull_up=True, bounce_time=DEBOUNCE_S,
         )
 
         # Drei-Stufen-Funktion grün (press / stop ≥1s / held ≥10s)
@@ -75,18 +85,21 @@ class Buttons:
         self.red.when_held = self._on_red_stop_reached
         self.red.when_released = self._on_red_released
 
-        # Zwei-Stufen-Funktion push (kurz = Pause/Play, lang ≥ 1s = Voice-PTT)
+        # Encoder-Push: single-press → main.py macht den Burst-Counter selbst.
         self._push_press_cb: Optional[Callable[[], None]] = None
-        self._push_held_cb: Optional[Callable[[], None]] = None
-        self._push_was_held: bool = False
-        self.push.when_held = self._on_push_internal_held
-        self.push.when_released = self._on_push_internal_released
+        self.push.when_pressed = self._on_push_internal_pressed
+
+        # Gelb + Blau: single-press, kein Hold.
+        self._yellow_press_cb: Optional[Callable[[], None]] = None
+        self._blue_press_cb: Optional[Callable[[], None]] = None
+        self.yellow.when_pressed = self._on_yellow_internal_pressed
+        self.blue.when_pressed = self._on_blue_internal_pressed
 
         logger.info(
-            "Buttons ready: green=GPIO%d red=GPIO%d push=GPIO%d "
-            "(stop ≥ %.0fs, long ≥ %.0fs, push-voice ≥ %.0fs)",
-            GREEN_PIN, RED_PIN, ENCODER_PUSH_PIN,
-            STOP_HOLD_SECONDS, HOLD_SECONDS, PUSH_HOLD_SECONDS,
+            "Buttons ready: green=GPIO%d red=GPIO%d push=GPIO%d yellow=GPIO%d blue=GPIO%d "
+            "(stop ≥ %.0fs, long ≥ %.0fs)",
+            GREEN_PIN, RED_PIN, ENCODER_PUSH_PIN, YELLOW_PIN, BLUE_PIN,
+            STOP_HOLD_SECONDS, HOLD_SECONDS,
         )
 
     def on_green(self, callback: Callable[[], None]) -> None:
@@ -114,12 +127,16 @@ class Buttons:
         self._red_held_cb = callback
 
     def on_push(self, callback: Callable[[], None]) -> None:
-        """Kurzer Push (< PUSH_HOLD_SECONDS) — z.B. Pause/Play-Toggle."""
+        """Encoder-Push — feuert bei jedem Druck. main.py bündelt Bursts selbst."""
         self._push_press_cb = callback
 
-    def on_push_held(self, callback: Callable[[], None]) -> None:
-        """Push ≥ PUSH_HOLD_SECONDS — z.B. Voice-Push-to-Talk."""
-        self._push_held_cb = callback
+    def on_yellow(self, callback: Callable[[], None]) -> None:
+        """Gelb — Pause/Play-Toggle."""
+        self._yellow_press_cb = callback
+
+    def on_blue(self, callback: Callable[[], None]) -> None:
+        """Blau — Voice-Push-to-Talk (Aufnahme)."""
+        self._blue_press_cb = callback
 
     # ---- Internals -------------------------------------------------------
 
@@ -204,27 +221,29 @@ class Buttons:
             except Exception as e:
                 logger.exception("on_red callback failed: %s", e)
 
-    def _on_push_internal_held(self) -> None:
-        self._push_was_held = True
-        if self._push_held_cb:
-            try:
-                self._push_held_cb()
-            except Exception as e:
-                logger.exception("on_push_held callback failed: %s", e)
-
-    def _on_push_internal_released(self) -> None:
-        was_held = self._push_was_held
-        self._push_was_held = False
-        if was_held:
-            return
+    def _on_push_internal_pressed(self) -> None:
         if self._push_press_cb:
             try:
                 self._push_press_cb()
             except Exception as e:
                 logger.exception("on_push callback failed: %s", e)
 
+    def _on_yellow_internal_pressed(self) -> None:
+        if self._yellow_press_cb:
+            try:
+                self._yellow_press_cb()
+            except Exception as e:
+                logger.exception("on_yellow callback failed: %s", e)
+
+    def _on_blue_internal_pressed(self) -> None:
+        if self._blue_press_cb:
+            try:
+                self._blue_press_cb()
+            except Exception as e:
+                logger.exception("on_blue callback failed: %s", e)
+
     def close(self) -> None:
-        for b in (self.green, self.red, self.push):
+        for b in (self.green, self.red, self.push, self.yellow, self.blue):
             try:
                 b.close()
             except Exception:
