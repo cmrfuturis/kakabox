@@ -46,6 +46,7 @@ from audio.library import scan
 from audio.player import Player
 from hardware.audio_output import set_volume
 from hardware.buttons import Buttons
+from hardware.leds import Leds, LedsUnavailable
 from hardware.nfc import PN532
 from hardware.rotary_encoder import Encoder as RotaryEncoder
 from network import Backend, BackendError
@@ -142,7 +143,7 @@ logging.basicConfig(
 logger = logging.getLogger("kakabox")
 
 
-DEFAULT_SYSTEM_VOLUME = 60  # Lautstärke für Boot-/WLAN-/Bye-Prompts
+DEFAULT_SYSTEM_VOLUME = 25  # Lautstärke für Boot-/WLAN-/Bye-Prompts (gedämpft, User-Wunsch — laute Default-Ansagen erschrecken)
 
 
 def load_config() -> dict:
@@ -208,6 +209,18 @@ class Kakabox:
         self.nfc = PN532()
         self.buttons = self._safe_init("buttons", Buttons)
         self.encoder = self._safe_init("rotary encoder", RotaryEncoder)
+        # LEDs: optional — wenn Adafruit-Lib oder Pi-5-Backend fehlt, läuft die
+        # Box ohne visuelles Feedback weiter. WICHTIG: solange DIN auf GPIO 18
+        # liegt, blockiert die LED-Init den MAX98357A-Speaker (selber Pin).
+        # Geplanter Fix: DIN auf GPIO 10 (SPI MOSI) umlöten → Pi5Neo statt
+        # Adafruit; dann läuft beides parallel.
+        # Bis dahin: Override via Env-Var, um Speaker für Audio-Tests freizugeben
+        # (Service läuft dann mit Knöpfen + Speaker, nur ohne LED-Feedback).
+        if os.environ.get("KAKABOX_DISABLE_LEDS") == "1":
+            logger.info("LEDs deaktiviert via KAKABOX_DISABLE_LEDS — Speaker frei.")
+            self.leds = None
+        else:
+            self.leds = self._safe_init("leds", Leds)
 
         try:
             self.backend = Backend(IDENTITY_PATH)
@@ -617,6 +630,10 @@ class Kakabox:
 
     def _handle_tag(self, uid: str) -> None:
         logger.info("NFC tag erkannt: %s", uid)
+        # Status-LED sofort grün — visuelles Feedback bevor wir Cache/Backend
+        # befragen, damit der User direkt sieht "ja, Chip wurde gelesen".
+        if self.leds is not None:
+            self.leds.nfc_chip_present()
 
         # Cache-first: bekannter Tag mit allen Audios lokal → sofort spielen,
         # Backend-Sync läuft im Hintergrund (siehe _refresh_tag_in_background).
@@ -778,6 +795,14 @@ class Kakabox:
 
         if not playlist.start(start_index=start_index, start_position=start_position):
             logger.warning("Konnte Playlist nicht starten.")
+            return
+        # Streifen: Tanz an + kurze Position-Anzeige beim Start. Beim Resume
+        # zeigt das gleich die richtige Stelle (start_index ≥ 0).
+        if self.leds is not None:
+            self.leds.strips_dance_start()
+            self.leds.strips_show_position(
+                playlist.current_index, playlist.length,
+            )
 
     def _compute_resume(self, uid: str) -> tuple[int, float]:
         """Wenn die zuletzt entfernte Kaka derselben UID = jetzt aufgelegt: resume."""
@@ -792,6 +817,11 @@ class Kakabox:
 
     def _on_tag_removed(self, uid: Optional[str]) -> None:
         """Aktiver Chip vom Reader weg → Snapshot speichern + Wiedergabe stoppen."""
+        # NFC-Status-LED aus + Streifen-Animation aus — "Chip ist weg" sofort
+        # sichtbar, vor Snapshot etc.
+        if self.leds is not None:
+            self.leds.nfc_chip_absent()
+            self.leds.strips_dance_stop()
         # Speed-Mode beenden — Snapshot/Resume soll mit Normalgeschwindigkeit
         # weiterlaufen, nicht im 200%-Chipmunk-Modus.
         if self._speed_mode:
@@ -905,6 +935,10 @@ class Kakabox:
             playlist = self._current_playlist
         if playlist:
             playlist.previous()
+            if self.leds is not None:
+                self.leds.strips_show_position(
+                    playlist.current_index, playlist.length,
+                )
 
     def _on_red_pressed(self) -> None:
         """Rot kurz: Nächster Track mit Loop."""
@@ -915,6 +949,10 @@ class Kakabox:
             playlist = self._current_playlist
         if playlist:
             playlist.next()
+            if self.leds is not None:
+                self.leds.strips_show_position(
+                    playlist.current_index, playlist.length,
+                )
 
     def _on_green_stop(self) -> None:
         """Grün ≥ 1s: Wiedergabe komplett stoppen + Resume-Position vergessen."""
@@ -950,6 +988,8 @@ class Kakabox:
         except Exception as e:
             logger.warning("Player.stop nach Full-Stop fehlgeschlagen: %s", e)
         self._last_kaka_memory = None
+        if self.leds is not None:
+            self.leds.strips_dance_stop()
         logger.info("Full stop (%s) — Memory geleert.", reason)
 
     def _on_green_held(self) -> None:
@@ -1035,6 +1075,11 @@ class Kakabox:
 
         with self._playlist_lock:
             playlist_active = self._current_playlist is not None
+
+        logger.info(
+            "🟦 Push (burst %d/%d, playlist=%s)",
+            len(self._push_times), SPEED_BURST_COUNT, playlist_active,
+        )
 
         if len(self._push_times) >= SPEED_BURST_COUNT and playlist_active:
             logger.info("🟦×%d → Speed-Mode aktiv", SPEED_BURST_COUNT)
@@ -1221,12 +1266,16 @@ class Kakabox:
         # umgestellt — sicherstellen, dass die Wiedergabe wirklich läuft.
         if self.player.get_state().paused:
             self.player.resume()
+        if self.leds is not None:
+            self.leds.show_speed(self._speed)
 
     def _exit_speed_mode(self) -> None:
         self._speed_mode = False
         self._speed = 1.0
         self.player.set_speed(1.0)
         logger.info("⏩ Speed zurück auf 100%%")
+        if self.leds is not None:
+            self.leds.hide_speed()
 
     def _adjust_speed(self, delta: float) -> None:
         # Auf 2 Nachkommastellen runden, sonst bekommen wir durch float-Drift
@@ -1237,10 +1286,17 @@ class Kakabox:
         self._speed = new_speed
         self.player.set_speed(new_speed)
         logger.info("⏩ Speed: %d%%", int(round(new_speed * 100)))
+        if self.leds is not None:
+            self.leds.show_speed(new_speed)
 
     def _adjust_volume(self, delta: int) -> None:
         new_vol = max(0, min(100, self._volume + delta))
         if new_vol == self._volume:
+            # Auch bei "schon am Anschlag"-Drehung Ring zeigen, damit der User
+            # sieht: ja, ich habe registriert was du gedreht hast, mehr geht
+            # halt nicht. Sonst bleibt der Ring stumm und es fühlt sich kaputt an.
+            if self.leds is not None:
+                self.leds.show_volume(self._volume)
             return
         self._volume = new_vol
         try:
@@ -1251,6 +1307,8 @@ class Kakabox:
         self.config["volume"] = new_vol
         save_config(self.config)
         logger.info("🔊 Volume: %d%%", new_vol)
+        if self.leds is not None:
+            self.leds.show_volume(new_vol)
 
     # ------------------------------------------------------------------
     # Shutdown
@@ -1268,6 +1326,8 @@ class Kakabox:
             self.buttons.close()
         if self.encoder is not None:
             self.encoder.close()
+        if self.leds is not None:
+            self.leds.close()
         save_config(self.config)
         logger.info("Bye.")
 
