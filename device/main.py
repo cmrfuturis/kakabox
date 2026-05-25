@@ -234,6 +234,20 @@ class Kakabox:
 
         self._volume = self.config.get("volume", 70)
         self._system_volume = int(self.config.get("system_volume", DEFAULT_SYSTEM_VOLUME))
+        # max_volume = HARD-Cap für die User-Lautstärke. Webapp kann per
+        # rule.max_volume im Manifest einen Wert vorgeben (Eltern-Schutz).
+        # Default 100 = kein Cap. Wird in _apply_rule_from_manifest gepflegt.
+        self._max_volume = int(self.config.get("max_volume", 100))
+        # Falls die persistierte volume schon über dem Cap liegt (z.B. weil
+        # max_volume neu gesetzt wurde während die Box offline war), gleich
+        # beim Boot klemmen.
+        if self._volume > self._max_volume:
+            logger.info(
+                "Boot-Volume %d über Cap %d — auf Cap geklemmt.",
+                self._volume, self._max_volume,
+            )
+            self._volume = self._max_volume
+            self.config["volume"] = self._volume
         try:
             set_volume(self._volume)
         except Exception as e:
@@ -516,6 +530,9 @@ class Kakabox:
         # Per-Box-Settings aus dem Backend übernehmen (z.B. system_volume vom
         # Webapp-Override). Fehlt das Feld → bei aktuellem Wert bleiben.
         self._apply_settings_from_manifest(manifest.get("settings") or {})
+        # Box-Rule (z.B. max_volume Hard-Cap) — separater Block weil
+        # semantisch was anderes als die Settings.
+        self._apply_rule_from_manifest(manifest.get("rule") or {})
 
     def _write_voice_catalog(self, files: list[dict]) -> None:
         """Schreibt eine kompakte Liste (content_id, title, aliases) für Voice-Match.
@@ -566,6 +583,36 @@ class Kakabox:
         self._system_volume = sys_vol
         self.config["system_volume"] = sys_vol
         save_config(self.config)
+
+    def _apply_rule_from_manifest(self, rule: dict) -> None:
+        """Übernimmt ``rule.max_volume`` aus dem Manifest als Hard-Cap.
+
+        Der Cap begrenzt, wie weit der User die Lautstärke per Encoder
+        hochdrehen kann (Eltern-Schutz). Wenn die aktuelle Lautstärke nach
+        einem strenger werdenden Cap zu laut ist, wird sie sofort
+        runtergezogen — sonst bliebe die laufende Wiedergabe ungebremst.
+        Wird in config.json gespiegelt, damit Offline-Boot den letzten
+        Stand behält.
+        """
+        max_vol = rule.get("max_volume")
+        if max_vol is None:
+            return
+        try:
+            max_vol = int(max_vol)
+        except (TypeError, ValueError):
+            logger.warning("rule.max_volume nicht numerisch: %r", max_vol)
+            return
+        max_vol = max(0, min(100, max_vol))
+        if max_vol == self._max_volume:
+            return
+        logger.info("max_volume vom Backend: %d → %d", self._max_volume, max_vol)
+        self._max_volume = max_vol
+        self.config["max_volume"] = max_vol
+        save_config(self.config)
+        # Aktuelle Lautstärke über dem neuen Cap? Sofort runter — mit dem
+        # üblichen _adjust_volume-Pfad, damit Player + LEDs konsistent sind.
+        if self._volume > self._max_volume:
+            self._adjust_volume(self._max_volume - self._volume)
 
     # ------------------------------------------------------------------
     # NFC-Loop (mit Multi-Chip-Tracking)
@@ -1290,7 +1337,10 @@ class Kakabox:
             self.leds.show_speed(new_speed)
 
     def _adjust_volume(self, delta: int) -> None:
-        new_vol = max(0, min(100, self._volume + delta))
+        # Hard-Cap aus rule.max_volume (Webapp / Eltern-Setting). Wenn die
+        # Webapp keinen Cap gesetzt hat, bleibt _max_volume=100, also wie
+        # vorher.
+        new_vol = max(0, min(self._max_volume, self._volume + delta))
         if new_vol == self._volume:
             # Auch bei "schon am Anschlag"-Drehung Ring zeigen, damit der User
             # sieht: ja, ich habe registriert was du gedreht hast, mehr geht
