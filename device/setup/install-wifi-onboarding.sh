@@ -158,6 +158,12 @@ install_prompt "A cheerful welcomin.wav"        listening.wav       de 145 50 \
 install_prompt "Wie-heißt-das-Zauberwort.wav"   zauberwort.wav      de 145 50 \
     "Wie heißt das Zauberwort?"
 
+install_prompt "Cartoonish successful.wav"      voice_success.wav   de 140 50 \
+    "Habe verstanden!"
+
+install_prompt "Cartoonish error.wav"           voice_error.wav     de 140 50 \
+    "Habe nichts verstanden."
+
 # ──────────────────────────────────────────────────────────────────────────
 # 5. systemd-Units
 # ──────────────────────────────────────────────────────────────────────────

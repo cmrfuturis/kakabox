@@ -1661,17 +1661,21 @@ class Kakabox:
                 "Voice match: kind=%s name='%s' score=%.2f query='%s'",
                 cmd.target.kind, cmd.target.name, cmd.score, cmd.query,
             )
-            # Match → Tag-UID für Continue-Logik merken (snapshot vorher),
+            # Match → Erfolgs-Sound (cartoonish), kurz warten bis er durch ist,
             # dann Voice-Target abspielen. Voice-Mode wird in _play_voice_target gesetzt.
             self._voice_pending_tag_uid = saved_tag_uid
             self._voice_last_target = cmd.target
+            self._play_prompt("voice_success.wav")
+            self.player.wait_until_idle(timeout=2.0)
             self._play_voice_target(cmd.target)
             recovered = True  # neue Wiedergabe läuft, kein Restore nötig
         finally:
             # Wenn vorher eine Kakafigur lief UND nichts Neues gestartet wurde:
-            # Kakafigur an gemerkter Position re-starten.
+            # Erst Error-Sound, dann Kakafigur/Random restoren.
             if not recovered:
                 try:
+                    self._play_prompt("voice_error.wav")
+                    self.player.wait_until_idle(timeout=2.0)
                     _restore_previous("kein Match / Recording fail / ASR fail")
                 except Exception as e:
                     logger.warning("Resume nach Voice-Abbruch fehlgeschlagen: %s", e)
