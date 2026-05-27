@@ -29,6 +29,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import secrets
 import signal
 import subprocess
@@ -44,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from audio import AudioCache, KakaContent, Playlist, PlaylistSnapshot
 from audio.library import scan
 from audio.player import Player
+from audio.spectrum import SpectrumCapture
 from hardware.audio_output import set_volume
 from hardware.buttons import Buttons
 from hardware.leds import Leds, LedsUnavailable
@@ -72,6 +74,8 @@ APLAY_PROMPT_PID = Path("/run/kakabox/prompt_pid")  # vom Comitup-Callback gesch
 VOLUME_STEP = 5            # Encoder-Klick = 5 Prozentpunkte
 HEARTBEAT_INTERVAL = 30
 AUDIO_SYNC_INTERVAL = 300  # 5 Minuten
+SYNC_RETRY_BACKOFF_SECONDS = 3600  # 1h: failed Downloads nicht jeden Zyklus retry'en
+                                   # (verhindert Log-Spam bei kaputten Backend-Storage-IDs)
 TAG_REMOVAL_THRESHOLD = 2  # NFC: aufeinanderfolgende Leer-Reads bis "Chip entfernt"
 
 # Geheimer Speed-Mode (Easter Egg): 4× Encoder-Push in 3s während Wiedergabe →
@@ -221,6 +225,8 @@ class Kakabox:
             self.leds = None
         else:
             self.leds = self._safe_init("leds", Leds)
+            if self.leds is not None:
+                logger.info("LEDs initialisiert (Pi5Neo / SPI MOSI / GPIO 10)")
 
         try:
             self.backend = Backend(IDENTITY_PATH)
@@ -248,10 +254,8 @@ class Kakabox:
             )
             self._volume = self._max_volume
             self.config["volume"] = self._volume
-        try:
-            set_volume(self._volume)
-        except Exception as e:
-            logger.warning("ALSA volume control unavailable: %s", e)
+        # MAX98357A hat keinen Hardware-Mixer → kein amixer-Call. Lautstärke
+        # wird ausschließlich über mpv softvol gesteuert.
         self.player.set_volume(self._volume)
 
         self._running = False
@@ -264,6 +268,51 @@ class Kakabox:
         self._speed_mode = False
         self._speed = 1.0
         self._push_times: list[float] = []
+
+        # Random-Mode: Encoder-Push ≥ 1s startet eine zufällige Playlist aus
+        # dem ganzen lokalen Audio-Cache (Lieder ohne Chip auflegen). Tag-
+        # Auflegen unterbricht den Modus zugunsten der Tag-Playlist; Tag-
+        # Wegnehmen geht in Ruhe (kein Auto-Random), Hold im Random startet
+        # die Session neu (neue Reihenfolge).
+        self._random_mode = False
+
+        # Voice-Mode: True während ein per Sprache erkannter Track läuft.
+        # Continue-Logik beim Voice-Track-Ende:
+        #   - _voice_pending_tag_uid noch aktiv (Tag liegt noch drauf):
+        #     Kakafigur-Wiedergabe wieder von vorne starten
+        #   - sonst: Random-Modus
+        # Tag-Removal während Voice → nur pending_uid clearen, Voice spielt durch.
+        # Tag-Auflegen während Voice → normale Kakafigur-Logik (überschreibt Voice).
+        self._voice_mode = False
+        self._voice_pending_tag_uid: Optional[str] = None
+        # Letztes Voice-Target, falls User per Grün den Voice-Track neu starten will.
+        self._voice_last_target: Optional[Candidate] = None
+
+        # Backoff-Map für Sync: content_id → time.monotonic() des letzten
+        # Failures. Verhindert dass die Box jeden Sync-Zyklus erneut
+        # Downloads für IDs versucht, die das Backend mit 404 abweist
+        # (Backend-Storage-Inkonsistenz). Nach SYNC_RETRY_BACKOFF_SECONDS
+        # darf jede ID erneut probiert werden — falls der Backend-Admin
+        # die Datei zwischenzeitlich nachgereicht hat.
+        self._sync_failures: dict[int, float] = {}
+
+        # Spectrum-Capture: liest fortlaufend Audio vom snd-aloop Loopback
+        # und füttert die LED-Streifen mit Frequenzbändern (audio-reaktiver
+        # Tanz). Wird optional initialisiert — wenn snd-aloop / asound.conf
+        # fehlt, läuft die Box weiter, nur die Streifen tanzen dann Pseudo.
+        # Energy-Save: ``_spectrum_active`` event steuert ob der arecord-
+        # Subprozess wirklich läuft. An: Wiedergabe spielt → Streifen tanzen.
+        # Aus: Idle (kein Tag, kein Random, kein Voice-Track) → arecord stoppt,
+        # FFT pausiert, CPU runter.
+        self._spectrum: Optional[SpectrumCapture] = None
+        self._spectrum_thread: Optional[threading.Thread] = None
+        self._spectrum_stop = threading.Event()
+        self._spectrum_active = threading.Event()
+        if self.leds is not None:
+            try:
+                self._spectrum = SpectrumCapture(n_bands=16)
+            except Exception:
+                logger.exception("SpectrumCapture-Init fehlgeschlagen — Pseudo-Tanz bleibt")
 
         # Voice-Stack. Backend (vosk|whisper) kommt aus config.json → "voice.backend".
         # Recognizer instanziieren ist billig; das eigentliche Modell wird in einem
@@ -355,20 +404,24 @@ class Kakabox:
             logger.warning("%s unavailable: %s — feature disabled", label, e)
             return None
 
-    def _play_prompt(self, filename: str) -> None:
+    def _play_prompt(self, filename: str, volume: Optional[int] = None) -> None:
         """Spielt eine Boot-/Status-Ansage über den Player (gleiches ALSA-Device wie mpv).
 
-        Nutzt ``player.play_prompt`` mit ``self._system_volume`` — so klebt die
-        oft-zu-laute Default-Lautstärke nicht an Boot-/Bye-Sounds. Der Knopf-
-        Druck während eines Prompts bricht ihn via ``player.stop()`` ab (siehe
-        Button-Handler).
+        ``volume=None`` (Default) → nutzt ``self._volume`` (die aktuell vom
+        User per Encoder gewählte Lautstärke). System-Prompts (Boot, WLAN-
+        Reset, Tschau, Listening, Zauberwort) sollen sich so anhören wie die
+        Musik, statt einen separaten gedämpften Pegel zu nutzen — sonst
+        kommt manchen User der Boot-Sound zu leise vor, anderen zu laut.
+        ``volume=<int>`` → expliziter Override (z.B. für system_volume,
+        wenn ein Prompt mal anders sein soll).
         """
         path = PROMPTS_DIR / filename
         if not path.is_file():
             logger.debug("Prompt nicht gefunden: %s", path)
             return
+        actual_volume = volume if volume is not None else self._volume
         try:
-            self.player.play_prompt(str(path), self._system_volume)
+            self.player.play_prompt(str(path), actual_volume)
         except Exception as e:
             logger.warning("Prompt-Wiedergabe fehlgeschlagen (%s): %s", filename, e)
 
@@ -386,6 +439,7 @@ class Kakabox:
         self.buttons.on_red_stop(self._on_red_stop)
         self.buttons.on_red_held(self._on_red_held)
         self.buttons.on_push(self._on_push_pressed)
+        self.buttons.on_push_held(self._on_push_held)
         self.buttons.on_yellow(self._on_yellow_pressed)
         self.buttons.on_blue(self._on_blue_pressed)
 
@@ -423,6 +477,17 @@ class Kakabox:
         if self.backend and self.backend.is_connected:
             threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat").start()
             threading.Thread(target=self._audio_sync_loop, daemon=True, name="audio-sync").start()
+
+        # Spectrum-Capture läuft dauerhaft im Hintergrund. arecord vom
+        # Loopback blockt sauber, wenn gerade nichts gespielt wird (sendet
+        # Stille / 0-Werte) — kein Schaden. LEDs nehmen die Werte nur an,
+        # wenn ihre eigene Tanz-Animation aktiv ist (siehe leds.update_spectrum).
+        if self._spectrum is not None:
+            self._spectrum_stop.clear()
+            self._spectrum_thread = threading.Thread(
+                target=self._spectrum_loop, daemon=True, name="spectrum"
+            )
+            self._spectrum_thread.start()
 
         # REST-API (Max's Feature) optional starten. Auf Port 8001, damit der
         # Pi-Backend-Client (KAKABOX_BACKEND, default localhost:8000) weiterhin
@@ -488,6 +553,12 @@ class Kakabox:
         files = manifest.get("manifest", [])
         files.sort(key=lambda m: 0 if m.get("priority") == "high" else 1)
 
+        now = time.monotonic()
+        cached_already = 0
+        downloaded = 0
+        failed_new = 0
+        skipped_backoff = 0
+
         for entry in files:
             if not self._running:
                 return
@@ -496,16 +567,40 @@ class Kakabox:
             if not content_id or not file_hash:
                 continue
             if self.audio_cache.is_cached(content_id, file_hash):
+                cached_already += 1
                 continue
-            logger.info("Sync: lade '%s' (id=%d)", entry.get("title"), content_id)
+            # Backoff: wenn der Download vor < SYNC_RETRY_BACKOFF_SECONDS
+            # bereits fehlgeschlagen ist, nicht nochmal versuchen. Spart
+            # Log-Spam + Bandbreite, wenn das Backend dauerhaft 404 liefert.
+            last_fail = self._sync_failures.get(content_id)
+            if last_fail and now - last_fail < SYNC_RETRY_BACKOFF_SECONDS:
+                skipped_backoff += 1
+                continue
+
+            logger.debug("Sync: lade '%s' (id=%d)", entry.get("title"), content_id)
             target = self.audio_cache.path_for(content_id)
             if self.backend.download_audio(content_id, target):
                 actual_hash = self.audio_cache.compute_hash(target)
                 if actual_hash != file_hash:
                     logger.error("Sync: Hash-Mismatch für content=%d — verworfen", content_id)
                     target.unlink(missing_ok=True)
+                    self._sync_failures[content_id] = now
+                    failed_new += 1
                 else:
                     self.backend.report_audio_cached(content_id, file_hash)
+                    self._sync_failures.pop(content_id, None)
+                    downloaded += 1
+            else:
+                self._sync_failures[content_id] = now
+                failed_new += 1
+
+        # Eine kompakte Summary-Zeile statt 70+ einzelne Warnings.
+        # Nur loggen wenn was passiert ist UND was zusagen ist.
+        if downloaded or failed_new:
+            logger.info(
+                "Sync: %d neu geladen, %d fehlgeschlagen, %d bereits gecached, %d in Backoff",
+                downloaded, failed_new, cached_already, skipped_backoff,
+            )
 
         # Veraltete Dateien entfernen — der Manifest ist die Quelle der Wahrheit.
         # So werden Lieder, die in der Web-App aus allen Kakas entfernt wurden,
@@ -839,6 +934,11 @@ class Kakabox:
             )
             self._current_playlist = playlist
             self._active_tag_uid = uid
+            # Tag-Playback überschreibt Random + Voice — beide Flags aus.
+            self._random_mode = False
+            self._voice_mode = False
+            self._voice_pending_tag_uid = None
+            self._voice_last_target = None
 
         if not playlist.start(start_index=start_index, start_position=start_position):
             logger.warning("Konnte Playlist nicht starten.")
@@ -850,6 +950,93 @@ class Kakabox:
             self.leds.strips_show_position(
                 playlist.current_index, playlist.length,
             )
+
+    # ------------------------------------------------------------------
+    # Random-Mode (Encoder-Push ≥ 1s)
+    # ------------------------------------------------------------------
+
+    def _all_cached_contents(self) -> list[KakaContent]:
+        """Sammelt alle Tracks, die in irgendeinem Tag-Cache referenziert UND
+        lokal gecached sind. De-dupliziert über content_id.
+
+        So bekommen wir "alle Lieder der Box" ohne extra Bibliotheks-Index —
+        der Tag-Cache ist die Quelle der Wahrheit für Track-Metadaten (Titel),
+        der Audio-Cache für die tatsächlichen Dateien.
+        """
+        seen: set[int] = set()
+        out: list[KakaContent] = []
+        for entry in self._tag_cache.values():
+            kaka = entry.get("kaka") or {}
+            for c in kaka.get("contents", []):
+                try:
+                    cid = int(c.get("id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if cid <= 0 or cid in seen:
+                    continue
+                if not self.audio_cache.is_cached(cid, c.get("file_hash")):
+                    continue
+                seen.add(cid)
+                out.append(KakaContent(
+                    content_id=cid,
+                    title=c.get("title", ""),
+                    file_hash=c.get("file_hash"),
+                    download_url=c.get("download_url"),
+                    cached_locally=True,
+                    sort_order=0,  # für Random egal — wird eh geshuffled
+                ))
+        return out
+
+    def _start_random_mode(self) -> None:
+        """Startet (oder restartet) den Random-Modus: alle lokalen Tracks
+        in zufälliger Reihenfolge. Funktioniert ohne Chip.
+
+        Bei Hold während Random bereits läuft: einfach neue zufällige
+        Reihenfolge generieren und von vorne anfangen (User-Wunsch: "wie
+        eine session, die neu losgeht").
+        """
+        contents = self._all_cached_contents()
+        if not contents:
+            logger.warning("🎲 Random-Modus: keine gecachten Tracks gefunden.")
+            return
+        random.shuffle(contents)
+        logger.info("🎲 Random-Modus startet mit %d Tracks", len(contents))
+
+        with self._playlist_lock:
+            if self._current_playlist:
+                self._current_playlist.stop()
+
+            playlist = Playlist(
+                contents=contents,
+                cache=self.audio_cache,
+                download_fn=lambda cid, path: bool(self.backend) and self.backend.download_audio(cid, path),
+                play_fn=self.player.play_file,
+                stop_fn=self.player.stop,
+                position_fn=self.player.current_position_seconds,
+                seek_fn=self.player.seek_to,
+            )
+            self._current_playlist = playlist
+            self._active_tag_uid = None  # kein Tag aktiv
+            self._random_mode = True
+            self._voice_mode = False
+            self._voice_pending_tag_uid = None
+            self._voice_last_target = None
+            self._last_kaka_memory = None  # kein Resume aus Random
+
+        if not playlist.start():
+            logger.warning("Random-Playlist konnte nicht starten.")
+            with self._playlist_lock:
+                self._current_playlist = None
+                self._random_mode = False
+            return
+        if self.leds is not None:
+            self.leds.strips_dance_start()
+            self.leds.strips_show_position(
+                playlist.current_index, playlist.length,
+            )
+            # Random-Indikator auf NFC-LED: lila pulsierend, damit der
+            # User auf einen Blick sieht "ich bin im Random-Modus".
+            self.leds.nfc_random_active()
 
     def _compute_resume(self, uid: str) -> tuple[int, float]:
         """Wenn die zuletzt entfernte Kaka derselben UID = jetzt aufgelegt: resume."""
@@ -863,7 +1050,21 @@ class Kakabox:
         return 0, 0.0
 
     def _on_tag_removed(self, uid: Optional[str]) -> None:
-        """Aktiver Chip vom Reader weg → Snapshot speichern + Wiedergabe stoppen."""
+        """Aktiver Chip vom Reader weg → Snapshot speichern + Wiedergabe stoppen.
+
+        Sonderfall Voice-Mode: Voice-Track läuft weiter (User-Wunsch). Wir
+        clearen nur ``_voice_pending_tag_uid``, damit beim Voice-Ende die
+        Continue-Logik weiß "kein Tag mehr, fall back auf Random".
+        """
+        if self._voice_mode:
+            if uid == self._voice_pending_tag_uid:
+                logger.info("Chip %s während Voice entfernt — Voice spielt weiter, "
+                            "Continue → Random.", uid)
+                self._voice_pending_tag_uid = None
+            # NFC-LED aus (Tag wirklich weg), aber Streifen + Player bleiben.
+            if self.leds is not None:
+                self.leds.nfc_chip_absent()
+            return
         # NFC-Status-LED aus + Streifen-Animation aus — "Chip ist weg" sofort
         # sichtbar, vor Snapshot etc.
         if self.leds is not None:
@@ -879,6 +1080,9 @@ class Kakabox:
             self._current_playlist = None
             removed_uid = self._active_tag_uid
             self._active_tag_uid = None
+            # Random war ohnehin nicht aktiv (Tag lag drauf), aber sicher ist
+            # sicher — Flag zurücksetzen, damit Folge-Aktionen sauber starten.
+            self._random_mode = False
 
         if playlist and removed_uid:
             snapshot = playlist.snapshot()
@@ -902,8 +1106,32 @@ class Kakabox:
     def _on_track_end(self) -> None:
         with self._playlist_lock:
             playlist = self._current_playlist
-        if playlist:
-            playlist.on_track_end()
+        if not playlist:
+            return
+        # Vorm Advance prüfen ob das der letzte Track war (Playlist beendet).
+        # Im Voice-Mode triggern wir dann die Continue-Logik (Kakafigur oder Random).
+        was_last = playlist.current_index >= playlist.length - 1
+        playlist.on_track_end()
+        if was_last and self._voice_mode:
+            self._voice_continue()
+
+    def _voice_continue(self) -> None:
+        """Voice-Playlist zu Ende → Kakafigur fortsetzen (falls Tag noch drauf)
+        sonst Random-Modus starten."""
+        self._voice_mode = False
+        self._voice_last_target = None
+        pending = self._voice_pending_tag_uid
+        self._voice_pending_tag_uid = None
+        if pending:
+            cached = self._tag_cache.get(pending)
+            if cached:
+                logger.info("Voice fertig → Kakafigur '%s' geht weiter", pending)
+                self._start_kaka_playlist(pending, cached.get("kaka") or {})
+                return
+        logger.info("Voice fertig → Random-Modus")
+        threading.Thread(
+            target=self._start_random_mode, daemon=True, name="voice-random-fallback"
+        ).start()
 
     def _fallback_local_lookup(self, uid: str) -> None:
         """Backend nicht erreichbar → erst Tag-Cache, dann Legacy-Album-Mapping.
@@ -974,32 +1202,75 @@ class Kakabox:
         return aborted
 
     def _on_green_pressed(self) -> None:
-        """Grün: Track zurück, oder Neustart wenn schon > 5s gelaufen, mit Loop."""
+        """Grün: Track zurück, oder Neustart wenn schon > 5s gelaufen.
+
+        Im Voice-Mode: Voice-Track neu starten (von vorne).
+        Sonst: Playlist.previous + Resume (hebt Pause auf, damit Skip aus
+        dem Pause-Zustand sofort spielt).
+        """
         logger.info("🟢 Grün")
         if self._abort_prompt_if_playing():
+            return
+        if self._voice_mode and self._voice_last_target is not None:
+            logger.info("🟢 Voice-Modus: Track neu starten")
+            target = self._voice_last_target
+            # _play_voice_target setzt voice_mode + räumt Playlist neu auf.
+            # pending_tag_uid bleibt erhalten — User möchte das gleiche Verhalten.
+            self._play_voice_target(target)
             return
         with self._playlist_lock:
             playlist = self._current_playlist
         if playlist:
             playlist.previous()
+            self.player.resume()
             if self.leds is not None:
                 self.leds.strips_show_position(
                     playlist.current_index, playlist.length,
                 )
+                # Track-Skip hebt Pause auf → NFC-LED zurück zum Mode-Status.
+                self._restore_idle_led()
 
     def _on_red_pressed(self) -> None:
-        """Rot kurz: Nächster Track mit Loop."""
+        """Rot: Nächster Track.
+
+        Im Voice-Mode + Tag noch drauf: Voice abbrechen, Kakafigur beim
+        nächsten Track weiter (User-Wunsch: "weiterklicken bei Voice + Tag
+        drauf = Kakafigur nächster Track").
+        Im Voice-Mode ohne Tag: einfach Voice-Continue (Random oder Stop).
+        Sonst: Playlist.next + Resume.
+        """
         logger.info("🔴 Rot")
         if self._abort_prompt_if_playing():
+            return
+        if self._voice_mode:
+            pending = self._voice_pending_tag_uid
+            if pending and pending in self._tag_cache:
+                logger.info("🔴 Voice-Modus: zurück zur Kakafigur '%s', nächster Track", pending)
+                # Voice abbrechen, Kakafigur starten, dann gleich next()
+                self._voice_mode = False
+                self._voice_last_target = None
+                self._voice_pending_tag_uid = None
+                self._start_kaka_playlist(pending, self._tag_cache[pending].get("kaka") or {})
+                with self._playlist_lock:
+                    playlist = self._current_playlist
+                if playlist:
+                    playlist.next()
+                    self.player.resume()
+                return
+            # Voice ohne Tag → Random oder Stop via Continue-Logik
+            self._voice_continue()
             return
         with self._playlist_lock:
             playlist = self._current_playlist
         if playlist:
             playlist.next()
+            self.player.resume()
             if self.leds is not None:
                 self.leds.strips_show_position(
                     playlist.current_index, playlist.length,
                 )
+                if self._active_tag_uid is not None:
+                    self.leds.nfc_chip_present()
 
     def _on_green_stop(self) -> None:
         """Grün ≥ 1s: Wiedergabe komplett stoppen + Resume-Position vergessen."""
@@ -1035,8 +1306,14 @@ class Kakabox:
         except Exception as e:
             logger.warning("Player.stop nach Full-Stop fehlgeschlagen: %s", e)
         self._last_kaka_memory = None
+        self._random_mode = False
+        self._voice_mode = False
+        self._voice_pending_tag_uid = None
+        self._voice_last_target = None
         if self.leds is not None:
             self.leds.strips_dance_stop()
+            # NFC-LED aus (egal ob vorher grün=Tag, lila=Random oder gelb=Pause).
+            self.leds.nfc_chip_absent()
         logger.info("Full stop (%s) — Memory geleert.", reason)
 
     def _on_green_held(self) -> None:
@@ -1133,12 +1410,103 @@ class Kakabox:
             self._push_times.clear()
             self._enter_speed_mode()
 
+    def _on_push_held(self) -> None:
+        """Encoder-Push ≥ 1s → Random-Modus an/aus toggeln.
+
+        - Random schon an → stoppen (alles aus, Stille).
+        - Random aus → starten (zufällige Reihenfolge aus allen Tracks).
+        - Speed-Mode beenden falls aktiv.
+
+        Im Hintergrund-Thread, weil _start_random_mode die Playlist-Init
+        + erstes play_file machen kann, und der gpiozero-Hold-Callback nicht
+        lange blocken soll.
+        """
+        if self._abort_prompt_if_playing():
+            return
+        if self._speed_mode:
+            self._exit_speed_mode()
+        if self._random_mode:
+            logger.info("🎲 Encoder-Push ≥ 1s — Random-Modus stoppen")
+            self._full_stop("Push-Hold Random-Stop")
+            return
+        logger.info("🎲 Encoder-Push ≥ 1s — Random-Modus starten")
+        threading.Thread(
+            target=self._start_random_mode,
+            daemon=True,
+            name="random-mode-start",
+        ).start()
+
     def _on_yellow_pressed(self) -> None:
-        """Gelb — Pause/Play-Toggle."""
+        """Gelb — Pause/Play-Toggle.
+
+        NFC-LED bei Pause IMMER gelb (auch im Random-Modus, damit der User
+        visuelles Feedback bekommt). Bei Resume zurück zum Mode-spezifischen
+        Status (grün=Tag, lila=Random, aus=nichts).
+        """
         if self._abort_prompt_if_playing():
             return
         logger.info("🟡 Gelb (Pause/Play)")
         self.player.toggle_pause()
+        if self.leds is not None:
+            if self.player.get_state().paused:
+                self.leds.nfc_chip_paused()
+            else:
+                self._restore_idle_led()
+
+    def _restore_idle_led(self) -> None:
+        """Setzt die NFC-LED auf den passenden "läuft normal"-Status:
+        grün=Tag aktiv, lila=Random-Modus, sonst aus.
+
+        Wird nach Pause/Resume + Track-Skip aufgerufen, damit die LED nicht
+        im falschen Zustand hängenbleibt.
+        """
+        if self.leds is None:
+            return
+        if self._active_tag_uid is not None:
+            self.leds.nfc_chip_present()
+        elif self._random_mode:
+            self.leds.nfc_random_active()
+        else:
+            self.leds.nfc_chip_absent()
+
+    def _spectrum_loop(self) -> None:
+        """Dauerhafter Audio-Capture + FFT für die LED-Streifen.
+
+        arecord läuft permanent (nicht lifecycle-gekoppelt). Grund: das
+        Multi-Device kakabox_audio (Speaker + Loopback) verträgt schnelles
+        Auf-Zu vom Capture-Reader nicht — wenn arecord gerade neu startet
+        während mpv versucht zu schreiben, blockiert der Loopback-Buffer
+        und mpv geht nach ~250 ms als "idle" raus → Track wird sofort
+        übersprungen. Permanent-Capture kostet ~1 % CPU dauerhaft, dafür
+        ist Audio bombenstabil.
+
+        Bei Stille (nichts spielt) liefert arecord 0-Samples → FFT-Bänder
+        ~0 → LEDs entscheiden über SPECTRUM_SILENCE_THRESHOLD selbst dass
+        sie aus bleiben.
+        """
+        if self._spectrum is None:
+            return
+        if not self._spectrum.start():
+            logger.warning("Spectrum-Capture konnte nicht starten — LEDs ohne Tanz")
+            return
+        try:
+            while not self._spectrum_stop.is_set():
+                bands = self._spectrum.read_bands()
+                if bands is None:
+                    # Stream tot — kurz warten, dann neu öffnen.
+                    if self._spectrum_stop.wait(1.0):
+                        return
+                    self._spectrum.stop()
+                    if not self._spectrum.start():
+                        return
+                    continue
+                if self.leds is not None:
+                    self.leds.update_spectrum(bands)
+        except Exception:
+            logger.exception("Spectrum-Loop crashed")
+        finally:
+            if self._spectrum is not None:
+                self._spectrum.close()
 
     def _warmup_recognizer(self) -> None:
         """Lädt das ASR-Modell beim Service-Start in den RAM.
@@ -1187,8 +1555,62 @@ class Kakabox:
         ).start()
 
     def _run_voice_activation(self) -> None:
-        """Padamm → Aufnehmen → ASR → Match → Wiedergabe. Lock-protected."""
+        """Padamm → Aufnehmen → ASR → Match → Wiedergabe. Lock-protected.
+
+        Recovery-Verhalten (User-Wunsch): Wenn vorher eine Kakafigur lief und
+        die Voice-Eingabe schiefgeht (kein Mic, ASR-Fehler, kein Match), soll
+        die Kakafigur weiterlaufen. Wir snapshoten den Stand (tag + index +
+        position) vor dem Voice-Flow und re-starten die Kakafigur mit
+        Resume-Position falls kein Match. Gap-frei geht nicht (listening-
+        Prompt + Aufnahme dauern ~3s), aber stabil.
+        """
+        # Snapshot des aktuellen Zustands für Recovery
+        saved_tag_uid = self._active_tag_uid
+        saved_random_mode = self._random_mode
+        saved_track_index = 0
+        saved_position = 0.0
+        with self._playlist_lock:
+            if self._current_playlist:
+                saved_track_index = self._current_playlist.current_index
+                try:
+                    saved_position = self.player.current_position_seconds()
+                except Exception:
+                    saved_position = 0.0
+        recovered = False  # True sobald entweder ein neuer Track läuft oder wir resumed haben
+
+        def _restore_previous(reason: str) -> None:
+            """Helper: vorheriges Playback fortsetzen.
+            - Kakafigur drauf → resume mit gemerkter Position
+            - Random war an → Random neu starten
+            - Sonst → nichts (war ja vorher auch nichts)
+            """
+            if saved_tag_uid and saved_tag_uid in self._tag_cache:
+                logger.info(
+                    "Voice abgebrochen (%s) → Kakafigur '%s' resume Track %d ab %.1fs",
+                    reason, saved_tag_uid, saved_track_index + 1, saved_position,
+                )
+                self._last_kaka_memory = KakaMemory(
+                    tag_uid=saved_tag_uid,
+                    track_index=saved_track_index,
+                    position_seconds=saved_position,
+                )
+                self._start_kaka_playlist(
+                    saved_tag_uid,
+                    self._tag_cache[saved_tag_uid].get("kaka") or {},
+                )
+            elif saved_random_mode:
+                logger.info("Voice abgebrochen (%s) → Random-Modus wieder an", reason)
+                self._start_random_mode()
+
+        # Während Voice-Eingabe → NFC-LED blau pulsieren (egal ob Tag drauf
+        # war oder nicht — zeigt visuell "ich höre dir gerade zu").
+        if self.leds is not None:
+            self.leds.nfc_voice_active()
+
         try:
+            # Vor dem Prompt sauber stoppen — wir können nicht pausieren weil
+            # der Prompt selbst mpv.stop()+play() macht (defensive in play_file),
+            # was den pausierten Stream eh zerstören würde.
             self._stop_for_voice()
             self._play_prompt("listening.wav")
             # Padamm zu Ende abspielen, sonst mischt's sich in die Aufnahme.
@@ -1239,8 +1661,34 @@ class Kakabox:
                 "Voice match: kind=%s name='%s' score=%.2f query='%s'",
                 cmd.target.kind, cmd.target.name, cmd.score, cmd.query,
             )
+            # Match → Tag-UID für Continue-Logik merken (snapshot vorher),
+            # dann Voice-Target abspielen. Voice-Mode wird in _play_voice_target gesetzt.
+            self._voice_pending_tag_uid = saved_tag_uid
+            self._voice_last_target = cmd.target
             self._play_voice_target(cmd.target)
+            recovered = True  # neue Wiedergabe läuft, kein Restore nötig
         finally:
+            # Wenn vorher eine Kakafigur lief UND nichts Neues gestartet wurde:
+            # Kakafigur an gemerkter Position re-starten.
+            if not recovered:
+                try:
+                    _restore_previous("kein Match / Recording fail / ASR fail")
+                except Exception as e:
+                    logger.warning("Resume nach Voice-Abbruch fehlgeschlagen: %s", e)
+            # NFC-LED zurück auf den passenden Status nach Voice:
+            #   - Kakafigur wieder aktiv (Restore oder durch Voice-Match mit
+            #     pending_tag) → grün
+            #   - Random-Modus läuft → lila
+            #   - sonst → aus
+            if self.leds is not None:
+                if self._active_tag_uid is not None or (
+                    self._voice_mode and self._voice_pending_tag_uid is not None
+                ):
+                    self.leds.nfc_chip_present()
+                elif self._random_mode:
+                    self.leds.nfc_random_active()
+                else:
+                    self.leds.nfc_chip_absent()
             self._voice_lock.release()
 
     def _stop_for_voice(self) -> None:
@@ -1301,9 +1749,12 @@ class Kakabox:
                 seek_fn=self.player.seek_to,
             )
             self._current_playlist = playlist
+            self._voice_mode = True
+            self._random_mode = False
 
         if not playlist.start():
             logger.warning("Voice-Playlist konnte nicht starten.")
+            self._voice_mode = False
 
     def _enter_speed_mode(self) -> None:
         self._speed_mode = True
@@ -1349,16 +1800,16 @@ class Kakabox:
                 self.leds.show_volume(self._volume)
             return
         self._volume = new_vol
-        try:
-            set_volume(new_vol)
-        except Exception as e:
-            logger.warning("ALSA volume control unavailable: %s", e)
+        # Hinweis: kein amixer-Call mehr. MAX98357A hat keinen Hardware-Mixer;
+        # jeder amixer-Subprocess blockte ~300ms und failte — staute den
+        # Encoder-Pfad. mpv softvol via player.set_volume reicht aus.
         self.player.set_volume(new_vol)
-        self.config["volume"] = new_vol
-        save_config(self.config)
-        logger.info("🔊 Volume: %d%%", new_vol)
         if self.leds is not None:
             self.leds.show_volume(new_vol)
+        # save_config NICHT bei jedem Tick — SD-Karten-Write blockt den
+        # Encoder-Loop. Wert wird beim regulären Shutdown gespeichert.
+        self.config["volume"] = new_vol
+        logger.info("🔊 Volume: %d%%", new_vol)
 
     # ------------------------------------------------------------------
     # Shutdown
@@ -1367,6 +1818,7 @@ class Kakabox:
     def _shutdown(self) -> None:
         logger.info("Shutting down...")
         self._running = False
+        self._spectrum_stop.set()
         with self._playlist_lock:
             if self._current_playlist:
                 self._current_playlist.stop()

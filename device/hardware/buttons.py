@@ -5,7 +5,7 @@ Verdrahtung (KY-Module + GND, Pi 5):
                              STOP bei Halten ≥ 1s; Power-Off bei Halten ≥ 5s)
   - GPIO25  = Rot          (Track-vor   — kurzer Druck;
                              STOP bei Halten ≥ 1s; WLAN-Reset bei Halten ≥ 5s)
-  - GPIO22  = Encoder-Push (nur noch Speed-Mode-Burst: 4× drücken in 3s)
+  - GPIO22  = Encoder-Push (kurz: Speed-Mode-Burst 4× in 3s; Hold ≥ 1s: Random-Modus)
   - GPIO5   = Blau         (Voice-Push-to-Talk — single-press)
   - GPIO24  = Gelb         (Pause/Play-Toggle — single-press)
 
@@ -43,6 +43,7 @@ YELLOW_PIN = 24     # Pause/Play-Toggle
 DEBOUNCE_S = 0.05
 STOP_HOLD_SECONDS = 1.0   # grün/rot ≥ 1s = STOP (Playlist + Memory weg)
 HOLD_SECONDS = 5.0        # grün ≥ 5s = Power-Off; rot ≥ 5s = WLAN-Reset
+PUSH_HOLD_SECONDS = 1.0   # Encoder-Push ≥ 1s = Random-Modus an/neu starten
 
 
 class Buttons:
@@ -57,6 +58,7 @@ class Buttons:
         )
         self.push = GpioButton(
             ENCODER_PUSH_PIN, pull_up=True, bounce_time=DEBOUNCE_S,
+            hold_time=PUSH_HOLD_SECONDS,
         )
         self.yellow = GpioButton(
             YELLOW_PIN, pull_up=True, bounce_time=DEBOUNCE_S,
@@ -85,9 +87,16 @@ class Buttons:
         self.red.when_held = self._on_red_stop_reached
         self.red.when_released = self._on_red_released
 
-        # Encoder-Push: single-press → main.py macht den Burst-Counter selbst.
+        # Encoder-Push: zwei Stufen — kurz (Burst-Counter macht main.py) vs.
+        # Hold ≥ PUSH_HOLD_SECONDS (Random-Modus an / neu starten). Beim
+        # Release entscheidet ein Flag, ob "press" oder "held" gefeuert wird,
+        # damit Hold nicht zusätzlich Press triggert (gleiches Schema wie
+        # grün/rot, nur ohne zweite "Held"-Stufe).
         self._push_press_cb: Optional[Callable[[], None]] = None
-        self.push.when_pressed = self._on_push_internal_pressed
+        self._push_held_cb: Optional[Callable[[], None]] = None
+        self._push_was_held: bool = False
+        self.push.when_held = self._on_push_internal_held
+        self.push.when_released = self._on_push_internal_released
 
         # Gelb + Blau: single-press, kein Hold.
         self._yellow_press_cb: Optional[Callable[[], None]] = None
@@ -97,9 +106,9 @@ class Buttons:
 
         logger.info(
             "Buttons ready: green=GPIO%d red=GPIO%d push=GPIO%d yellow=GPIO%d blue=GPIO%d "
-            "(stop ≥ %.0fs, long ≥ %.0fs)",
+            "(stop ≥ %.0fs, long ≥ %.0fs, push-hold ≥ %.0fs)",
             GREEN_PIN, RED_PIN, ENCODER_PUSH_PIN, YELLOW_PIN, BLUE_PIN,
-            STOP_HOLD_SECONDS, HOLD_SECONDS,
+            STOP_HOLD_SECONDS, HOLD_SECONDS, PUSH_HOLD_SECONDS,
         )
 
     def on_green(self, callback: Callable[[], None]) -> None:
@@ -127,8 +136,12 @@ class Buttons:
         self._red_held_cb = callback
 
     def on_push(self, callback: Callable[[], None]) -> None:
-        """Encoder-Push — feuert bei jedem Druck. main.py bündelt Bursts selbst."""
+        """Kurzer Encoder-Push (< PUSH_HOLD_SECONDS). main.py bündelt Bursts."""
         self._push_press_cb = callback
+
+    def on_push_held(self, callback: Callable[[], None]) -> None:
+        """Encoder-Push ≥ PUSH_HOLD_SECONDS — z.B. Random-Modus starten."""
+        self._push_held_cb = callback
 
     def on_yellow(self, callback: Callable[[], None]) -> None:
         """Gelb — Pause/Play-Toggle."""
@@ -221,7 +234,22 @@ class Buttons:
             except Exception as e:
                 logger.exception("on_red callback failed: %s", e)
 
-    def _on_push_internal_pressed(self) -> None:
+    def _on_push_internal_held(self) -> None:
+        """Hold-Schwelle (PUSH_HOLD_SECONDS) erreicht. Feuert sofort beim
+        Überschreiten und merkt sich, dass dieser Druck kein "press" mehr
+        ist — beim Loslassen wird der press-Callback dann übersprungen."""
+        self._push_was_held = True
+        if self._push_held_cb:
+            try:
+                self._push_held_cb()
+            except Exception as e:
+                logger.exception("on_push_held callback failed: %s", e)
+
+    def _on_push_internal_released(self) -> None:
+        was_held = self._push_was_held
+        self._push_was_held = False
+        if was_held:
+            return
         if self._push_press_cb:
             try:
                 self._push_press_cb()

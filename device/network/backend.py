@@ -252,7 +252,10 @@ class Backend:
                     self._clear_token("token invalid (download_audio)")
                     return False
                 if not resp.ok:
-                    logger.warning("download_audio %s: HTTP %s", content_id, resp.status_code)
+                    # DEBUG, weil der Sync-Loop diese Failures gesammelt in einer
+                    # Summary-Zeile loggt (verhindert Log-Spam bei kaputten
+                    # Backend-Storage-IDs, die jeden Sync-Zyklus 404 liefern).
+                    logger.debug("download_audio %s: HTTP %s", content_id, resp.status_code)
                     return False
                 with tmp_path.open("wb") as fh:
                     for chunk in resp.iter_content(chunk_size=64 * 1024):

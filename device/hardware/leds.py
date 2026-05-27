@@ -1,22 +1,17 @@
 """WS2812 LED-Steuerung der Kakabox.
 
 Hardware-Setup (Stand: Mai 2026):
-  - 25 WS2812 als Daisy-Chain an GPIO 18 (Pin 12)
+  - 25 WS2812 als Daisy-Chain an GPIO 10 (Pin 19, SPI0 MOSI)
   - 5V extern versorgt, GND gemeinsam mit Pi
   - Reihenfolge (logisch): #0-7 LED-Ring, #8 NFC-Status,
     #9-16 Streifen Links, #17-24 Streifen Rechts
 
-⚠ Hardware-Konflikt: GPIO 18 ist auch I²S0_BCLK für den MAX98357A-Speaker.
-Solange LED-Steuerung läuft, ist der Speaker stumm — geplanter Fix: DIN auf
-GPIO 10 (SPI MOSI) umlöten, dann auf Pi5Neo umstellen. Bis dahin gegenseitig
-ausschließend.
+Library: ``Pi5Neo`` nutzt SPI als WS2812-Encoder — der Pi-5-freundliche Weg
+ohne PWM/DMA-Hacks. Läuft als User (kein sudo), kein Konflikt mit I²S-Audio
+auf GPIO 18-21 (Speaker + Mic).
 
 Helligkeit ist fest auf MAX 25% begrenzt — kinderverträglich, weniger
 Stromhunger (25 LEDs voll weiß bei 100% wären ~1.5A; bei 25% ~400mA).
-
-Die Library ``adafruit-circuitpython-neopixel`` + ``Adafruit-Blinka-
-Raspberry-Pi5-Neopixel`` nutzt PIO im RP1-Chip — funktioniert auf Pi 5,
-braucht je nach Setup root (über das Service ist es root, manuell ggf. sudo).
 """
 from __future__ import annotations
 
@@ -30,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Hardware-Konstanten
 LED_COUNT = 25
-MAX_BRIGHTNESS = 0.25  # global cap — Kinderschutz + Stromsparen
+MAX_BRIGHTNESS = 0.15  # global cap — Kinderschutz + Stromsparen
 
 # Logische Zonen — slices über den Strip
 ZONE_RING = slice(0, 8)         # 8 LEDs um den Encoder
@@ -78,6 +73,16 @@ DEFAULT_SPEED_MAX = 2.0
 # zwischen 5% (kaum wahrnehmbar) und 15% (gedämpft, nicht stechend).
 # Beide Werte absolut (0..1), unabhängig vom globalen MAX_BRIGHTNESS-Cap.
 NFC_PRESENT_COLOR_BASE: Tuple[int, int, int] = (0, 255, 0)
+# Gelb für Pause-Zustand — gleiche Pulse-Range/Frequenz wie grün, nur Farbe
+# anders. So weiß der User auf einen Blick: Chip liegt drauf, aber wir
+# warten gerade (statt zu spielen).
+NFC_PAUSED_COLOR_BASE: Tuple[int, int, int] = (255, 200, 0)
+# Dunkles Blau für Voice-Aufnahme — sattes Königsblau, klar unterscheidbar
+# vom Random-Lila und vom Pause-Gelb.
+NFC_VOICE_COLOR_BASE: Tuple[int, int, int] = (0, 0, 200)
+# Lila für Random-Modus — visuelles Signal "kein Chip, aber Box spielt
+# zufällige Lieder". Anders als Speed-Mode-Lila (das nur am Ring leuchtet).
+NFC_RANDOM_COLOR_BASE: Tuple[int, int, int] = (160, 50, 255)
 NFC_PRESENT_PULSE_MIN_INTENSITY = 0.05
 NFC_PRESENT_PULSE_MAX_INTENSITY = 0.15
 NFC_PULSE_HZ = 1.0    # eine Schwingung pro Sekunde
@@ -91,8 +96,12 @@ NFC_PULSE_FPS = 20    # 50 ms zwischen Updates — flüssig
 #     schon gespielt sind (z.B. 3/5 → 10 von 16 LEDs leuchten)
 # Wechselt automatisch nach Ablauf zurück zu "dance".
 STRIPS_TOTAL = (ZONE_STRIP_RIGHT.stop - ZONE_STRIP_LEFT.start)  # = 16
-DANCE_FPS = 25
+DANCE_FPS = 20  # 50 ms zwischen Frames — visuell flüssig, weniger CPU als 25 fps
 PSEUDO_DANCE_BPM = 120  # virtueller Beat für die Fallback-Animation
+# Wenn alle FFT-Bänder unter diesem Wert liegen, behandeln wir es als Stille
+# und schalten die Streifen aus — sonst würde die Box auch bei Pause oder
+# leise gedrehtem Volume "tanzen", was visuell verwirrt.
+SPECTRUM_SILENCE_THRESHOLD = 0.02
 POSITION_DISPLAY_S = 5.0
 POSITION_COLOR_BASE: Tuple[int, int, int] = (100, 200, 255)  # hellblau
 POSITION_INTENSITY = 0.15  # absolut — gedämpft, nicht stechend
@@ -166,6 +175,14 @@ def spectrum_to_led_colors(
     bekommt eine feste Farbe (Hue aus Regenbogen), Helligkeit kommt vom
     jeweiligen Band-Amplitudenwert. Pure function für Tests.
 
+    Square-Root-Skalierung der Amplitude: leise Bänder werden visuell
+    angehoben, ohne dass laute clampen — sonst wäre bei 10 % mpv-Volume
+    fast nichts zu sehen, weil rohe FFT-Werte dort tief sind.
+
+    Globaler 25 %-Cap kommt vom ``_Pi5NeoAdapter.brightness`` beim Schreiben;
+    hier werden Farben in voller Skala 0..255 zurückgegeben (sonst wäre die
+    Helligkeit doppelt skaliert und effektiv viel zu dunkel).
+
     Wenn weniger/mehr Bänder reinkommen, wird interpoliert/abgeschnitten.
     """
     out: list[Tuple[int, int, int]] = []
@@ -179,12 +196,17 @@ def spectrum_to_led_colors(
         else:
             amp = bands[min(n - 1, int(i / strip_size * n))]
         amp = max(0.0, min(1.0, amp))
+        # sqrt(amp): expandiert den unteren Bereich. amp=0.04 → 0.20,
+        # amp=0.25 → 0.50, amp=1.0 → 1.0. Macht leise Musik sichtbar.
+        visual_amp = amp ** 0.5
         # Hue: gleichmäßiger Regenbogen über alle LEDs
         hue = int(255 * i / strip_size) % 256
         base = _hue_to_rgb(hue)
-        # Intensity skaliert mit der Amplitude — leise Bänder fast aus
-        intensity = MAX_BRIGHTNESS * amp
-        out.append(scale_to_intensity(base, intensity))
+        out.append((
+            int(base[0] * visual_amp),
+            int(base[1] * visual_amp),
+            int(base[2] * visual_amp),
+        ))
     return out
 
 
@@ -223,6 +245,71 @@ class LedsUnavailable(RuntimeError):
     """LED-Stack kann nicht laufen — Paket fehlt oder Hardware nicht verfügbar."""
 
 
+class _Pi5NeoAdapter:
+    """Übersetzt die wenigen NeoPixel-API-Aufrufe, die Leds nutzt, auf Pi5Neo.
+
+    Adafruit-NeoPixel-API (Original): ``pixels[i] = (r,g,b)``, ``pixels.fill(c)``,
+    ``pixels.show()``, ``pixels.deinit()`` plus settable ``pixels.brightness``.
+    Pi5Neo bietet ``set_led_color(i,r,g,b)``, ``fill_strip(r,g,b)``,
+    ``update_strip()``, ``close()`` — aber keine Brightness-Property.
+
+    Brightness wenden wir hier beim Setzen an, damit die ``MAX_BRIGHTNESS``-Cap-
+    Mechanik aus dem Rest der Datei unverändert weiter funktioniert.
+    """
+
+    def __init__(self, strip, count: int, brightness: float) -> None:
+        self._strip = strip
+        self._count = count
+        self._brightness = brightness
+
+    @property
+    def brightness(self) -> float:
+        return self._brightness
+
+    @brightness.setter
+    def brightness(self, value: float) -> None:
+        self._brightness = max(0.0, min(1.0, value))
+
+    def _apply(self, color: Tuple[int, int, int]) -> Tuple[int, int, int]:
+        b = self._brightness
+        return (int(color[0] * b), int(color[1] * b), int(color[2] * b))
+
+    def __setitem__(self, idx: int, color: Tuple[int, int, int]) -> None:
+        r, g, bl = self._apply(color)
+        try:
+            self._strip.set_led_color(idx, r, g, bl)
+        except Exception:
+            logger.exception("Pi5Neo set_led_color(%d, %d,%d,%d) failed", idx, r, g, bl)
+
+    def fill(self, color: Tuple[int, int, int]) -> None:
+        r, g, bl = self._apply(color)
+        try:
+            self._strip.fill_strip(r, g, bl)
+        except Exception:
+            logger.exception("Pi5Neo fill_strip(%d,%d,%d) failed", r, g, bl)
+
+    def show(self) -> None:
+        # sleep_duration=0.001 statt Pi5Neos Default 0.1s. WS2812 braucht nur
+        # ~50µs Latch-Zeit; 100ms ist absurd und macht jeden show()-Call
+        # zur Stau-Quelle (insb. parallel zum Tanz-Loop, der jeden Frame
+        # update_strip() ruft). 1ms ist sicher und 100× schneller.
+        try:
+            self._strip.update_strip(sleep_duration=0.001)
+        except Exception:
+            logger.exception("Pi5Neo update_strip() failed")
+
+    def deinit(self) -> None:
+        try:
+            self._strip.clear_strip()
+            self._strip.update_strip()
+        except Exception:
+            pass
+        try:
+            self._strip.close()
+        except Exception:
+            pass
+
+
 class Leds:
     """Wrapper um die 25er-WS2812-Kette mit Zonen-API.
 
@@ -233,13 +320,10 @@ class Leds:
 
     def __init__(self, brightness: float = MAX_BRIGHTNESS) -> None:
         try:
-            import board  # type: ignore
-            import neopixel  # type: ignore
+            from pi5neo import Pi5Neo  # type: ignore
         except ImportError as e:
             raise LedsUnavailable(
-                "adafruit-circuitpython-neopixel fehlt. Installation: "
-                ".venv/bin/pip install adafruit-circuitpython-neopixel "
-                "Adafruit-Blinka-Raspberry-Pi5-Neopixel"
+                "Pi5Neo fehlt. Installation: .venv/bin/pip install Pi5Neo"
             ) from e
 
         capped = max(0.0, min(brightness, MAX_BRIGHTNESS))
@@ -248,10 +332,17 @@ class Leds:
                 "LED-Helligkeit %.2f auf Cap %.2f reduziert (Kinderschutz)",
                 brightness, MAX_BRIGHTNESS,
             )
-        self._pixels = neopixel.NeoPixel(
-            board.D18, LED_COUNT,
-            brightness=capped, auto_write=False,
-            pixel_order=neopixel.GRB,
+        # Wrapper, der die NeoPixel-API (pixels[i] = color; pixels.show();
+        # pixels.fill(); pixels.deinit()) auf Pi5Neo abbildet — so bleibt der
+        # restliche Code in leds.py library-agnostisch.
+        # /dev/spidev0.0 = SPI0 mit GPIO 10 als MOSI (= LED-DIN). Erfordert
+        # dtparam=spi=on in /boot/firmware/config.txt. /dev/spidev10.0 ist
+        # ein interner RP1-Bus, der NICHT auf die externen Pins geht — daher
+        # blieben LEDs dort dunkel obwohl Pi5Neo "OK" sagte.
+        self._pixels = _Pi5NeoAdapter(
+            Pi5Neo("/dev/spidev0.0", LED_COUNT, 800, quiet_mode=True),
+            count=LED_COUNT,
+            brightness=capped,
         )
         # NeoPixel ist nicht thread-safe; Auto-Off-Timer und Speed-Pulse
         # feuern aus separaten Threads, deshalb alle Schreibvorgänge unter
@@ -266,8 +357,11 @@ class Leds:
         self._speed_led_count = 0
         # NFC-Status-Pulse: gleiches Schema (Thread + Event), aber eigene
         # Zone (nur die eine NFC-LED), eigene Frequenz, eigene Range.
+        # _nfc_color = live aktuelle Pulse-Farbe (grün=present, gelb=paused).
+        # Wechsel ohne Thread-Restart, der Loop liest pro Frame neu.
         self._nfc_pulse_thread: threading.Thread | None = None
         self._nfc_pulse_stop = threading.Event()
+        self._nfc_color: Tuple[int, int, int] = NFC_PRESENT_COLOR_BASE
         # Streifen-Animation: ein Thread rendert je nach _strips_mode
         # entweder Pseudo-Tanz/Spectrum oder Track-Position. Spektrum-Daten
         # liefert ein externer Spectrum-Capture-Thread via update_spectrum().
@@ -321,17 +415,35 @@ class Leds:
         self.fill_zone(ZONE_NFC, color)
 
     def nfc_chip_present(self) -> None:
-        """Chip aufgelegt → grünes Status-Licht, sanft pulsierend 5–15% bei 1 Hz.
+        """Chip aufgelegt + spielt → grünes Pulse-Licht (5–15% bei 1 Hz)."""
+        self._start_nfc_pulse(NFC_PRESENT_COLOR_BASE)
 
-        Startet den Pulse-Thread (idempotent — zweimal Aufrufen tut nichts).
-        Bei ``nfc_chip_absent`` wird der Thread gestoppt und die LED gelöscht.
-        """
+    def nfc_chip_paused(self) -> None:
+        """Chip aufgelegt + pausiert → gelbes Pulse-Licht (gleicher Pulse,
+        nur Farbwechsel)."""
+        self._start_nfc_pulse(NFC_PAUSED_COLOR_BASE)
+
+    def nfc_voice_active(self) -> None:
+        """Voice-Aufnahme läuft → dunkelblaues Pulse-Licht (zeigt: ich höre
+        dir gerade zu). Egal ob Chip drauf liegt oder nicht."""
+        self._start_nfc_pulse(NFC_VOICE_COLOR_BASE)
+
+    def nfc_random_active(self) -> None:
+        """Random-Modus läuft → lila Pulse-Licht (kein Chip drauf, aber Box
+        spielt zufällige Lieder aus dem ganzen Cache)."""
+        self._start_nfc_pulse(NFC_RANDOM_COLOR_BASE)
+
+    def _start_nfc_pulse(self, color: Tuple[int, int, int]) -> None:
+        """Setzt Pulse-Farbe und startet den Thread falls noch nicht läuft.
+        Idempotent — Farbwechsel bei laufendem Thread updated nur ``_nfc_color``,
+        der Loop liest den Wert pro Frame neu."""
+        self._nfc_color = color
         with self._lock:
             if (
                 self._nfc_pulse_thread is not None
                 and self._nfc_pulse_thread.is_alive()
             ):
-                return  # läuft schon
+                return  # läuft schon — Farbe wurde oben gesetzt
             self._nfc_pulse_stop.clear()
             self._nfc_pulse_thread = threading.Thread(
                 target=self._nfc_pulse_loop,
@@ -366,7 +478,9 @@ class Leds:
                 # sin geht von -1..1, /2+0.5 normalisiert auf 0..1
                 pulse = 0.5 * (1 + math.sin(2 * math.pi * NFC_PULSE_HZ * t))
                 intensity = NFC_PRESENT_PULSE_MIN_INTENSITY + amplitude * pulse
-                color = scale_to_intensity(NFC_PRESENT_COLOR_BASE, intensity)
+                # Farbe live aus _nfc_color — wird von außen umgeschaltet
+                # (grün=present, gelb=paused) ohne den Thread neu zu starten.
+                color = scale_to_intensity(self._nfc_color, intensity)
                 with self._lock:
                     for i in range(*ZONE_NFC.indices(LED_COUNT)):
                         self._pixels[i] = color
@@ -585,12 +699,31 @@ class Leds:
             logger.exception("Strips-Loop crashed")
 
     def _render_dance(self) -> None:
-        """Audio-reaktiv wenn Spectrum frisch (<1s), sonst Pseudo-Welle."""
+        """Audio-reaktiv: Spectrum frisch + über Stille-Schwelle → Bänder zeigen.
+        Sonst: Streifen aus (kein Pseudo-Regenbogen, damit Pause/leise =
+        wirklich dunkel ist — User-Wunsch).
+
+        Pseudo bleibt nur als allerletzter Fallback, wenn das Spectrum-
+        Capture-Modul gar nicht initialisiert wurde (z.B. snd-aloop fehlt) —
+        sonst hätte die Box bei Capture-Init-Fehlern stumme Streifen ohne
+        sichtbares Lebenszeichen.
+        """
         spectrum_age = time.monotonic() - self._spectrum_updated_at
-        if spectrum_age < 1.0 and any(self._spectrum_bands):
-            colors = spectrum_to_led_colors(self._spectrum_bands)
-        else:
+        if spectrum_age < 2.0:
+            # Capture liefert frische Daten → audio-reaktiv. Bei Stille
+            # (alle Bänder unter Schwelle) → schwarz statt Tanz.
+            max_amp = max(self._spectrum_bands) if self._spectrum_bands else 0.0
+            if max_amp < SPECTRUM_SILENCE_THRESHOLD:
+                colors = [BLACK] * STRIPS_TOTAL
+            else:
+                colors = spectrum_to_led_colors(self._spectrum_bands)
+        elif self._spectrum_updated_at == 0.0:
+            # Capture wurde nie initialisiert → Pseudo als Lebenszeichen.
             colors = self._pseudo_dance_colors()
+        else:
+            # Capture lief mal, ist jetzt stumm (Stream tot) → einfach aus,
+            # statt plötzlich auf Pseudo umzuschalten und den User zu verwirren.
+            colors = [BLACK] * STRIPS_TOTAL
         with self._lock:
             for i, c in enumerate(colors):
                 self._pixels[ZONE_STRIP_LEFT.start + i] = c

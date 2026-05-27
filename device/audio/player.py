@@ -9,6 +9,11 @@ from audio.library import Track, Album
 
 logger = logging.getLogger(__name__)
 
+# Direkt auf MAX98357A → bombensicher, aber kein Audio-Spectrum für LEDs.
+# Multi-Device "kakabox_audio" (Loopback) wäre für Spectrum nötig, aber
+# verursachte Audio-Hänger nach Track-Wechseln (mpv-Stream-Reopen schlägt
+# auf snd-aloop fehl). Audio-reaktiver LED-Tanz braucht eine andere Lösung
+# (z.B. mpv audio-data-API direkt, oder pipewire-Filter).
 AUDIO_DEVICE = "alsa/plughw:CARD=MAX98357A,DEV=0"
 
 
@@ -119,7 +124,17 @@ class Player:
 
         ``start_seconds`` lässt mpv die Wiedergabe direkt an dieser Position starten —
         wird für Resume-on-Replace genutzt.
+
+        Defensive Sequenz: erst stop, kurz warten, dann play. Ohne das geht
+        mpv beim 2. Track auf dem Multi-Device kakabox_audio (snd-aloop +
+        MAX98357A) nach 250ms in "idle" → Track wird sofort übersprungen.
+        Vermutlich Multi-Device-Race nach incomplete teardown des Vorgängers.
         """
+        try:
+            self._mpv.stop()
+        except Exception:
+            pass
+        time.sleep(0.05)
         self._state.current_album = None
         synthetic = Track(id=str(path), title=title or str(path), path=str(path), index=0)
         self._state.current_track = synthetic
