@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 # Logitech-C920-Webcam hat ein brauchbares Stereo-Mic eingebaut; via ``plughw``
 # konvertiert ALSA automatisch auf das von Vosk gewünschte Format (mono 16 kHz).
 # CARD-Name statt Karten-Nummer macht's stabil gegen USB-Reordering bei Reboot.
-DEFAULT_DEVICE = "plughw:CARD=C920,DEV=0"
+# INMP441 MEMS-Mic über Google Voice HAT Overlay. Selbe Karte wie der
+# MAX98357A-Speaker (sndrpigooglevoi) — Capture-Side liefert mono I²S-Daten.
+DEFAULT_DEVICE = "plughw:CARD=sndrpigooglevoi,DEV=0"
 DEFAULT_SAMPLE_RATE = 16000
 
 # VAD-Schwellen (16-bit RMS, max 32767). Empirisch bestimmt mit der C920 bei

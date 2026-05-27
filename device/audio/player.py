@@ -9,12 +9,11 @@ from audio.library import Track, Album
 
 logger = logging.getLogger(__name__)
 
-# Direkt auf MAX98357A → bombensicher, aber kein Audio-Spectrum für LEDs.
-# Multi-Device "kakabox_audio" (Loopback) wäre für Spectrum nötig, aber
-# verursachte Audio-Hänger nach Track-Wechseln (mpv-Stream-Reopen schlägt
-# auf snd-aloop fehl). Audio-reaktiver LED-Tanz braucht eine andere Lösung
-# (z.B. mpv audio-data-API direkt, oder pipewire-Filter).
-AUDIO_DEVICE = "alsa/plughw:CARD=MAX98357A,DEV=0"
+# Google Voice HAT Soundcard (MAX98357A Speaker + INMP441 Mic an I²S).
+# Card-Name kommt vom `dtoverlay=googlevoicehat-soundcard` in
+# /boot/firmware/config.txt — Playback (Speaker) und Capture (Mic) auf
+# der gleichen Karte.
+AUDIO_DEVICE = "alsa/plughw:CARD=sndrpigooglevoi,DEV=0"
 
 
 @dataclass
