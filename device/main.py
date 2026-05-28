@@ -286,6 +286,9 @@ class Kakabox:
         self._active_tag_uid: Optional[str] = None
         self._last_kaka_memory: Optional[KakaMemory] = None
         self._playlist_lock = threading.Lock()
+        # Serialisiert Audio-Sync-Trigger: der 5-Min-Loop und der Sofort-Sync
+        # beim Auflegen einer Figur (M1) dürfen nicht gleichzeitig laufen.
+        self._sync_lock = threading.Lock()
 
         # Speed-Mode-State (siehe SPEED_* Konstanten)
         self._speed_mode = False
@@ -619,9 +622,35 @@ class Kakabox:
         except Exception as e:
             logger.warning("heartbeat failed: %s", e)
 
-    def _sync_audio_manifest(self) -> None:
+    def _trigger_background_sync(self, reason: str) -> None:
+        """Stößt einen Audio-Sync sofort an (Hintergrund-Thread), statt auf den
+        nächsten 5-Min-Zyklus zu warten — z.B. wenn eine Figur aufgelegt wird
+        und ein neu verknüpftes Lied noch fehlt. _sync_audio_manifest ist gegen
+        Mehrfachläufe selbst abgesichert, ein paralleler Trigger ist also
+        gefahrlos (no-op, wenn schon einer läuft).
+        """
         if not self.backend or not self.backend.is_connected:
             return
+        threading.Thread(
+            target=self._sync_audio_manifest, daemon=True, name=f"sync-{reason}",
+        ).start()
+
+    def _sync_audio_manifest(self) -> None:
+        """Wrapper: serialisiert gleichzeitige Sync-Trigger (5-Min-Loop +
+        Sofort-Sync beim Auflegen). Läuft schon einer, wird der Trigger
+        verworfen — verhindert doppelte Downloads und Cleanup-Races.
+        """
+        if not self.backend or not self.backend.is_connected:
+            return
+        if not self._sync_lock.acquire(blocking=False):
+            logger.debug("Sync läuft bereits — Trigger übersprungen.")
+            return
+        try:
+            self._sync_audio_manifest_locked()
+        finally:
+            self._sync_lock.release()
+
+    def _sync_audio_manifest_locked(self) -> None:
         manifest = self.backend.audio_manifest()
         if not manifest:
             return
@@ -787,34 +816,45 @@ class Kakabox:
         save_config(self.config)
 
     def _apply_rule_from_manifest(self, rule: dict) -> None:
-        """Übernimmt ``rule.max_volume`` aus dem Manifest als Hard-Cap.
+        """Übernimmt die Box-Rule aus dem Manifest: ``max_volume`` (Hard-Cap)
+        und ``enable_zauberwort`` (Höflichkeits-Gate fürs Voice-Matching).
 
-        Der Cap begrenzt, wie weit der User die Lautstärke per Encoder
-        hochdrehen kann (Eltern-Schutz). Wenn die aktuelle Lautstärke nach
-        einem strenger werdenden Cap zu laut ist, wird sie sofort
-        runtergezogen — sonst bliebe die laufende Wiedergabe ungebremst.
-        Wird in config.json gespiegelt, damit Offline-Boot den letzten
-        Stand behält.
+        Beide Felder werden UNABHÄNGIG voneinander angewandt — ein fehlendes
+        Feld lässt den lokalen Stand unverändert (kein Reset auf Default). Der
+        max_volume-Cap begrenzt, wie weit der User per Encoder hochdrehen kann;
+        liegt die aktuelle Lautstärke nach einem strengeren Cap zu hoch, wird
+        sie sofort runtergezogen. Alles wird in config.json gespiegelt, damit
+        ein Offline-Boot den letzten Stand behält.
         """
+        # --- max_volume (Hard-Cap für die User-Lautstärke) ---
         max_vol = rule.get("max_volume")
-        if max_vol is None:
-            return
-        try:
-            max_vol = int(max_vol)
-        except (TypeError, ValueError):
-            logger.warning("rule.max_volume nicht numerisch: %r", max_vol)
-            return
-        max_vol = max(0, min(100, max_vol))
-        if max_vol == self._max_volume:
-            return
-        logger.info("max_volume vom Backend: %d → %d", self._max_volume, max_vol)
-        self._max_volume = max_vol
-        self.config["max_volume"] = max_vol
-        save_config(self.config)
-        # Aktuelle Lautstärke über dem neuen Cap? Sofort runter — mit dem
-        # üblichen _adjust_volume-Pfad, damit Player + LEDs konsistent sind.
-        if self._volume > self._max_volume:
-            self._adjust_volume(self._max_volume - self._volume)
+        if max_vol is not None:
+            try:
+                max_vol = max(0, min(100, int(max_vol)))
+            except (TypeError, ValueError):
+                logger.warning("rule.max_volume nicht numerisch: %r", max_vol)
+                max_vol = None
+            if max_vol is not None and max_vol != self._max_volume:
+                logger.info("max_volume vom Backend: %d → %d", self._max_volume, max_vol)
+                self._max_volume = max_vol
+                self.config["max_volume"] = max_vol
+                save_config(self.config)
+                # Aktuelle Lautstärke über dem neuen Cap? Sofort runter — mit dem
+                # üblichen _adjust_volume-Pfad, damit Player + LEDs konsistent sind.
+                if self._volume > self._max_volume:
+                    self._adjust_volume(self._max_volume - self._volume)
+
+        # --- enable_zauberwort (Höflichkeits-Gate) ---
+        # Spiegelt den Webapp-Toggle nach config['zauberwort_mode_enabled'],
+        # damit er ohne Box-Reboot greift (vorher las das Gerät die Rule nie aus
+        # → der Modus war faktisch tot, egal was in der Webapp stand).
+        zw = rule.get("enable_zauberwort")
+        if zw is not None:
+            zw = bool(zw)
+            if zw != bool(self.config.get("zauberwort_mode_enabled", False)):
+                logger.info("Zauberwort-Modus vom Backend: %s", "an" if zw else "aus")
+                self.config["zauberwort_mode_enabled"] = zw
+                save_config(self.config)
 
     # ------------------------------------------------------------------
     # NFC-Loop (mit Multi-Chip-Tracking)
@@ -951,7 +991,11 @@ class Kakabox:
         bräuchten wir frische download_urls vom Server, also lieber den
         normalen Backend-Pfad nehmen.
         """
-        contents = kaka.get("contents") or []
+        # Nur abspielbare Inhalte betrachten — eine unveröffentlichte/dateilose
+        # Verknüpfung kann gar nicht lokal liegen und darf den Cache-First-Pfad
+        # nicht blockieren (sonst nie Instant-Start). Spiegelt den Filter in
+        # _start_kaka_playlist.
+        contents = [c for c in (kaka.get("contents") or []) if c.get("playable", True)]
         if not contents:
             return False
         for c in contents:
@@ -985,6 +1029,10 @@ class Kakabox:
 
         if status in ("play", "paired"):
             self._update_tag_cache(uid, kaka)
+            # M2: laufende Playlist live nachziehen, falls sich der Inhalt der
+            # noch aktiven Figur geändert hat (z.B. 3. Lied verknüpft) — ohne
+            # die aktuelle Wiedergabe zu unterbrechen.
+            self._refresh_active_playlist(uid, kaka)
             return
 
         if status in ("unknown", "foreign_household"):
@@ -1003,10 +1051,56 @@ class Kakabox:
                 except Exception as e:
                     logger.warning("Player.stop fehlgeschlagen: %s", e)
 
+    def _refresh_active_playlist(self, uid: str, kaka: dict) -> None:
+        """Zieht die Track-Liste der LAUFENDEN Playlist nach, falls ``uid`` noch
+        die aktive Figur ist. Baut KakaContent aus den (playable) Inhalten und
+        ruft ``Playlist.update_contents`` — das laufende Audio bricht NICHT ab.
+
+        Bei echter Änderung wird der LED-Track-Balken neu gesetzt und ein
+        Sofort-Sync angestoßen, damit ein neu hinzugekommenes (noch fehlendes)
+        Lied gleich geladen und beim Erreichen abspielbar ist.
+        """
+        new_contents = [
+            KakaContent(
+                content_id=c["id"],
+                title=c.get("title", ""),
+                file_hash=c.get("file_hash"),
+                download_url=c.get("download_url"),
+                cached_locally=bool(c.get("cached_locally")),
+                sort_order=int(c.get("sort_order", 0)),
+            )
+            for c in (kaka.get("contents") or [])
+            if c.get("id") and c.get("playable", True)
+        ]
+        # Leere Liste nicht anwenden — sonst würde eine laufende Wiedergabe
+        # ihre Track-Liste verlieren. (Status-Wechsel auf "keine Lieder" wird
+        # ohnehin über den normalen Tag-Scan-Pfad behandelt.)
+        if not new_contents:
+            return
+
+        with self._playlist_lock:
+            playlist = self._current_playlist if self._active_tag_uid == uid else None
+        if playlist is None:
+            return
+
+        if playlist.update_contents(new_contents):
+            if self.leds is not None:
+                self.leds.strips_show_position(
+                    playlist.current_index, playlist.length,
+                )
+            self._trigger_background_sync("content-changed")
+
     def _start_kaka_playlist(self, uid: str, kaka: dict) -> None:
-        contents_data = kaka.get("contents", [])
+        # Nur tatsächlich auslieferbare Lieder (veröffentlicht + Audiodatei) in
+        # die Playlist nehmen. 'playable' kommt vom Backend (formatKaka); fehlt
+        # das Feld (älteres Backend), gilt der Track als spielbar (Kompat).
+        # So zählt der LED-Track-Balken nie ein Lied mit, das nie geladen
+        # werden kann ("3/3 angezeigt, aber 3. Lied unerreichbar").
+        contents_data = [
+            c for c in kaka.get("contents", []) if c.get("playable", True)
+        ]
         if not contents_data:
-            logger.info("Kaka '%s' hat noch keine Lieder.", kaka.get("name"))
+            logger.info("Kaka '%s' hat noch keine abspielbaren Lieder.", kaka.get("name"))
             return
 
         contents = [
@@ -1064,6 +1158,10 @@ class Kakabox:
             self.leds.strips_show_position(
                 playlist.current_index, playlist.length,
             )
+        # M1: Beim Auflegen sofort einen Sync anstoßen — so werden neu
+        # verknüpfte Lieder gleich geladen (statt erst beim nächsten 5-Min-
+        # Zyklus), und _jump_to lädt notfalls beim Erreichen blockierend nach.
+        self._trigger_background_sync("tag-placed")
 
     # ------------------------------------------------------------------
     # Random-Mode (Encoder-Push ≥ 1s)

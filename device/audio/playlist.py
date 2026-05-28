@@ -88,6 +88,10 @@ class Playlist:
         self._index = -1
         self._stopped = threading.Event()
         self._download_thread: Optional[threading.Thread] = None
+        # Schützt den atomaren Swap von _contents/_index in update_contents()
+        # gegen gleichzeitige Navigation (next/previous/on_track_end laufen aus
+        # Button-/Player-Threads, update_contents aus dem Sync-Thread).
+        self._update_lock = threading.Lock()
 
     @property
     def is_empty(self) -> bool:
@@ -112,6 +116,57 @@ class Playlist:
             except (TypeError, ValueError):
                 pos = 0.0
         return PlaylistSnapshot(track_index=self._index, position_seconds=pos)
+
+    def update_contents(self, new_contents: list[KakaContent]) -> bool:
+        """Aktualisiert die Track-Liste einer LAUFENDEN Playlist.
+
+        Wird vom Audio-Sync / Tag-Refresh aufgerufen, wenn sich der Inhalt der
+        gerade aktiven Kaka geändert hat (neues Lied verknüpft, eines entfernt)
+        oder ein zuvor fehlendes Lied nachgeladen wurde. Der aktuell spielende
+        Track bleibt erhalten (über content_id wiedergefunden); neue Tracks
+        werden über _ensure_local beim Erreichen erreichbar, entfernte fallen
+        raus. Frische download_url/file_hash werden ebenfalls übernommen.
+
+        Gibt True zurück, wenn sich Menge oder Reihenfolge der Tracks geändert
+        hat — dann muss der Aufrufer z.B. die LED-Track-Anzeige neu setzen.
+        Das gerade laufende Audio wird NICHT unterbrochen.
+        """
+        if self._stopped.is_set():
+            return False
+
+        new_sorted = sorted(new_contents, key=lambda c: c.sort_order)
+        with self._update_lock:
+            old_ids = [c.content_id for c in self._contents]
+            new_ids = [c.content_id for c in new_sorted]
+            current = self._current_content()
+            self._contents = new_sorted
+            # Index auf den weiterhin laufenden Track neu ausrichten.
+            if current is not None:
+                new_idx = next(
+                    (i for i, c in enumerate(new_sorted)
+                     if c.content_id == current.content_id),
+                    None,
+                )
+                if new_idx is not None:
+                    self._index = new_idx
+                else:
+                    # Laufender Track wurde entfernt — Index defensiv klemmen,
+                    # damit on_track_end nicht ins Leere greift.
+                    self._index = min(self._index, len(new_sorted) - 1)
+            changed = old_ids != new_ids
+
+        if changed:
+            logger.info(
+                "Playlist live aktualisiert: %d → %d Tracks.",
+                len(old_ids), len(new_ids),
+            )
+            # Neu hinzugekommene Tracks im Hintergrund vorab laden, damit sie
+            # beim Erreichen sofort spielen statt erst beim Jump blockierend.
+            if not self.is_empty and not self._stopped.is_set():
+                threading.Thread(
+                    target=self._prefetch_rest, daemon=True, name="playlist-refetch",
+                ).start()
+        return changed
 
     # ------------------------------------------------------------------
     # Wiedergabe-Steuerung
@@ -229,19 +284,30 @@ class Playlist:
     # ------------------------------------------------------------------
 
     def _jump_to(self, index: int) -> None:
-        if not (0 <= index < len(self._contents)):
+        # Snapshot der Liste — update_contents() könnte parallel swappen.
+        contents = self._contents
+        n = len(contents)
+        if n == 0 or not (0 <= index < n):
             return
-        nxt = self._contents[index]
-        path = self._ensure_local(nxt, blocking=True)
-        if path is None:
-            logger.error("Track '%s' nicht verfügbar — überspringe.", nxt.title)
-            # Bei nicht-verfügbarem Track einen weiter, max einmal
-            if index != self._index:
-                self._index = index
-                self.next()
-            return
-        self._index = index
-        self._play(nxt, path)
+        # Ab `index` den nächsten TATSÄCHLICH verfügbaren Track suchen und bei
+        # Bedarf on-demand laden. Maximal einmal rundherum, damit ein fehlendes
+        # Lied (z.B. noch nicht fertig gesynct) weder eine Endlosschleife noch
+        # ein stummes Zurückspringen auf Track 1 auslöst. _ensure_local lädt
+        # blockierend nach — so wird ein neu verknüpftes 3. Lied beim Erreichen
+        # geladen statt übersprungen.
+        for offset in range(n):
+            i = (index + offset) % n
+            nxt = contents[i]
+            path = self._ensure_local(nxt, blocking=True)
+            if path is not None:
+                self._index = i
+                self._play(nxt, path)
+                return
+            logger.warning(
+                "Track '%s' (#%d) nicht verfügbar — versuche nächsten.",
+                nxt.title, i + 1,
+            )
+        logger.error("Kein Track der Playlist verfügbar — Wiedergabe pausiert.")
 
     def _play(self, content: KakaContent, path: Path, start_seconds: float = 0.0) -> None:
         logger.info(

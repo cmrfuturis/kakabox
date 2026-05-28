@@ -295,3 +295,119 @@ def test_callbacks_silent_failure_does_not_break_playlist(cache):
     # stop() darf auch nicht ausbrechen
     pl.stop()
     assert player.stop_called is True
+
+
+# ----------------------------------------------------------------------
+# update_contents: laufende Playlist live aktualisieren (M2) + robustes
+# Advancing zu einem erst später verfügbaren Track (M3).
+# Regression: "3. Lied verknüpft, LED zeigt 1/3 2/3, aber 3. Track unerreichbar".
+# ----------------------------------------------------------------------
+
+def test_update_contents_adds_track_and_preserves_current(cache):
+    backend = FakeBackend()
+    backend.set_content(1, b"a")
+    backend.set_content(2, b"b")
+    backend.set_content(3, b"c")
+    player = FakePlayer()
+
+    pl = Playlist(
+        contents=[_make_content(1, b"a", sort=1), _make_content(2, b"b", sort=2)],
+        cache=cache,
+        download_fn=backend.download,
+        play_fn=player.play,
+        stop_fn=player.stop,
+    )
+    assert pl.start() is True          # spielt Track 1
+    assert pl.length == 2
+    assert pl.current_index == 0
+
+    changed = pl.update_contents([
+        _make_content(1, b"a", sort=1),
+        _make_content(2, b"b", sort=2),
+        _make_content(3, b"c", sort=3),
+    ])
+    assert changed is True
+    assert pl.length == 3              # LED-Zähler-Nenner steigt auf 3
+    assert pl.current_index == 0       # laufender Track (id=1) bleibt erhalten
+
+
+def test_update_contents_unchanged_returns_false(cache):
+    backend = FakeBackend()
+    backend.set_content(1, b"a")
+    player = FakePlayer()
+    pl = Playlist(
+        contents=[_make_content(1, b"a", sort=1)],
+        cache=cache, download_fn=backend.download,
+        play_fn=player.play, stop_fn=player.stop,
+    )
+    pl.start()
+    assert pl.update_contents([_make_content(1, b"a", sort=1)]) is False
+
+
+def test_update_contents_remaps_index_when_earlier_track_removed(cache):
+    backend = FakeBackend()
+    for cid, payload in [(1, b"a"), (2, b"b"), (3, b"c")]:
+        backend.set_content(cid, payload)
+    player = FakePlayer()
+    pl = Playlist(
+        contents=[_make_content(1, b"a", 1), _make_content(2, b"b", 2), _make_content(3, b"c", 3)],
+        cache=cache, download_fn=backend.download,
+        play_fn=player.play, stop_fn=player.stop,
+    )
+    pl.start()
+    threading.Event().wait(0.05)
+    pl.on_track_end()                  # → Track 2 (index 1)
+    assert pl.current_index == 1
+    # Track 1 entfernt → laufender Track (id=2) zeigt auf neuen Index 0
+    pl.update_contents([_make_content(2, b"b", 2), _make_content(3, b"c", 3)])
+    assert pl.length == 2
+    assert pl.current_index == 0
+
+
+def test_reaches_newly_added_track_on_advance(cache):
+    """Kern-Regression: 2 Tracks gecached, 3. erst nach update_contents per
+    Download verfügbar — on_track_end muss bis zum 3. Track durchlaufen und ihn
+    on-demand laden, statt auf Track 1 zurückzuspringen."""
+    cache.path_for(1).write_bytes(b"a")
+    cache.path_for(2).write_bytes(b"b")
+    backend = FakeBackend()
+    backend.set_content(3, b"c")       # 3. nur per Download
+    player = FakePlayer()
+    pl = Playlist(
+        contents=[_make_content(1, b"a", 1), _make_content(2, b"b", 2)],
+        cache=cache, download_fn=backend.download,
+        play_fn=player.play, stop_fn=player.stop,
+    )
+    pl.start()
+    pl.update_contents([
+        _make_content(1, b"a", 1), _make_content(2, b"b", 2), _make_content(3, b"c", 3),
+    ])
+    threading.Event().wait(0.05)       # prefetch
+    pl.on_track_end()                  # → Track 2
+    assert player.played[-1] == cache.path_for(2)
+    pl.on_track_end()                  # → Track 3 (on-demand geladen)
+    assert player.played[-1] == cache.path_for(3)
+    assert 3 in backend.calls
+
+
+def test_jump_skips_unavailable_track_without_wrapping_to_first(cache):
+    """M3: ein fehlender, nicht-ladbarer Track darf nicht zum stummen
+    Zurückspringen auf Track 1 führen — es geht zum nächsten verfügbaren."""
+    cache.path_for(1).write_bytes(b"a")
+    cache.path_for(3).write_bytes(b"c")
+    backend = FakeBackend()            # Track 2 nirgends → Download schlägt fehl
+    player = FakePlayer()
+    pl = Playlist(
+        contents=[
+            _make_content(1, b"a", 1),
+            _make_content(2, b"b", 2),
+            _make_content(3, b"c", 3),
+        ],
+        cache=cache, download_fn=backend.download,
+        play_fn=player.play, stop_fn=player.stop,
+    )
+    pl.start()                         # Track 1
+    threading.Event().wait(0.05)
+    pl.on_track_end()                  # Track 2 fehlt → weiter auf Track 3
+    assert player.played[-1] == cache.path_for(3)
+    assert pl.current_index == 2

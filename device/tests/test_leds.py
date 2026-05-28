@@ -140,13 +140,21 @@ def test_scale_to_intensity_halves_at_half():
 
 
 def test_scale_to_intensity_nfc_pulse_range():
-    """NFC pulsiert zwischen 5% und 15%. Bei MAX_BRIGHTNESS=15% ergibt das
-    Min-Faktor 0.05/0.15 ≈ 0.333 → (0, 84, 0), Max-Faktor 1.0 → (0, 255, 0)."""
+    """NFC pulsiert zwischen MIN- und MAX-Intensität. ``scale_to_intensity``
+    bildet die absolute Intensität relativ zu ``MAX_BRIGHTNESS`` ab.
+
+    Erwartung aus den Konstanten ableiten, damit der Test bei einer
+    Helligkeitsänderung (z.B. MIN 0.05→0.10) nicht veraltet — er prüft die
+    Skalierungs-Logik, nicht einen hartkodierten Pegel.
+    """
     low = scale_to_intensity(NFC_PRESENT_COLOR_BASE, NFC_PRESENT_PULSE_MIN_INTENSITY)
     high = scale_to_intensity(NFC_PRESENT_COLOR_BASE, NFC_PRESENT_PULSE_MAX_INTENSITY)
-    # int(255 * (0.05 / 0.15)) = int(85.0) = 85 ; int(255 * 1.0) = 255
-    assert low == (0, 85, 0)
-    assert high == (0, 255, 0)
+
+    min_factor = NFC_PRESENT_PULSE_MIN_INTENSITY / MAX_BRIGHTNESS
+    expected_low = tuple(int(c * min_factor) for c in NFC_PRESENT_COLOR_BASE)
+    assert low == expected_low
+    # MAX-Intensität == MAX_BRIGHTNESS → Faktor 1.0 → Basisfarbe unverändert.
+    assert high == NFC_PRESENT_COLOR_BASE
 
 
 def test_nfc_pulse_range_is_sane():
