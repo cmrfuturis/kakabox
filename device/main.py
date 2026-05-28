@@ -97,6 +97,11 @@ SPEED_MAX = 2.0
 VOICE_MAX_SECONDS = 7.0
 VOICE_SILENCE_SECONDS = 2.0
 VOICE_INITIAL_SILENCE_SECONDS = 3.0  # nichts gesagt nach 3s → Abbruch
+# Follow-up-Aufnahme für die Zauberwort-Rückfrage ("Wie heißt das Zauberwort?"):
+# kurze Nachlauf-Stille, damit nach erkanntem "bitte" praktisch sofort gestartet
+# wird (nicht erst nach 2s wie bei einem normalen Befehl). Max- und
+# Initial-Silence bleiben gleich (7s hart / mind. 3s lauschen).
+VOICE_ZAUBERWORT_SILENCE_SECONDS = 0.4
 
 
 def _kill_aplay_prompt() -> bool:
@@ -2045,15 +2050,9 @@ class Kakabox:
 
             logger.info("Voice transkribiert: «%s»", text)
 
-            # Zauberwort-Modus: nur abspielen, wenn "bitte" im Transkript steht.
-            # Sonst Prompt "Wie heißt das Zauberwort?" — Kind muss den Befehl
-            # nochmal mit Höflichkeit wiederholen. Der Modus wird per API
-            # (POST /zauberwort/enable) oder direkt in config.json geschaltet.
-            if self.config.get("zauberwort_mode_enabled") and not has_magic_word(text):
-                logger.info("Zauberwort fehlt in «%s» — Prompt statt Match.", text)
-                self._play_prompt("zauberwort.wav")
-                return
-
+            # Erst MATCHEN, dann erst das Zauberwort-Gate (Z2). So kommt der
+            # "Wie heißt das Zauberwort?"-Prompt nur, wenn das Lied wirklich
+            # gefunden wurde — bei Nicht-Treffer der normale Error-Ton (finally).
             catalog = build_catalog_from_file(VOICE_CATALOG_PATH)
             if not catalog:
                 logger.warning("Voice-Catalog leer — kein Match möglich.")
@@ -2061,14 +2060,25 @@ class Kakabox:
 
             cmd = parse_play_command(text, catalog)
             if cmd is None:
-                logger.info("Voice: kein Match für «%s»", text)
+                logger.info("Voice: kein Match für «%s» → Error-Ton.", text)
                 return
 
             logger.info(
                 "Voice match: kind=%s name='%s' score=%.2f query='%s'",
                 cmd.target.kind, cmd.target.name, cmd.score, cmd.query,
             )
-            # Match → Erfolgs-Feedback: NFC-LED static sattes Grün während
+
+            # Zauberwort-Gate: Lied gefunden, aber im aktiven Modus fehlt "bitte"
+            # → "Wie heißt das Zauberwort?" abspielen und ein zweites Mal
+            # lauschen. Sagt das Kind dann "bitte" (vorne/mitte/hinten), spielen
+            # wir; sonst kein Playback (finally → Error-Ton).
+            if self.config.get("zauberwort_mode_enabled") and not has_magic_word(text):
+                logger.info("Zauberwort fehlt in «%s» — frage nach.", text)
+                if not self._await_zauberwort():
+                    logger.info("Zauberwort nicht gesagt — kein Playback.")
+                    return
+
+            # Match (+ ggf. Zauberwort bestätigt) → Erfolgs-Feedback: NFC-LED static sattes Grün während
             # der success-Sound spielt. Danach Voice-Track. Der finally-Block
             # setzt die LED dann zurück auf den richtigen Pulse-Status (grün
             # falls Tag noch drauf via _voice_pending_tag_uid).
@@ -2107,6 +2117,37 @@ class Kakabox:
                 else:
                     self.leds.nfc_chip_absent()
             self._voice_lock.release()
+
+    def _await_zauberwort(self) -> bool:
+        """Spielt "Wie heißt das Zauberwort?" und lauscht ein zweites Mal.
+
+        Gibt True zurück, wenn das Kind "bitte" sagt (positionsunabhängig, via
+        has_magic_word). Follow-up-Timing (Z4): max 7s, mind. 3s lauschen bevor
+        bei Stille abgebrochen wird, nur ~0.4s Nachlauf-Stille → nach "bitte"
+        startet es praktisch sofort. Die NFC-LED bleibt blau ("lauscht"); das
+        grüne Erfolgs-Feedback setzt der aufrufende Erfolgs-Pfad.
+        """
+        if self.leds is not None:
+            self.leds.nfc_voice_active()
+        self._play_prompt("zauberwort.wav")
+        # Prompt fertig abspielen, sonst mischt er sich in die Aufnahme.
+        self.player.wait_until_idle(timeout=2.0)
+        try:
+            wav = self._mic_recorder.record_until_silence(
+                max_seconds=VOICE_MAX_SECONDS,
+                silence_seconds=VOICE_ZAUBERWORT_SILENCE_SECONDS,
+                initial_silence_seconds=VOICE_INITIAL_SILENCE_SECONDS,
+            )
+        except RecorderError as e:
+            logger.warning("Zauberwort-Aufnahme fehlgeschlagen: %s", e)
+            return False
+        try:
+            text = self._recognizer.transcribe_wav(wav)
+        except VoiceUnavailable as e:
+            logger.warning("ASR (Zauberwort) nicht verfügbar: %s", e)
+            return False
+        logger.info("Zauberwort-Antwort: «%s»", text)
+        return has_magic_word(text)
 
     def _stop_for_voice(self) -> None:
         """Räumt vor der Aufnahme: laufende Playlist stoppen, Tag-State leeren.
