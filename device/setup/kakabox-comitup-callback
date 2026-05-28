@@ -16,15 +16,15 @@
 #     HOTSPOT-Prompt tatsächlich lief (= echter Onboarding-Flow, nicht
 #     Auto-Connect beim Boot).
 #
-# Lautstärke: Prompts laufen auf system_volume aus config.json (separater
-# Pegel für Boot/WLAN/Bye, normalerweise leiser als die Musik). Vor dem aplay
-# wird ALSA-PCM auf system_volume gesetzt, danach auf die User-Lautstärke
-# zurück — beide Werte werden frisch aus config gelesen, falls der User
-# während der Ansage am Encoder gedreht hat.
+# Lautstärke: Prompts laufen über mpv-softvol auf der AKTUELLEN User-Lautstärke
+# (config 'volume'), hart gekappt durch 'max_volume' — exakt wie die Musik.
+# KEIN system_volume und KEIN amixer mehr: die voiceHAT/MAX98357A-Karte hat
+# keinen Hardware-Mixer, amixer verpuffte (lief zudem auf der falschen Karte)
+# → aplay spielte voll auf. mpv --volume ist echte Software-Lautstärke.
 #
-# Abbruch per Knopfdruck: aplay-PID wird in $STATE_DIR/prompt_pid abgelegt;
+# Abbruch per Knopfdruck: mpv-PID wird in $STATE_DIR/prompt_pid abgelegt;
 # main.py liest die Datei beim Button-Press und schickt SIGTERM, womit die
-# Wiedergabe direkt endet (siehe _kill_aplay_prompt in main.py).
+# Ansage sofort endet (siehe _kill_aplay_prompt in main.py).
 #
 # Wird aus /etc/comitup.conf via external_callback geladen.
 
@@ -55,36 +55,35 @@ except Exception:
 " 2>/dev/null || echo "$default"
 }
 
-set_alsa_volume() {
-    # Card 0 + PCM-Control entsprechen dem, was main.py nutzt
-    # (hardware/audio_output.py). Failsafe: bei Fehlern weiter, kein Abort.
-    amixer -c 0 sset PCM "${1}%" >/dev/null 2>&1 || true
-}
-
 play_prompt() {
     local file="$PROMPTS/$1"
     [ -f "$file" ] || { log "prompt missing: $file"; return; }
 
-    local sys_vol
-    sys_vol=$(read_config_volume system_volume 60)
-    set_alsa_volume "$sys_vol"
-    log "Prompt-Lautstärke ALSA PCM auf ${sys_vol}% (system_volume)"
+    # Lautstärke = aktuelle User-Lautstärke, HART gekappt durch max_volume
+    # (Eltern-Schutz) — exakt wie die Musik. KEIN system_volume und KEIN amixer:
+    # die voiceHAT/MAX98357A-Soundkarte hat keinen Hardware-Mixer (main.py regelt
+    # alles über mpv-softvol), und amixer lief obendrein auf der falschen Karte
+    # (-c 0 statt der echten Karte) → verpuffte komplett, aplay spielte VOLL auf.
+    # mpv --volume ist echte Software-Lautstärke und respektiert den Pegel.
+    local vol max
+    vol=$(read_config_volume volume 70)
+    max=$(read_config_volume max_volume 100)
+    [ "$vol" -gt "$max" ] && vol="$max"
+    log "Prompt-Lautstärke (mpv softvol) ${vol}% (volume, gekappt auf max ${max})"
 
-    # aplay im Hintergrund — PID merken, damit ein Knopfdruck via SIGTERM
-    # die Wiedergabe abbrechen kann (siehe _kill_aplay_prompt in main.py).
-    aplay -q -D plughw:CARD=sndrpigooglevoi,DEV=0 "$file" 2>&1 | tee -a "$LOG" &
+    # mpv im Hintergrund — PID merken, damit ein BELIEBIGER Knopfdruck via
+    # SIGTERM die Ansage sofort abbricht (siehe _kill_aplay_prompt in main.py).
+    # Kein Pipe (anders als früher `aplay | tee &`, wo $! die tee-PID war und
+    # SIGTERM ins Leere ging) — so ist $! die echte mpv-PID.
+    mpv --really-quiet --no-video --no-terminal \
+        --audio-device=alsa/plughw:CARD=sndrpigooglevoi,DEV=0 \
+        --volume="$vol" "$file" >>"$LOG" 2>&1 &
     local pid=$!
     echo "$pid" > "$STATE_DIR/prompt_pid"
     wait "$pid" 2>/dev/null
     local rc=$?
     rm -f "$STATE_DIR/prompt_pid"
-    log "aplay beendet (rc=$rc)"
-
-    # ALSA zurück auf User-Lautstärke — frisch aus config, könnte sich
-    # während der Ansage geändert haben.
-    local user_vol
-    user_vol=$(read_config_volume volume 70)
-    set_alsa_volume "$user_vol"
+    log "mpv-Prompt beendet (rc=$rc)"
 }
 
 cancel_pending_hotspot() {
