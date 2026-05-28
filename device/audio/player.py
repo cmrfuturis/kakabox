@@ -12,7 +12,9 @@ logger = logging.getLogger(__name__)
 # Google Voice HAT Soundcard (MAX98357A Speaker + INMP441 Mic an I²S).
 # Card-Name kommt vom `dtoverlay=googlevoicehat-soundcard` in
 # /boot/firmware/config.txt — Playback (Speaker) und Capture (Mic) auf
-# der gleichen Karte.
+# der gleichen Karte. Direkt-Routing statt Multi-Device, weil snd-aloop
+# mit mpv jeden Track nach 250ms in idle zwingt — Audio-reaktive LEDs
+# müssen einen anderen Weg finden (z.B. mpv af=astats).
 AUDIO_DEVICE = "alsa/plughw:CARD=sndrpigooglevoi,DEV=0"
 
 
@@ -146,6 +148,15 @@ class Player:
             self._mpv["start"] = "0"
         self._mpv.play(str(path))
 
+    def current_track_path(self) -> Optional[str]:
+        """Pfad der gerade abspielenden Datei (None wenn idle/Track ohne Pfad)."""
+        if self._state.current_track is not None:
+            return self._state.current_track.path
+        return None
+
+    def is_paused(self) -> bool:
+        return self._state.paused
+
     def current_position_seconds(self) -> float:
         """Aktuelle Wiedergabeposition in Sekunden (oder 0 wenn nichts läuft)."""
         try:
@@ -181,6 +192,13 @@ class Player:
 
     def stop(self) -> None:
         self._mpv.stop()
+        # mpv hält pause als eigenes Property — wenn vorher pause war und wir
+        # jetzt stoppen, würde der nächste play_file() den Track stumm in
+        # Pause laden (User müsste erst pause-toggeln). Explizit zurücksetzen.
+        try:
+            self._mpv.pause = False
+        except Exception:
+            pass
         self._state.playing = False
         self._state.paused = False
         self._state.current_track = None

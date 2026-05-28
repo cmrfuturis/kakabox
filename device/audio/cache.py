@@ -41,6 +41,45 @@ class AudioCache:
                 h.update(chunk)
         return h.hexdigest()
 
+    def find_by_hash(self, expected_hash: str) -> Path | None:
+        """Sucht eine bereits gecachte Datei mit dem gegebenen sha256-Hash.
+
+        Genutzt vom Sync-Loop: bevor ein neuer Download startet, prüfen ob
+        derselbe Inhalt schon unter einer anderen ``content_id`` liegt
+        (Backend-Dublette: gleicher Hash, andere ID). In dem Fall einfach
+        per Hardlink "duplizieren" — kein zweiter Download, kein doppelter
+        Speicherplatz.
+        """
+        if not expected_hash:
+            return None
+        for f in self.dir.iterdir():
+            if not f.is_file() or f.suffix != ".mp3":
+                continue
+            try:
+                if self.compute_hash(f) == expected_hash:
+                    return f
+            except OSError:
+                continue
+        return None
+
+    def link_from(self, source: Path, content_id: int) -> bool:
+        """Erzeugt path_for(content_id) als Hardlink auf ``source``. Returns
+        True bei Erfolg. Falls Hardlink scheitert (z.B. cross-filesystem),
+        fallback auf copy."""
+        target = self.path_for(content_id)
+        if target.exists():
+            return True
+        try:
+            os.link(source, target)
+            return True
+        except OSError:
+            try:
+                shutil.copy2(source, target)
+                return True
+            except OSError as e:
+                logger.warning("link_from(%s → %s) failed: %s", source, target, e)
+                return False
+
     def cleanup(self, keep_content_ids: Iterable[int]) -> int:
         """Entfernt Dateien, die nicht mehr in keep_content_ids sind. Returns: Anzahl gelöscht."""
         keep = {int(cid) for cid in keep_content_ids}

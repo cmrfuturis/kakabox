@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from audio import AudioCache, KakaContent, Playlist, PlaylistSnapshot
 from audio.library import scan
 from audio.player import Player
-from audio.spectrum import SpectrumCapture
+from audio.spectrum import FileSpectrum
 from hardware.audio_output import set_volume
 from hardware.buttons import Buttons
 from hardware.leds import Leds, LedsUnavailable
@@ -87,12 +87,14 @@ SPEED_STEP = 0.1
 SPEED_MIN = 0.5
 SPEED_MAX = 2.0
 
-# Voice-Push-to-Talk: Encoder ≥ 1s gehalten → Padamm → Aufnehmen → Match.
-# VAD-light bricht die Aufnahme automatisch ab, sobald 1s am Stück Stille
-# (nach erster erkannter Sprache) erreicht ist — sonst hartes Cap bei 5s,
-# damit die Box nicht endlos auf jemanden wartet, der gerade gar nichts sagt.
-VOICE_MAX_SECONDS = 5.0
-VOICE_SILENCE_SECONDS = 1.0
+# Voice-Push-to-Talk: Blau gedrückt → Padamm → Aufnehmen → Match.
+# VAD-light bricht die Aufnahme automatisch ab, sobald 2s am Stück Stille
+# (nach erster erkannter Sprache) erreicht ist — sonst hartes Cap bei 7s,
+# damit längere Sätze möglich sind aber die Box nicht endlos wartet, wenn
+# jemand nichts sagt.
+VOICE_MAX_SECONDS = 7.0
+VOICE_SILENCE_SECONDS = 2.0
+VOICE_INITIAL_SILENCE_SECONDS = 3.0  # nichts gesagt nach 3s → Abbruch
 
 
 def _kill_aplay_prompt() -> bool:
@@ -276,6 +278,15 @@ class Kakabox:
         # die Session neu (neue Reihenfolge).
         self._random_mode = False
 
+        # Yellow-Hold-State: Snapshot vom Pause-Status beim Druck, damit der
+        # Release-Callback entscheiden kann ob Toggle (kurz) oder Resume (Hold).
+        self._yellow_was_paused_before_press = False
+
+        # LED-Streifen User-Toggle: per Gelb-Hold (≥ 3s) an/aus. Default aus,
+        # damit der User sie bewusst aktiviert (kein lautes Lichtspiel beim
+        # Boot).
+        self._strips_user_enabled = False
+
         # Voice-Mode: True während ein per Sprache erkannter Track läuft.
         # Continue-Logik beim Voice-Track-Ende:
         #   - _voice_pending_tag_uid noch aktiv (Tag liegt noch drauf):
@@ -296,23 +307,16 @@ class Kakabox:
         # die Datei zwischenzeitlich nachgereicht hat.
         self._sync_failures: dict[int, float] = {}
 
-        # Spectrum-Capture: liest fortlaufend Audio vom snd-aloop Loopback
-        # und füttert die LED-Streifen mit Frequenzbändern (audio-reaktiver
-        # Tanz). Wird optional initialisiert — wenn snd-aloop / asound.conf
-        # fehlt, läuft die Box weiter, nur die Streifen tanzen dann Pseudo.
-        # Energy-Save: ``_spectrum_active`` event steuert ob der arecord-
-        # Subprozess wirklich läuft. An: Wiedergabe spielt → Streifen tanzen.
-        # Aus: Idle (kein Tag, kein Random, kein Voice-Track) → arecord stoppt,
-        # FFT pausiert, CPU runter.
-        self._spectrum: Optional[SpectrumCapture] = None
+        # Audio-Level-Poller: liest 20×/s den RMS-Pegel von mpv (via astats-
+        # Filter, siehe player.AUDIO_DEVICE/af) und reicht ihn an die LED-
+        # Streifen weiter (audio-reaktiver Tanz). Ersetzt den früheren snd-
+        # aloop-Capture-Pfad, der mit Multi-Device auf Pi 5 / googlevoicehat
+        # nicht stabil lief (mpv ging nach 250 ms in idle). Vorteil: keine
+        # Soundkarten-Multiplexerei, kostet ~0% CPU. Nachteil: nur ein Wert
+        # (RMS) statt 16-Band-Spektrum — Streifen pulsieren statt Bass/Treble
+        # zu trennen.
         self._spectrum_thread: Optional[threading.Thread] = None
         self._spectrum_stop = threading.Event()
-        self._spectrum_active = threading.Event()
-        if self.leds is not None:
-            try:
-                self._spectrum = SpectrumCapture(n_bands=16)
-            except Exception:
-                logger.exception("SpectrumCapture-Init fehlgeschlagen — Pseudo-Tanz bleibt")
 
         # Voice-Stack. Backend (vosk|whisper) kommt aus config.json → "voice.backend".
         # Recognizer instanziieren ist billig; das eigentliche Modell wird in einem
@@ -440,7 +444,9 @@ class Kakabox:
         self.buttons.on_red_held(self._on_red_held)
         self.buttons.on_push(self._on_push_pressed)
         self.buttons.on_push_held(self._on_push_held)
+        self.buttons.on_yellow_down(self._on_yellow_down)
         self.buttons.on_yellow(self._on_yellow_pressed)
+        self.buttons.on_yellow_held(self._on_yellow_held)
         self.buttons.on_blue(self._on_blue_pressed)
 
     def _wire_encoder(self) -> None:
@@ -478,14 +484,14 @@ class Kakabox:
             threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat").start()
             threading.Thread(target=self._audio_sync_loop, daemon=True, name="audio-sync").start()
 
-        # Spectrum-Capture läuft dauerhaft im Hintergrund. arecord vom
-        # Loopback blockt sauber, wenn gerade nichts gespielt wird (sendet
-        # Stille / 0-Werte) — kein Schaden. LEDs nehmen die Werte nur an,
-        # wenn ihre eigene Tanz-Animation aktiv ist (siehe leds.update_spectrum).
-        if self._spectrum is not None:
+        # Audio-Level-Loop: pollt mpv-RMS 20×/s und füttert LED-Streifen. Bei
+        # paused/idle/Stille liefert player.current_audio_level() 0.0, LEDs
+        # zeigen dann schwarz (im Dance-Mode). Sehr leichtgewichtig (nur
+        # property-read), darf dauerhaft laufen.
+        if self.leds is not None:
             self._spectrum_stop.clear()
             self._spectrum_thread = threading.Thread(
-                target=self._spectrum_loop, daemon=True, name="spectrum"
+                target=self._audio_level_loop, daemon=True, name="audio-level"
             )
             self._spectrum_thread.start()
 
@@ -569,6 +575,16 @@ class Kakabox:
             if self.audio_cache.is_cached(content_id, file_hash):
                 cached_already += 1
                 continue
+            # Dedup: liegt der gleiche Inhalt (Hash) schon unter einer anderen
+            # content_id im Cache? Backend hat manche Songs doppelt eingespielt
+            # (gleicher Hash, andere ID) — kein zweiter Download nötig, einfach
+            # hardlinken. Spart Bandbreite + Speicher.
+            existing = self.audio_cache.find_by_hash(file_hash)
+            if existing is not None:
+                if self.audio_cache.link_from(existing, content_id):
+                    cached_already += 1
+                    self.backend.report_audio_cached(content_id, file_hash)
+                    continue
             # Backoff: wenn der Download vor < SYNC_RETRY_BACKOFF_SECONDS
             # bereits fehlgeschlagen ist, nicht nochmal versuchen. Spart
             # Log-Spam + Bandbreite, wenn das Backend dauerhaft 404 liefert.
@@ -1436,22 +1452,68 @@ class Kakabox:
             name="random-mode-start",
         ).start()
 
-    def _on_yellow_pressed(self) -> None:
-        """Gelb — Pause/Play-Toggle.
+    def _on_yellow_down(self) -> None:
+        """Sofort bei Gelb-Press (vor Hold/Release). Snapshot + Pause.
 
-        NFC-LED bei Pause IMMER gelb (auch im Random-Modus, damit der User
-        visuelles Feedback bekommt). Bei Resume zurück zum Mode-spezifischen
-        Status (grün=Tag, lila=Random, aus=nichts).
+        Wir pausieren JEDEN Druck (auch Kurz-Druck) sofort — das gibt
+        sofortiges Audio-Feedback. Der spätere Release-Handler entscheidet
+        anhand des Pre-Press-Snapshots ob's ein Toggle (Kurz) oder Resume
+        (Hold) war.
         """
         if self._abort_prompt_if_playing():
             return
+        self._yellow_was_paused_before_press = self.player.get_state().paused
+        if not self._yellow_was_paused_before_press:
+            self.player.pause()
+            # NFC-LED auf gelb wenn Tag oder Random aktiv (sofortige Optik).
+            if self.leds is not None and (
+                self._active_tag_uid is not None or self._random_mode
+            ):
+                self.leds.nfc_chip_paused()
+
+    def _on_yellow_pressed(self) -> None:
+        """Gelb — kurzer Druck (< YELLOW_HOLD_SECONDS) → klassischer Toggle.
+
+        Bei kurzem Press hat ``_on_yellow_down`` schon pausiert. Jetzt
+        invertieren wir den Pre-Press-State: war vorher Play → bleibt
+        jetzt Pause; war vorher Pause → jetzt Play (resume).
+        """
         logger.info("🟡 Gelb (Pause/Play)")
-        self.player.toggle_pause()
+        if self._yellow_was_paused_before_press:
+            self.player.resume()
         if self.leds is not None:
             if self.player.get_state().paused:
-                self.leds.nfc_chip_paused()
+                if self._active_tag_uid is not None or self._random_mode:
+                    self.leds.nfc_chip_paused()
             else:
                 self._restore_idle_led()
+
+    def _on_yellow_held(self) -> None:
+        """Gelb-Hold (≥ YELLOW_HOLD_SECONDS) bei Release → LED-Streifen
+        toggeln + Musik resume (ungeachtet Pre-Press-State).
+
+        User-Wunsch: Hold = Strips-Toggle + Musik läuft beim Loslassen weiter.
+        """
+        logger.info("🟡⏵ Gelb 3s — LED-Streifen toggeln")
+        # Music: immer resume (war während Hold pausiert wegen _on_yellow_down)
+        if not self._yellow_was_paused_before_press:
+            self.player.resume()
+        # Strips-Toggle
+        self._toggle_strips()
+        # NFC-LED zurück zum Mode-Status
+        if self.leds is not None:
+            self._restore_idle_led()
+
+    def _toggle_strips(self) -> None:
+        """Schaltet die LED-Streifen-Animation an/aus mit Sweep-Animation."""
+        self._strips_user_enabled = not self._strips_user_enabled
+        logger.info("LED-Streifen %s", "AN" if self._strips_user_enabled else "AUS")
+        if self.leds is None:
+            return
+        if self._strips_user_enabled:
+            self.leds.strips_user_enable()
+        else:
+            self.leds.strips_user_disable()
 
     def _restore_idle_led(self) -> None:
         """Setzt die NFC-LED auf den passenden "läuft normal"-Status:
@@ -1469,44 +1531,87 @@ class Kakabox:
         else:
             self.leds.nfc_chip_absent()
 
-    def _spectrum_loop(self) -> None:
-        """Dauerhafter Audio-Capture + FFT für die LED-Streifen.
+    def _audio_level_loop(self) -> None:
+        """Parallele ffmpeg-Decode pro Track + 20×/s FFT-Bänder an LED-Streifen.
 
-        arecord läuft permanent (nicht lifecycle-gekoppelt). Grund: das
-        Multi-Device kakabox_audio (Speaker + Loopback) verträgt schnelles
-        Auf-Zu vom Capture-Reader nicht — wenn arecord gerade neu startet
-        während mpv versucht zu schreiben, blockiert der Loopback-Buffer
-        und mpv geht nach ~250 ms als "idle" raus → Track wird sofort
-        übersprungen. Permanent-Capture kostet ~1 % CPU dauerhaft, dafür
-        ist Audio bombenstabil.
+        Lifecycle: bei Track-Wechsel wird ein neuer ``FileSpectrum`` auf den
+        neuen Dateipfad gespawnt (ffmpeg streamt rohes PCM, die Pipe blockt
+        selbst sobald wir vorlaufen). Bei jedem Poll lesen wir bis zur mpv-
+        Wiedergabeposition voraus + berechnen 16 Frequenzbänder, die an
+        ``leds.update_spectrum`` gehen.
 
-        Bei Stille (nichts spielt) liefert arecord 0-Samples → FFT-Bänder
-        ~0 → LEDs entscheiden über SPECTRUM_SILENCE_THRESHOLD selbst dass
-        sie aus bleiben.
+        Bei paused/idle: keine neuen Bänder → LEDs zeigen schwarz nach 2 s.
         """
-        if self._spectrum is None:
-            return
-        if not self._spectrum.start():
-            logger.warning("Spectrum-Capture konnte nicht starten — LEDs ohne Tanz")
-            return
+        current_spectrum: Optional[FileSpectrum] = None
+        current_path: Optional[str] = None
+        last_pos: float = 0.0
         try:
             while not self._spectrum_stop.is_set():
-                bands = self._spectrum.read_bands()
-                if bands is None:
-                    # Stream tot — kurz warten, dann neu öffnen.
-                    if self._spectrum_stop.wait(1.0):
-                        return
-                    self._spectrum.stop()
-                    if not self._spectrum.start():
-                        return
-                    continue
-                if self.leds is not None:
-                    self.leds.update_spectrum(bands)
-        except Exception:
-            logger.exception("Spectrum-Loop crashed")
+                try:
+                    path = self.player.current_track_path()
+                    pos = self.player.current_position_seconds()
+                    paused = self.player.is_paused()
+                except Exception:
+                    path, pos, paused = None, 0.0, False
+
+                # Track-Wechsel oder Stop → alten Decoder beenden
+                if path != current_path:
+                    if current_spectrum is not None:
+                        current_spectrum.close()
+                        current_spectrum = None
+                    current_path = path
+                    if path is not None:
+                        current_spectrum = FileSpectrum(path, n_bands=16)
+                        if not current_spectrum.start(start_seconds=pos):
+                            current_spectrum = None
+                        last_pos = pos
+
+                # Rückwärtsseek > 1s → ffmpeg neustarten
+                if current_spectrum is not None and pos + 1.0 < last_pos:
+                    current_spectrum.stop()
+                    current_spectrum = FileSpectrum(path, n_bands=16)
+                    if not current_spectrum.start(start_seconds=pos):
+                        current_spectrum = None
+                last_pos = pos
+
+                # Bänder lesen + an LEDs
+                if current_spectrum is not None and not paused:
+                    bands = current_spectrum.read_bands_at(pos)
+                    if bands is None:
+                        # EOF / Fehler → Decoder zu, beim nächsten Track neu
+                        current_spectrum.close()
+                        current_spectrum = None
+                        current_path = None
+                    elif self.leds is not None:
+                        # Lautstärke koppelt die LED-Intensität: User-Volume
+                        # relativ zum max_volume-Cap. Bei Eltern-Limit (z.B.
+                        # 30) bedeutet "Volume=30" = volle LED-Reaktion, weil
+                        # das ist was die Box maximal hergibt. Unter 10% wird
+                        # komplett dunkel (Box flüstert nur → Lichter still).
+                        #
+                        # Sporadik-Effekt bei leiser Musik: nur die stärksten
+                        # Bänder überleben den Threshold. Bei vol_ratio=0.10
+                        # blitzen nur Peaks (≥0.55), bei vol_ratio≥0.70 läuft
+                        # alles durch — disco statt firefly.
+                        vol_ratio = self._volume / max(1, self._max_volume)
+                        if vol_ratio < 0.10:
+                            bands = [0.0] * len(bands)
+                        else:
+                            peak_threshold = max(0.0, 0.65 * (0.70 - vol_ratio))
+                            if peak_threshold > 0:
+                                bands = [b if b >= peak_threshold else 0.0 for b in bands]
+                            if vol_ratio < 1.0:
+                                bands = [b * vol_ratio for b in bands]
+                        try:
+                            self.leds.update_spectrum(bands)
+                        except Exception:
+                            pass
+
+                if self._spectrum_stop.wait(0.05):
+                    return
         finally:
-            if self._spectrum is not None:
-                self._spectrum.close()
+            if current_spectrum is not None:
+                current_spectrum.close()
 
     def _warmup_recognizer(self) -> None:
         """Lädt das ASR-Modell beim Service-Start in den RAM.
@@ -1620,6 +1725,7 @@ class Kakabox:
                 wav = self._mic_recorder.record_until_silence(
                     max_seconds=VOICE_MAX_SECONDS,
                     silence_seconds=VOICE_SILENCE_SECONDS,
+                    initial_silence_seconds=VOICE_INITIAL_SILENCE_SECONDS,
                 )
             except RecorderError as e:
                 logger.warning("Voice-Aufnahme fehlgeschlagen: %s", e)
@@ -1661,19 +1767,25 @@ class Kakabox:
                 "Voice match: kind=%s name='%s' score=%.2f query='%s'",
                 cmd.target.kind, cmd.target.name, cmd.score, cmd.query,
             )
-            # Match → Erfolgs-Sound (cartoonish), kurz warten bis er durch ist,
-            # dann Voice-Target abspielen. Voice-Mode wird in _play_voice_target gesetzt.
+            # Match → Erfolgs-Feedback: NFC-LED static sattes Grün während
+            # der success-Sound spielt. Danach Voice-Track. Der finally-Block
+            # setzt die LED dann zurück auf den richtigen Pulse-Status (grün
+            # falls Tag noch drauf via _voice_pending_tag_uid).
             self._voice_pending_tag_uid = saved_tag_uid
             self._voice_last_target = cmd.target
+            if self.leds is not None:
+                self.leds.nfc_flash_success()
             self._play_prompt("voice_success.wav")
             self.player.wait_until_idle(timeout=2.0)
             self._play_voice_target(cmd.target)
             recovered = True  # neue Wiedergabe läuft, kein Restore nötig
         finally:
             # Wenn vorher eine Kakafigur lief UND nichts Neues gestartet wurde:
-            # Erst Error-Sound, dann Kakafigur/Random restoren.
+            # Static rot + Error-Sound, dann Kakafigur/Random restoren.
             if not recovered:
                 try:
+                    if self.leds is not None:
+                        self.leds.nfc_flash_error()
                     self._play_prompt("voice_error.wav")
                     self.player.wait_until_idle(timeout=2.0)
                     _restore_previous("kein Match / Recording fail / ASR fail")

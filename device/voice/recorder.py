@@ -59,12 +59,17 @@ class MicRecorder:
         self,
         max_seconds: float = 5.0,
         silence_seconds: float = 1.0,
+        initial_silence_seconds: float = 3.0,
         speech_rms: float = DEFAULT_SPEECH_RMS,
         silence_rms: float = DEFAULT_SILENCE_RMS,
         output_path: Path | str = "/tmp/kakabox_ptt.wav",
     ) -> Path:
         """Nimmt auf, bis ``silence_seconds`` zusammenhängende Stille NACH erster
         Sprache erreicht ist — spätestens nach ``max_seconds`` hart abgebrochen.
+
+        ``initial_silence_seconds``: wenn nach so langer Aufnahme noch keine
+        Sprache erkannt wurde, wird abgebrochen (verhindert lange Wartezeit
+        bei versehentlichem Knopfdruck).
 
         Schreibt eine 16 kHz mono S16_LE-WAV. Wirft ``RecorderError`` wenn
         arecord nicht startet oder keine Frames liefert.
@@ -74,6 +79,7 @@ class MicRecorder:
         chunk_bytes = chunk_frames * 2  # S16_LE = 2 byte pro Sample
         max_chunks = max(1, int(max_seconds * 1000 / chunk_ms))
         silence_chunks_target = max(1, int(silence_seconds * 1000 / chunk_ms))
+        initial_silence_chunks = max(1, int(initial_silence_seconds * 1000 / chunk_ms))
 
         cmd = [
             "arecord", "-q",
@@ -93,7 +99,7 @@ class MicRecorder:
         speech_seen = False
         silence_streak = 0
         try:
-            for _ in range(max_chunks):
+            for chunk_idx in range(max_chunks):
                 data = proc.stdout.read(chunk_bytes)
                 if not data or len(data) < chunk_bytes:
                     break
@@ -108,6 +114,10 @@ class MicRecorder:
                 # In-between (silence_rms ≤ rms < speech_rms): keine Änderung —
                 # so frisst leises Nachhallen den Silence-Counter nicht weg.
                 if speech_seen and silence_streak >= silence_chunks_target:
+                    break
+                # Initial-Silence-Cap: wenn nach initial_silence_chunks noch
+                # gar nichts gesprochen wurde, raus (versehentlicher Knopfdruck).
+                if not speech_seen and chunk_idx + 1 >= initial_silence_chunks:
                     break
         finally:
             proc.terminate()

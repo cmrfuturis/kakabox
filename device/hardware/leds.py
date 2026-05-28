@@ -59,8 +59,8 @@ VOLUME_AUTO_OFF_S = 5.0
 # Soll sich klar vom Volume-Modus (Regenbogen) unterscheiden.
 SPEED_COLOR_BASE: Tuple[int, int, int] = (180, 0, 200)  # Lila bei Vollpegel
 SPEED_PULSE_HZ = 1.0                # eine Schwingung pro Sekunde
-SPEED_PULSE_FACTOR_MIN = 0.40       # ergibt 25% * 0.40 = 10% effektive Helligkeit
-SPEED_PULSE_FACTOR_MAX = 1.00       # ergibt 25% * 1.00 = 25% effektive Helligkeit
+SPEED_PULSE_FACTOR_MIN = 0.667      # ergibt 15% * 0.667 = 10% effektive Helligkeit
+SPEED_PULSE_FACTOR_MAX = 1.00       # ergibt 15% * 1.00  = 15% effektive Helligkeit
 SPEED_PULSE_FPS = 20                # 50 ms zwischen Updates — flüssig genug
 
 # Player-Speed-Range muss zur main.py SPEED_MIN/SPEED_MAX passen — der LED-
@@ -83,7 +83,12 @@ NFC_VOICE_COLOR_BASE: Tuple[int, int, int] = (0, 0, 200)
 # Lila für Random-Modus — visuelles Signal "kein Chip, aber Box spielt
 # zufällige Lieder". Anders als Speed-Mode-Lila (das nur am Ring leuchtet).
 NFC_RANDOM_COLOR_BASE: Tuple[int, int, int] = (160, 50, 255)
-NFC_PRESENT_PULSE_MIN_INTENSITY = 0.05
+# Static-Feedback-Farben (kein Pulse, ~0.5s nach Voice-Match/-Fail).
+# Sattes Grün/Rot, gut sichtbar als kurzer Blink.
+NFC_SUCCESS_COLOR_BASE: Tuple[int, int, int] = (0, 255, 0)
+NFC_ERROR_COLOR_BASE: Tuple[int, int, int] = (255, 0, 0)
+NFC_FLASH_INTENSITY = 0.15  # absolut, gleicher Pegel wie der Pulse-Max
+NFC_PRESENT_PULSE_MIN_INTENSITY = 0.10
 NFC_PRESENT_PULSE_MAX_INTENSITY = 0.15
 NFC_PULSE_HZ = 1.0    # eine Schwingung pro Sekunde
 NFC_PULSE_FPS = 20    # 50 ms zwischen Updates — flüssig
@@ -376,6 +381,18 @@ class Leds:
         # Dance-Loop auf Pseudo fallbacked wenn Audio-Capture verstummt.
         self._spectrum_bands: list[float] = [0.0] * STRIPS_TOTAL
         self._spectrum_updated_at: float = 0.0
+        # Audio-Level (RMS, 0..1) vom mpv-astats-Filter, alle 50 ms aktualisiert.
+        # Modulier die Helligkeit der Pseudo-Welle im Dance-Mode → Streifen
+        # pulsieren zur Musik. Bei _audio_level == 0 (paused/idle/Stille) bleiben
+        # sie dunkel. Wenn _audio_level_updated_at frisch ist, hat dieser Pfad
+        # Vorrang vor _spectrum_bands (Legacy, snd-aloop).
+        self._audio_level: float = 0.0
+        self._audio_level_updated_at: float = 0.0
+        # User-Toggle (via Gelb-Hold ≥ 3s): wenn False, bleiben die Streifen
+        # auch im "dance"-Mode dunkel. Sweep-Animationen beim Wechsel.
+        self._strips_user_enabled = False
+        # Sweep-Thread läuft 1s — muss serialisieren mit Strips-Render-Loop.
+        self._sweep_thread: threading.Thread | None = None
 
     # ---- Roh-Zugriff -----------------------------------------------------
 
@@ -432,6 +449,30 @@ class Leds:
         """Random-Modus läuft → lila Pulse-Licht (kein Chip drauf, aber Box
         spielt zufällige Lieder aus dem ganzen Cache)."""
         self._start_nfc_pulse(NFC_RANDOM_COLOR_BASE)
+
+    def nfc_flash_success(self) -> None:
+        """Statisches sattes Grün — Voice-Feedback "verstanden". Caller setzt
+        danach den passenden State (z.B. nfc_chip_present für Pulse)."""
+        self._nfc_flash(NFC_SUCCESS_COLOR_BASE)
+
+    def nfc_flash_error(self) -> None:
+        """Statisches sattes Rot — Voice-Feedback "nicht verstanden"."""
+        self._nfc_flash(NFC_ERROR_COLOR_BASE)
+
+    def _nfc_flash(self, base_color: Tuple[int, int, int]) -> None:
+        """Stoppt einen laufenden Pulse-Thread und schreibt eine statische
+        Farbe auf die NFC-LED. Caller bestimmt wie lange + setzt danach
+        explizit den Folgestate."""
+        self._nfc_pulse_stop.set()
+        thread = self._nfc_pulse_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.5)
+        self._nfc_pulse_thread = None
+        color = scale_to_intensity(base_color, NFC_FLASH_INTENSITY)
+        with self._lock:
+            for i in range(*ZONE_NFC.indices(LED_COUNT)):
+                self._pixels[i] = color
+            self._pixels.show()
 
     def _start_nfc_pulse(self, color: Tuple[int, int, int]) -> None:
         """Setzt Pulse-Farbe und startet den Thread falls noch nicht läuft.
@@ -653,6 +694,73 @@ class Leds:
             self._strips_mode = "position"
             self._ensure_strips_thread_locked()
 
+    # ---- User-Toggle für Streifen-Animation -----------------------------
+
+    def strips_user_enable(self) -> None:
+        """Aktiviert die Streifen-Animation mit Sweep-On (Regenbogen läuft
+        in 1s von links nach rechts auf). Danach normaler Dance-Modus."""
+        self._strips_user_enabled = True
+        # Render-Loop muss laufen, damit nach der Sweep der normale Dance kommt
+        with self._lock:
+            self._strips_mode = "dance"
+            self._ensure_strips_thread_locked()
+        self._start_sweep(direction="on")
+
+    def strips_user_disable(self) -> None:
+        """Deaktiviert die Animation mit Sweep-Off (alle LEDs werden in 1s
+        gedimmt von rechts nach links). Render-Loop bleibt aktiv und zeigt
+        danach schwarz (User-Disable-Check in ``_render_dance``)."""
+        self._strips_user_enabled = False
+        self._start_sweep(direction="off")
+
+    def _start_sweep(self, direction: str) -> None:
+        """Startet eine Sweep-Animation als Background-Thread, damit der
+        Caller (Button-Handler) nicht 1s blockt."""
+        # Wenn schon ein Sweep läuft → warten bis er fertig ist (gibt sonst
+        # widersprüchliche Frames). Pragmatisch: stoppen und neu starten.
+        old = self._sweep_thread
+        if old is not None and old.is_alive():
+            # Lass ihn ausklingen, neue Sweep wartet kurz
+            old.join(timeout=1.2)
+        self._sweep_thread = threading.Thread(
+            target=self._sweep_loop, args=(direction,),
+            daemon=True, name=f"led-sweep-{direction}",
+        )
+        self._sweep_thread.start()
+
+    def _sweep_loop(self, direction: str) -> None:
+        """1s-Animation: 'on' baut Regenbogen von links auf, 'off' baut ihn
+        von rechts ab. 30 fps für flüssige Wahrnehmung."""
+        duration = 1.0
+        fps = 30
+        n_frames = int(duration * fps)
+        frame_time = duration / n_frames
+        strip_size = STRIPS_TOTAL
+        try:
+            for f in range(n_frames):
+                progress = (f + 1) / n_frames  # 0 < p ≤ 1
+                if direction == "on":
+                    active_count = int(progress * strip_size)
+                else:  # "off"
+                    active_count = strip_size - int(progress * strip_size)
+                with self._lock:
+                    for i in range(strip_size):
+                        if i < active_count:
+                            hue = int(255 * i / strip_size) % 256
+                            self._pixels[ZONE_STRIP_LEFT.start + i] = _hue_to_rgb(hue)
+                        else:
+                            self._pixels[ZONE_STRIP_LEFT.start + i] = BLACK
+                    self._pixels.show()
+                time.sleep(frame_time)
+            # Finaler Frame komplett aus, falls direction=off
+            if direction == "off":
+                with self._lock:
+                    for i in range(strip_size):
+                        self._pixels[ZONE_STRIP_LEFT.start + i] = BLACK
+                    self._pixels.show()
+        except Exception:
+            logger.exception("Sweep-Loop crashed")
+
     def update_spectrum(self, bands: list[float]) -> None:
         """Wird vom Spectrum-Capture-Thread aufgerufen. Live-Update der Daten.
 
@@ -663,6 +771,16 @@ class Leds:
         # (worst case rendert ein Frame mit alten Werten).
         self._spectrum_bands = list(bands)
         self._spectrum_updated_at = time.monotonic()
+
+    def update_audio_level(self, level: float) -> None:
+        """Single-Wert Audio-Level (0..1) für Streifen-Reaktion auf Musik.
+
+        Wird vom Audio-Level-Loop in main.py 20×/s aufgerufen, mit dem RMS-
+        Pegel den mpv via astats-Filter berechnet. Der Dance-Loop modulier
+        damit die Helligkeit der Rainbow-Welle: leise → dunkel, laut → hell.
+        """
+        self._audio_level = max(0.0, min(1.0, float(level)))
+        self._audio_level_updated_at = time.monotonic()
 
     def _ensure_strips_thread_locked(self) -> None:
         """Startet den Render-Thread falls noch nicht aktiv. Lock vom Caller."""
@@ -699,31 +817,39 @@ class Leds:
             logger.exception("Strips-Loop crashed")
 
     def _render_dance(self) -> None:
-        """Audio-reaktiv: Spectrum frisch + über Stille-Schwelle → Bänder zeigen.
-        Sonst: Streifen aus (kein Pseudo-Regenbogen, damit Pause/leise =
-        wirklich dunkel ist — User-Wunsch).
+        """Audio-reaktiv wenn Spectrum frisch, sonst Pseudo-Welle. User-
+        Toggle ``_strips_user_enabled`` schaltet die ganze Animation aus.
 
-        Pseudo bleibt nur als allerletzter Fallback, wenn das Spectrum-
-        Capture-Modul gar nicht initialisiert wurde (z.B. snd-aloop fehlt) —
-        sonst hätte die Box bei Capture-Init-Fehlern stumme Streifen ohne
-        sichtbares Lebenszeichen.
+        Sweep-Animationen (sweep_thread aktiv) übernehmen das Rendern selbst
+        und blocken hier — wir geben dann sofort zurück.
         """
-        spectrum_age = time.monotonic() - self._spectrum_updated_at
-        if spectrum_age < 2.0:
-            # Capture liefert frische Daten → audio-reaktiv. Bei Stille
-            # (alle Bänder unter Schwelle) → schwarz statt Tanz.
+        # Sweep läuft → er rendert selbst, wir lassen ihn in Ruhe
+        if self._sweep_thread is not None and self._sweep_thread.is_alive():
+            return
+        # User hat Streifen ausgestellt → dunkel
+        if not self._strips_user_enabled:
+            colors = [BLACK] * STRIPS_TOTAL
+            with self._lock:
+                for i, c in enumerate(colors):
+                    self._pixels[ZONE_STRIP_LEFT.start + i] = c
+                self._pixels.show()
+            return
+        now = time.monotonic()
+        spectrum_age = now - self._spectrum_updated_at
+        if spectrum_age < 1.0:
+            # FileSpectrum (ffmpeg-parallel-decode in main._audio_level_loop)
+            # liefert 16 Frequenzbänder synchron zur mpv-Wiedergabeposition.
+            # Bei Stille (alle Bänder unter Schwelle) → schwarz statt Tanz.
             max_amp = max(self._spectrum_bands) if self._spectrum_bands else 0.0
             if max_amp < SPECTRUM_SILENCE_THRESHOLD:
                 colors = [BLACK] * STRIPS_TOTAL
             else:
                 colors = spectrum_to_led_colors(self._spectrum_bands)
-        elif self._spectrum_updated_at == 0.0:
-            # Capture wurde nie initialisiert → Pseudo als Lebenszeichen.
-            colors = self._pseudo_dance_colors()
         else:
-            # Capture lief mal, ist jetzt stumm (Stream tot) → einfach aus,
-            # statt plötzlich auf Pseudo umzuschalten und den User zu verwirren.
-            colors = [BLACK] * STRIPS_TOTAL
+            # Keine frische Spektrum-Daten (paused/idle/Prompt) → Pseudo-Welle
+            # als visuelles Feedback. User hat die Streifen explizit per Gelb-
+            # Hold eingeschaltet, also Bewegung statt Dunkelheit.
+            colors = self._pseudo_dance_colors()
         with self._lock:
             for i, c in enumerate(colors):
                 self._pixels[ZONE_STRIP_LEFT.start + i] = c
@@ -740,6 +866,28 @@ class Leds:
             led_phase = i / STRIPS_TOTAL * 2 * math.pi
             beat = 0.5 * (1 + math.sin(bpm_phase + led_phase * 2))
             intensity = MAX_BRIGHTNESS * (0.20 + 0.80 * beat)  # 5..25%
+            hue = (int(t * 30) + int(255 * i / STRIPS_TOTAL)) % 256
+            colors.append(scale_to_intensity(_hue_to_rgb(hue), intensity))
+        return colors
+
+    def _level_dance_colors(self, level: float) -> list[Tuple[int, int, int]]:
+        """Regenbogen-Welle, deren Helligkeit mit dem aktuellen RMS-Pegel
+        skaliert. Bei lauter Musik volle Brightness, bei leiser Passage
+        gedimmt.
+
+        sqrt(level) hebt leise Stellen visuell an — sonst wären typische
+        Pop-Songs bei -20 dBFS (Level 0.6) optisch fast wie bei Stille.
+        Floor von 0.10 verhindert komplettes Verschwinden bei sehr leisen
+        Passagen, solange überhaupt ein Signal kommt.
+        """
+        t = time.monotonic()
+        visual_level = max(0.10, level ** 0.5)
+        colors: list[Tuple[int, int, int]] = []
+        bpm_phase = 2 * math.pi * (PSEUDO_DANCE_BPM / 60.0) * t
+        for i in range(STRIPS_TOTAL):
+            led_phase = i / STRIPS_TOTAL * 2 * math.pi
+            beat = 0.5 * (1 + math.sin(bpm_phase + led_phase * 2))
+            intensity = MAX_BRIGHTNESS * (0.30 + 0.70 * beat) * visual_level
             hue = (int(t * 30) + int(255 * i / STRIPS_TOTAL)) % 256
             colors.append(scale_to_intensity(_hue_to_rgb(hue), intensity))
         return colors

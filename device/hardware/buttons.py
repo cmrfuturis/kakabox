@@ -7,7 +7,8 @@ Verdrahtung (KY-Module + GND, Pi 5):
                              STOP bei Halten ≥ 1s; WLAN-Reset bei Halten ≥ 5s)
   - GPIO22  = Encoder-Push (kurz: Speed-Mode-Burst 4× in 3s; Hold ≥ 1s: Random-Modus)
   - GPIO5   = Blau         (Voice-Push-to-Talk — single-press)
-  - GPIO24  = Gelb         (Pause/Play-Toggle — single-press)
+  - GPIO24  = Gelb         (kurz: Pause/Play-Toggle; Hold ≥ 3s: LED-Streifen
+                             toggeln, Musik pausiert während Hold)
 
 Alle Buttons sind gegen GND verdrahtet, interner Pull-up — gedrückt = LOW.
 
@@ -44,6 +45,7 @@ DEBOUNCE_S = 0.05
 STOP_HOLD_SECONDS = 1.0   # grün/rot ≥ 1s = STOP (Playlist + Memory weg)
 HOLD_SECONDS = 5.0        # grün ≥ 5s = Power-Off; rot ≥ 5s = WLAN-Reset
 PUSH_HOLD_SECONDS = 1.0   # Encoder-Push ≥ 1s = Random-Modus an/neu starten
+YELLOW_HOLD_SECONDS = 3.0 # Gelb ≥ 3s = LED-Streifen toggeln + Musik pause während Hold
 
 
 class Buttons:
@@ -62,6 +64,7 @@ class Buttons:
         )
         self.yellow = GpioButton(
             YELLOW_PIN, pull_up=True, bounce_time=DEBOUNCE_S,
+            hold_time=YELLOW_HOLD_SECONDS,
         )
         self.blue = GpioButton(
             BLUE_PIN, pull_up=True, bounce_time=DEBOUNCE_S,
@@ -98,17 +101,26 @@ class Buttons:
         self.push.when_held = self._on_push_internal_held
         self.push.when_released = self._on_push_internal_released
 
-        # Gelb + Blau: single-press, kein Hold.
+        # Gelb: dreiphasig (press/held/released). Beim Press feuert ein Hook,
+        # damit main.py sofort pausieren kann (User-Wunsch: pause-während-Hold).
+        # Bei Release entscheidet ``_yellow_was_held`` welcher Callback feuert.
         self._yellow_press_cb: Optional[Callable[[], None]] = None
+        self._yellow_held_cb: Optional[Callable[[], None]] = None
+        self._yellow_down_cb: Optional[Callable[[], None]] = None
+        self._yellow_was_held: bool = False
+        self.yellow.when_pressed = self._on_yellow_internal_down
+        self.yellow.when_held = self._on_yellow_internal_held
+        self.yellow.when_released = self._on_yellow_internal_released
+
+        # Blau: single-press, kein Hold.
         self._blue_press_cb: Optional[Callable[[], None]] = None
-        self.yellow.when_pressed = self._on_yellow_internal_pressed
         self.blue.when_pressed = self._on_blue_internal_pressed
 
         logger.info(
             "Buttons ready: green=GPIO%d red=GPIO%d push=GPIO%d yellow=GPIO%d blue=GPIO%d "
-            "(stop ≥ %.0fs, long ≥ %.0fs, push-hold ≥ %.0fs)",
+            "(stop ≥ %.0fs, long ≥ %.0fs, push-hold ≥ %.0fs, yellow-hold ≥ %.0fs)",
             GREEN_PIN, RED_PIN, ENCODER_PUSH_PIN, YELLOW_PIN, BLUE_PIN,
-            STOP_HOLD_SECONDS, HOLD_SECONDS, PUSH_HOLD_SECONDS,
+            STOP_HOLD_SECONDS, HOLD_SECONDS, PUSH_HOLD_SECONDS, YELLOW_HOLD_SECONDS,
         )
 
     def on_green(self, callback: Callable[[], None]) -> None:
@@ -144,8 +156,17 @@ class Buttons:
         self._push_held_cb = callback
 
     def on_yellow(self, callback: Callable[[], None]) -> None:
-        """Gelb — Pause/Play-Toggle."""
+        """Gelb — kurzer Druck (< YELLOW_HOLD_SECONDS), bei Release gefeuert."""
         self._yellow_press_cb = callback
+
+    def on_yellow_held(self, callback: Callable[[], None]) -> None:
+        """Gelb — Hold ≥ YELLOW_HOLD_SECONDS, bei Release nach Hold gefeuert."""
+        self._yellow_held_cb = callback
+
+    def on_yellow_down(self, callback: Callable[[], None]) -> None:
+        """Gelb — feuert SOFORT beim Drücken (vor jedem Hold/Release).
+        Nützlich für "pause-while-pressed"-Logik in main.py."""
+        self._yellow_down_cb = callback
 
     def on_blue(self, callback: Callable[[], None]) -> None:
         """Blau — Voice-Push-to-Talk (Aufnahme)."""
@@ -256,12 +277,30 @@ class Buttons:
             except Exception as e:
                 logger.exception("on_push callback failed: %s", e)
 
-    def _on_yellow_internal_pressed(self) -> None:
-        if self._yellow_press_cb:
+    def _on_yellow_internal_down(self) -> None:
+        """Sofort bei Press — vor any Hold-Decision. Snapshot-Hook für main.py."""
+        if self._yellow_down_cb:
             try:
-                self._yellow_press_cb()
+                self._yellow_down_cb()
             except Exception as e:
-                logger.exception("on_yellow callback failed: %s", e)
+                logger.exception("on_yellow_down callback failed: %s", e)
+
+    def _on_yellow_internal_held(self) -> None:
+        """Hold-Schwelle (YELLOW_HOLD_SECONDS) erreicht — markieren."""
+        self._yellow_was_held = True
+
+    def _on_yellow_internal_released(self) -> None:
+        was_held = self._yellow_was_held
+        self._yellow_was_held = False
+        cb = self._yellow_held_cb if was_held else self._yellow_press_cb
+        if cb:
+            try:
+                cb()
+            except Exception as e:
+                logger.exception(
+                    "on_yellow %s callback failed: %s",
+                    "held" if was_held else "press", e,
+                )
 
     def _on_blue_internal_pressed(self) -> None:
         if self._blue_press_cb:
