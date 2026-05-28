@@ -648,18 +648,39 @@ class Kakabox:
     def _write_voice_catalog(self, files: list[dict]) -> None:
         """Schreibt eine kompakte Liste (content_id, title, aliases) für Voice-Match.
 
+        Dedup: Backend hat manche Songs doppelt (gleicher Hash, andere
+        content_id) — für den Sprachbefehl ist nur ein Eintrag pro Hash
+        sinnvoll, sonst matched "spiele Hexentanz" zufällig eine der beiden
+        IDs. Wir behalten den ersten und mergen die Aliase aller Dubletten.
+        Fallback (Backend liefert keinen Hash): dedup per (Titel, lower).
+
         Best-effort: bei IO-Fehlern (read-only FS, Disk voll) wird nur gewarnt —
         Voice-Match fällt dann auf den letzten gültigen Stand zurück.
         """
-        songs = []
+        songs: list[dict] = []
+        seen_keys: dict[str, int] = {}  # dedup-key → index in songs
         for entry in files:
             cid = entry.get("content_id")
             if not cid:
                 continue
+            title = entry.get("title") or ""
+            aliases = list(entry.get("aliases") or [])
+            key = entry.get("file_hash") or title.strip().lower()
+            if not key:
+                continue
+            if key in seen_keys:
+                # Aliase der Dublette in den bestehenden Eintrag mergen,
+                # damit kein Aufrufname verloren geht.
+                existing = songs[seen_keys[key]]
+                for a in aliases:
+                    if a and a not in existing["aliases"]:
+                        existing["aliases"].append(a)
+                continue
+            seen_keys[key] = len(songs)
             songs.append({
                 "content_id": int(cid),
-                "title": entry.get("title") or "",
-                "aliases": list(entry.get("aliases") or []),
+                "title": title,
+                "aliases": aliases,
             })
         payload = {
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
