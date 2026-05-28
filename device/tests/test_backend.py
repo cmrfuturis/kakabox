@@ -139,3 +139,52 @@ def test_report_storage_posts_mb_values(backend):
     assert backend.report_storage(total_mb=64000, free_mb=12000) is True
     body = json.loads(responses.calls[0].request.body)
     assert body == {"total_mb": 64000, "free_mb": 12000}
+
+
+@responses.activate
+def test_play_session_posts_payload(backend):
+    responses.post(
+        "https://test/api/box/play-session",
+        json={"status": "ok", "id": 42},
+        status=200,
+    )
+    payload = {
+        "client_uuid": "00000000-0000-0000-0000-000000000001",
+        "content_id": 7,
+        "kaka_id": 3,
+        "source": "kaka",
+        "started_at": "2026-05-28T10:00:00Z",
+        "ended_at":   "2026-05-28T10:02:00Z",
+        "duration_seconds": 120,
+        "end_reason": "completed",
+    }
+    assert backend.play_session(payload) is True
+    body = json.loads(responses.calls[0].request.body)
+    assert body["content_id"] == 7
+    assert body["source"] == "kaka"
+
+
+@responses.activate
+def test_play_session_4xx_returns_false_without_clearing_token(backend, identity_path):
+    responses.post(
+        "https://test/api/box/play-session",
+        json={"error": "validation_failed"},
+        status=422,
+    )
+    assert backend.play_session({"source": "kaka"}) is False
+    # Token darf NICHT entfernt werden, sonst tilgt eine kaputte Box ihren
+    # Login wegen einer Validation-Failure.
+    saved = json.loads(identity_path.read_text())
+    assert saved["api_token"] == "test-plain-token"
+
+
+@responses.activate
+def test_play_session_401_clears_local_token(backend, identity_path):
+    responses.post(
+        "https://test/api/box/play-session",
+        json={"error": "unauthorized"},
+        status=401,
+    )
+    assert backend.play_session({"source": "kaka"}) is False
+    saved = json.loads(identity_path.read_text())
+    assert saved["api_token"] is None

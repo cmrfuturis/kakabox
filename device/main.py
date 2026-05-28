@@ -52,6 +52,7 @@ from hardware.leds import Leds, LedsUnavailable
 from hardware.nfc import PN532
 from hardware.rotary_encoder import Encoder as RotaryEncoder
 from network import Backend, BackendError
+from network.play_sessions import PlaySessionReporter
 from voice.asr import VoiceUnavailable, build_recognizer
 from voice.catalog import build_catalog_from_file
 from voice.intent import Candidate, has_magic_word, parse_play_command
@@ -69,6 +70,7 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 IDENTITY_PATH = Path(__file__).parent / "box_identity.json"
 TAG_CACHE_PATH = Path(__file__).parent / "tag_cache.json"
 VOICE_CATALOG_PATH = Path(__file__).parent / "voice_catalog.json"
+PLAY_SESSION_QUEUE_PATH = Path(__file__).parent / "play_sessions_queue.json"
 PROMPTS_DIR = Path("/usr/share/kakabox/prompts")  # vom Installer befüllt
 APLAY_PROMPT_PID = Path("/run/kakabox/prompt_pid")  # vom Comitup-Callback geschrieben
 VOLUME_STEP = 5            # Encoder-Klick = 5 Prozentpunkte
@@ -140,6 +142,25 @@ def read_wifi_ssid() -> str | None:
         return None
     ssid = out.stdout.strip()
     return ssid or None
+
+
+def read_cpu_load_percent() -> int | None:
+    """Aktuelle CPU-Auslastung (1-Min-Schnitt) als gerundeter Prozentwert.
+
+    Quelle: /proc/loadavg, erstes Feld = Anzahl runnable/blocked Prozesse
+    über die letzte Minute. Wir teilen durch die Anzahl der CPU-Cores und
+    cappen bei 100 — load > #cores ist Overload, in der UI aber als 100%
+    repräsentiert (Unterschiede darüber sind für die Eltern-Sicht irrelevant).
+    Bei Lese-/Parse-Fehlern → None, Heartbeat sendet das Feld dann gar nicht.
+    """
+    try:
+        loadavg_text = Path("/proc/loadavg").read_text()
+        load_1m = float(loadavg_text.split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    cores = os.cpu_count() or 1
+    percent = round(load_1m / cores * 100.0)
+    return max(0, min(100, percent))
 
 
 logging.basicConfig(
@@ -335,6 +356,17 @@ class Kakabox:
         # Track-Ende-Callback an Player binden
         self.player.on_track_end(self._on_track_end)
 
+        # PlaySession-Reporter: meldet abgeschlossene Wiedergaben ans Backend.
+        # send_fn ist defensiv — wenn backend zur Laufzeit weggeht (Token weg,
+        # Netz offline), gibt Backend.play_session() False zurück und der
+        # Reporter retryt später.
+        def _send_session(payload: dict) -> bool:
+            return bool(self.backend) and self.backend.play_session(payload)
+        self.play_session_reporter = PlaySessionReporter(
+            send_fn=_send_session,
+            queue_path=PLAY_SESSION_QUEUE_PATH,
+        )
+
         # Hardware-Inputs verdrahten
         self._wire_buttons()
         self._wire_encoder()
@@ -476,8 +508,38 @@ class Kakabox:
     # Run
     # ------------------------------------------------------------------
 
+    def _playback_session_callbacks(
+        self,
+        source: str,
+        kaka_id: Optional[int],
+        used_zauberwort: Optional[bool] = None,
+    ):
+        """Liefert (on_start, on_end) für eine Playlist, die alle Track-Wechsel
+        an den PlaySessionReporter durchreicht. Closures merken sich source
+        und kaka_id — pro Playlist konstant, daher hier gebunden.
+        """
+        reporter = self.play_session_reporter
+
+        def on_start(content) -> None:
+            reporter.start(
+                content_id=content.content_id,
+                kaka_id=kaka_id,
+                source=source,
+                used_zauberwort=used_zauberwort,
+            )
+
+        def on_end(content, end_reason: str, position: float) -> None:
+            reporter.end(end_reason=end_reason, position_seconds=position)
+
+        return on_start, on_end
+
     def run(self) -> None:
         self._running = True
+
+        # Reporter-Worker startet immer — auch ohne Backend-Verbindung. Die
+        # Queue persistiert auf Disk und wird verarbeitet, sobald sich die
+        # Box wieder verbindet.
+        self.play_session_reporter.start_worker()
 
         threading.Thread(target=self._nfc_loop, daemon=True, name="nfc").start()
         if self.backend and self.backend.is_connected:
@@ -541,11 +603,19 @@ class Kakabox:
     def _send_heartbeat(self) -> None:
         if not self.backend:
             return
+        payload: dict = {
+            "volume": self._volume,
+            "wifi_ssid": read_wifi_ssid(),
+        }
+        cpu_load = read_cpu_load_percent()
+        if cpu_load is not None:
+            # 1-Min-Schnitt aus /proc/loadavg. Wird auf einer Box auf der
+            # Webapp als "Auslastung" angezeigt (kein Watt-Wert, das hat der
+            # Pi nicht). 30-Sekunden-Heartbeat (HEARTBEAT_INTERVAL) → Wert
+            # wandert recht zügig.
+            payload["cpu_load_percent"] = cpu_load
         try:
-            self.backend.heartbeat({
-                "volume": self._volume,
-                "wifi_ssid": read_wifi_ssid(),
-            })
+            self.backend.heartbeat(payload)
         except Exception as e:
             logger.warning("heartbeat failed: %s", e)
 
@@ -956,6 +1026,11 @@ class Kakabox:
         # Nach dem Lesen ist der Memory verbraucht (egal ob er gepasst hat)
         self._last_kaka_memory = None
 
+        kaka_id = kaka.get("id")
+        on_start, on_end = self._playback_session_callbacks(
+            source="kaka", kaka_id=kaka_id,
+        )
+
         with self._playlist_lock:
             if self._current_playlist:
                 self._current_playlist.stop()
@@ -968,6 +1043,8 @@ class Kakabox:
                 stop_fn=self.player.stop,
                 position_fn=self.player.current_position_seconds,
                 seek_fn=self.player.seek_to,
+                on_track_start=on_start,
+                on_track_end=on_end,
             )
             self._current_playlist = playlist
             self._active_tag_uid = uid
@@ -1039,6 +1116,10 @@ class Kakabox:
         random.shuffle(contents)
         logger.info("🎲 Random-Modus startet mit %d Tracks", len(contents))
 
+        on_start, on_end = self._playback_session_callbacks(
+            source="manual", kaka_id=None,
+        )
+
         with self._playlist_lock:
             if self._current_playlist:
                 self._current_playlist.stop()
@@ -1051,6 +1132,8 @@ class Kakabox:
                 stop_fn=self.player.stop,
                 position_fn=self.player.current_position_seconds,
                 seek_fn=self.player.seek_to,
+                on_track_start=on_start,
+                on_track_end=on_end,
             )
             self._current_playlist = playlist
             self._active_tag_uid = None  # kein Tag aktiv
@@ -1133,7 +1216,10 @@ class Kakabox:
                     "Chip %s entfernt — gemerkt: Track %d ab %.1fs.",
                     removed_uid, snapshot.track_index + 1, snapshot.position_seconds,
                 )
-            playlist.stop()
+            # Reason "kaka_removed" landet in der Wiedergabe-Historie —
+            # so erkennt man "Kind hat den Chip nur kurz aufgelegt" vs.
+            # "Track ist normal durchgelaufen".
+            playlist.stop(reason="kaka_removed")
 
         try:
             self.player.stop()
@@ -1875,6 +1961,13 @@ class Kakabox:
             logger.warning("Voice: keine spielbaren Tracks für '%s'", target.name)
             return
 
+        used_zauberwort = bool(self.config.get("zauberwort_mode_enabled"))
+        on_start, on_end = self._playback_session_callbacks(
+            source="voice",
+            kaka_id=None,
+            used_zauberwort=used_zauberwort,
+        )
+
         with self._playlist_lock:
             playlist = Playlist(
                 contents=contents,
@@ -1884,6 +1977,8 @@ class Kakabox:
                 stop_fn=self.player.stop,
                 position_fn=self.player.current_position_seconds,
                 seek_fn=self.player.seek_to,
+                on_track_start=on_start,
+                on_track_end=on_end,
             )
             self._current_playlist = playlist
             self._voice_mode = True
@@ -1960,6 +2055,14 @@ class Kakabox:
             if self._current_playlist:
                 self._current_playlist.stop()
         self.player.stop()
+        # Reporter-Worker bekommt noch eine kurze Chance, die Queue zu
+        # flushen, bevor das Process-Exit den Daemon-Thread killt. Disk-
+        # Persistenz ist die Backup-Garantie, aber wir sparen damit eine
+        # Iteration nach dem nächsten Boot.
+        try:
+            self.play_session_reporter.stop_worker(timeout=2.0)
+        except Exception as e:
+            logger.warning("PlaySessionReporter Stop fehlgeschlagen: %s", e)
         self.nfc.close()
         if self.buttons is not None:
             self.buttons.close()

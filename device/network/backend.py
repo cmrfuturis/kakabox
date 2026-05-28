@@ -302,6 +302,41 @@ class Backend:
         return resp.ok
 
     # ------------------------------------------------------------------
+    # Play-Sessions (Wiedergabe-Historie für die Webapp)
+    # ------------------------------------------------------------------
+
+    def play_session(self, payload: dict[str, Any]) -> bool:
+        """Meldet eine abgeschlossene Wiedergabe-Session ans Backend.
+
+        Erwartete Felder: client_uuid (für Idempotenz bei Retries),
+        content_id, kaka_id (nullable), source, started_at, ended_at,
+        duration_seconds, end_reason, optional used_zauberwort + metadata.
+        """
+        if not self.is_connected:
+            return False
+        try:
+            resp = self._session.post(
+                f"{self._base_url}/api/box/play-session",
+                json=payload,
+                headers=self._auth_headers(),
+                timeout=self._timeout,
+            )
+        except requests.RequestException as e:
+            logger.warning("play_session transport error: %s", e)
+            return False
+        if resp.status_code == 401:
+            self._clear_token("token invalid (play_session)")
+            return False
+        if not resp.ok:
+            # 4xx (validation/foreign household) loggen wir auf WARN — der
+            # Reporter darf nicht ewig retryen, wenn das Backend den Eintrag
+            # ablehnt. 5xx wird vom Reporter selbst erneut versucht.
+            level = logging.WARNING if resp.status_code < 500 else logging.INFO
+            logger.log(level, "play_session: HTTP %s — %s", resp.status_code, resp.text[:200])
+            return False
+        return True
+
+    # ------------------------------------------------------------------
     # Commands (Pull-Modell)
     # ------------------------------------------------------------------
 

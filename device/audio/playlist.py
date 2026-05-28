@@ -67,6 +67,8 @@ class Playlist:
         stop_fn: Callable[[], None],
         position_fn: Optional[Callable[[], float]] = None,
         seek_fn: Optional[Callable[[float], None]] = None,
+        on_track_start: Optional[Callable[["KakaContent"], None]] = None,
+        on_track_end: Optional[Callable[["KakaContent", str, float], None]] = None,
     ) -> None:
         # Sortiere nach sort_order, damit die Reihenfolge stabil ist.
         self._contents = sorted(contents, key=lambda c: c.sort_order)
@@ -76,6 +78,12 @@ class Playlist:
         self._stop_fn = stop_fn
         self._position_fn = position_fn  # liefert aktuelle Sekunde im Track
         self._seek_fn = seek_fn          # springt im aktuellen Track
+        # Lifecycle-Callbacks — werden von der Box für die Wiedergabe-Historie
+        # genutzt. Beide optional; bei None ist die Playlist still.
+        # on_track_end-Signatur: (content, end_reason, position_seconds)
+        # end_reason ∈ {"completed", "skipped_next", "skipped_back", "stopped"}.
+        self._on_track_start = on_track_start
+        self._on_track_end = on_track_end
 
         self._index = -1
         self._stopped = threading.Event()
@@ -145,6 +153,11 @@ class Playlist:
         if self._stopped.is_set():
             return
 
+        # Aktuelle Session sauber als "completed" abschließen, bevor wir den
+        # nächsten Track starten — der Reporter braucht das, sonst stapeln
+        # sich offene Sessions.
+        self._emit_track_end("completed")
+
         next_index = self._index + 1
         if next_index >= len(self._contents):
             logger.info("Playlist beendet.")
@@ -158,6 +171,7 @@ class Playlist:
         """Nächster Track. Am Ende → Wraparound zum ersten."""
         if self._stopped.is_set() or self.is_empty:
             return
+        self._emit_track_end("skipped_next")
         target = (self._index + 1) % len(self._contents)
         self._jump_to(target)
 
@@ -178,8 +192,15 @@ class Playlist:
 
         if pos >= TRACK_RESTART_THRESHOLD_S:
             logger.info("Track läuft seit %.1fs — Neustart.", pos)
+            # Restart auf 0:00 zählt als "skipped_back" für die Wiedergabe-
+            # Historie: aus User-Sicht ein Reset des aktuellen Titels.
+            self._emit_track_end("skipped_back")
             if self._seek_fn:
                 self._seek_fn(0.0)
+                # Seek startet den Track neu — wir markieren das als neuen
+                # Session-Start, damit die Webapp zwei Einträge zeigt.
+                cur = self._contents[self._index]
+                self._emit_track_start(cur)
             else:
                 # Fallback: Track neu starten via _play
                 cur = self._contents[self._index]
@@ -188,10 +209,18 @@ class Playlist:
                     self._play(cur, path)
             return
 
+        self._emit_track_end("skipped_back")
         target = (self._index - 1) % len(self._contents)
         self._jump_to(target)
 
-    def stop(self) -> None:
+    def stop(self, reason: str = "stopped") -> None:
+        # Wenn die Playlist während laufender Wiedergabe abgebrochen wird,
+        # melden wir der Box ein End-Event — sonst geht die Session in der
+        # Webapp-Historie verloren. Caller können den Grund konkretisieren
+        # (z. B. "kaka_removed" beim Abnehmen der Figur), Default ist der
+        # generische "stopped"-Fall (Box wird heruntergefahren, neuer
+        # Wiedergabe-Modus übernimmt etc.).
+        self._emit_track_end(reason)
         self._stopped.set()
         self._stop_fn()
 
@@ -221,6 +250,45 @@ class Playlist:
             f" (ab {start_seconds:.1f}s)" if start_seconds > 0 else "",
         )
         self._play_fn(path, content.title, start_seconds)
+        self._emit_track_start(content)
+
+    # ------------------------------------------------------------------
+    # Lifecycle-Callbacks (no-op wenn keine registriert)
+    # ------------------------------------------------------------------
+
+    def _current_position(self) -> float:
+        if not self._position_fn:
+            return 0.0
+        try:
+            return float(self._position_fn() or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _current_content(self) -> Optional[KakaContent]:
+        if 0 <= self._index < len(self._contents):
+            return self._contents[self._index]
+        return None
+
+    def _emit_track_start(self, content: KakaContent) -> None:
+        if self._on_track_start is None:
+            return
+        try:
+            self._on_track_start(content)
+        except Exception as e:
+            # Callback-Fehler dürfen die Wiedergabe nicht abreißen.
+            logger.warning("on_track_start callback warf %s — ignoriert.", e)
+
+    def _emit_track_end(self, end_reason: str) -> None:
+        if self._on_track_end is None:
+            return
+        content = self._current_content()
+        if content is None:
+            return
+        pos = self._current_position()
+        try:
+            self._on_track_end(content, end_reason, pos)
+        except Exception as e:
+            logger.warning("on_track_end callback warf %s — ignoriert.", e)
 
     def _ensure_local(self, content: KakaContent, blocking: bool = True) -> Path | None:
         """Stellt sicher, dass der Content lokal vorliegt. Lädt notfalls runter."""

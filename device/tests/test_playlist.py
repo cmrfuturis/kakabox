@@ -43,7 +43,9 @@ class FakePlayer:
         self.played: list[Path] = []
         self.stop_called = False
 
-    def play(self, path: Path, title: str):
+    # Playlist ruft play_fn(path, title, start_seconds) auf — start_seconds
+    # ist neu (Resume-Feature), in Tests aber egal solange die Signatur passt.
+    def play(self, path: Path, title: str, start_seconds: float = 0.0):
         self.played.append(Path(path))
 
     def stop(self):
@@ -180,3 +182,116 @@ def test_sort_order_respected(cache):
     )
     pl.start()
     assert player.played[0] == cache.path_for(1)
+
+
+# ----------------------------------------------------------------------
+# Wiedergabe-Historie: on_track_start / on_track_end Callbacks
+# ----------------------------------------------------------------------
+
+class CallbackRecorder:
+    def __init__(self):
+        self.events: list[tuple] = []
+
+    def on_start(self, content):
+        self.events.append(("start", content.content_id))
+
+    def on_end(self, content, reason: str, position: float):
+        self.events.append(("end", content.content_id, reason))
+
+
+def test_callbacks_fire_on_start_and_completion(cache):
+    backend = FakeBackend()
+    backend.set_content(1, b"a")
+    backend.set_content(2, b"b")
+    player = FakePlayer()
+    rec = CallbackRecorder()
+
+    pl = Playlist(
+        contents=[_make_content(1, b"a", sort=1), _make_content(2, b"b", sort=2)],
+        cache=cache,
+        download_fn=backend.download,
+        play_fn=player.play,
+        stop_fn=player.stop,
+        on_track_start=rec.on_start,
+        on_track_end=rec.on_end,
+    )
+    pl.start()
+    threading.Event().wait(0.05)  # prefetch durch
+    pl.on_track_end()  # Track 1 natürlich zu Ende → Track 2 startet
+
+    # Erwartet: start(1), end(1, completed), start(2)
+    assert rec.events[0] == ("start", 1)
+    assert rec.events[1] == ("end", 1, "completed")
+    assert rec.events[2] == ("start", 2)
+
+
+def test_next_emits_skipped_next_then_new_start(cache):
+    backend = FakeBackend()
+    backend.set_content(1, b"a")
+    backend.set_content(2, b"b")
+    player = FakePlayer()
+    rec = CallbackRecorder()
+
+    pl = Playlist(
+        contents=[_make_content(1, b"a", sort=1), _make_content(2, b"b", sort=2)],
+        cache=cache,
+        download_fn=backend.download,
+        play_fn=player.play,
+        stop_fn=player.stop,
+        on_track_start=rec.on_start,
+        on_track_end=rec.on_end,
+    )
+    pl.start()
+    threading.Event().wait(0.05)
+    pl.next()
+
+    assert ("end", 1, "skipped_next") in rec.events
+    # Letzter Event muss ein start(2) sein — Reihenfolge:
+    # start(1), end(1, skipped_next), start(2)
+    assert rec.events[-1] == ("start", 2)
+
+
+def test_stop_emits_end_event_with_reason(cache):
+    backend = FakeBackend()
+    backend.set_content(1, b"a")
+    player = FakePlayer()
+    rec = CallbackRecorder()
+
+    pl = Playlist(
+        contents=[_make_content(1, b"a", sort=1)],
+        cache=cache,
+        download_fn=backend.download,
+        play_fn=player.play,
+        stop_fn=player.stop,
+        on_track_start=rec.on_start,
+        on_track_end=rec.on_end,
+    )
+    pl.start()
+    pl.stop(reason="kaka_removed")
+
+    assert ("end", 1, "kaka_removed") in rec.events
+
+
+def test_callbacks_silent_failure_does_not_break_playlist(cache):
+    """Wenn ein Callback eine Exception wirft, soll die Playlist weiterlaufen."""
+    backend = FakeBackend()
+    backend.set_content(1, b"a")
+    player = FakePlayer()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("callback boom")
+
+    pl = Playlist(
+        contents=[_make_content(1, b"a", sort=1)],
+        cache=cache,
+        download_fn=backend.download,
+        play_fn=player.play,
+        stop_fn=player.stop,
+        on_track_start=boom,
+        on_track_end=boom,
+    )
+    assert pl.start() is True
+    assert player.played[0] == cache.path_for(1)
+    # stop() darf auch nicht ausbrechen
+    pl.stop()
+    assert player.stop_called is True
