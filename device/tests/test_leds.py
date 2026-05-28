@@ -260,3 +260,22 @@ def test_nfc_present_color_is_green():
     """Sanity-Check: die NFC-Status-Basis-Farbe muss grün sein (G dominant)."""
     r, g, b = NFC_PRESENT_COLOR_BASE
     assert g > r and g > b, f"NFC-Status muss grün sein: {NFC_PRESENT_COLOR_BASE}"
+
+
+# ---- sync_comet_frame (Orange-Sync-Animation) --------------------------------
+
+def test_sync_comet_frame_head_and_tail():
+    from hardware.leds import sync_comet_frame, SYNC_RING_COLOR_BASE, SYNC_RING_TAIL_FACTOR, RING_SIZE, BLACK
+    frame = sync_comet_frame(0)
+    assert len(frame) == RING_SIZE
+    assert frame[0] == tuple(SYNC_RING_COLOR_BASE)                 # Kopf voll
+    tail = tuple(int(c * SYNC_RING_TAIL_FACTOR) for c in SYNC_RING_COLOR_BASE)
+    assert frame[RING_SIZE - 1] == tail                            # Schweif hinter dem Kopf (wrap)
+    assert all(frame[i] == BLACK for i in range(1, RING_SIZE - 1)) # Rest aus
+
+
+def test_sync_comet_frame_rotates_and_wraps():
+    from hardware.leds import sync_comet_frame, SYNC_RING_COLOR_BASE, RING_SIZE
+    for head in range(RING_SIZE * 2):  # über den Wrap hinaus
+        frame = sync_comet_frame(head)
+        assert frame[head % RING_SIZE] == tuple(SYNC_RING_COLOR_BASE)

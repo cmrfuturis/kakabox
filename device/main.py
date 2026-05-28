@@ -103,6 +103,11 @@ VOICE_INITIAL_SILENCE_SECONDS = 3.0  # nichts gesagt nach 3s → Abbruch
 # Initial-Silence bleiben gleich (7s hart / mind. 3s lauschen).
 VOICE_ZAUBERWORT_SILENCE_SECONDS = 0.4
 
+# Mindestdauer der Orange-Sync-Optik bei erkannter Dongel-Änderung — auch wenn
+# der Sync sofort fertig ist (nichts zu laden), bleibt das Feedback so lange
+# sichtbar, damit der User es wahrnimmt. Danach der Bestätigungssound.
+SYNC_FEEDBACK_MIN_S = 2.0
+
 
 def _kill_aplay_prompt() -> bool:
     """Bricht einen WLAN-Status-Prompt ab, der per ``aplay`` aus dem Comitup-
@@ -1189,14 +1194,65 @@ class Kakabox:
                 self.leds.strips_show_position(
                     playlist.current_index, playlist.length,
                 )
-            self._trigger_background_sync("content-changed")
+            # Dongel-Änderung erkannt → Sync MIT Orange-Feedback + Bestätigungs-
+            # sound (eigener Thread, blockiert den Tag-Refresh nicht).
+            threading.Thread(
+                target=self._run_sync_with_feedback, args=(uid, kaka),
+                daemon=True, name="sync-feedback",
+            ).start()
 
-    def _start_kaka_playlist(self, uid: str, kaka: dict) -> None:
+    def _run_sync_with_feedback(self, uid: str, kaka: dict) -> None:
+        """Sync für eine erkannte Dongel-Änderung MIT Feedback: Status-LED orange
+        pulsieren + Ring-Komet (mind. SYNC_FEEDBACK_MIN_S, auch wenn nichts zu
+        laden ist), danach der Voice-Success-Sound als Bestätigung, dass der Sync
+        geklappt hat. Läuft im Hintergrund — Wiedergabe/Bedienung bleiben möglich.
+        """
+        if self.leds is not None:
+            self.leds.sync_start()
+        t0 = time.monotonic()
+        try:
+            self._sync_audio_manifest()
+        finally:
+            remaining = SYNC_FEEDBACK_MIN_S - (time.monotonic() - t0)
+            if remaining > 0:
+                time.sleep(remaining)
+            if self.leds is not None:
+                self.leds.sync_stop()
+                self._restore_idle_led()
+        self._play_sync_confirmation(uid, kaka)
+
+    def _play_sync_confirmation(self, uid: str, kaka: dict) -> None:
+        """Bestätigungssound (derselbe wie bei einem Voice-Treffer). Läuft gerade
+        ein Lied, wird die Position gemerkt, der Sound kurz darübergespielt und
+        das Lied an der Stelle fortgesetzt (KEIN erneuter Sync → keine Schleife).
+        """
+        with self._playlist_lock:
+            resume = self._active_tag_uid == uid and self._current_playlist is not None
+            idx = self._current_playlist.current_index if resume else 0
+        pos = 0.0
+        if resume:
+            try:
+                pos = float(self.player.current_position_seconds() or 0.0)
+            except Exception:
+                pos = 0.0
+
+        self._play_prompt("voice_success.wav")
+        self.player.wait_until_idle(timeout=2.0)
+
+        if resume:
+            self._last_kaka_memory = KakaMemory(
+                tag_uid=uid, track_index=idx, position_seconds=pos,
+            )
+            self._start_kaka_playlist(uid, kaka, trigger_sync=False)
+
+    def _start_kaka_playlist(self, uid: str, kaka: dict, trigger_sync: bool = True) -> None:
         # Nur tatsächlich auslieferbare Lieder (veröffentlicht + Audiodatei) in
         # die Playlist nehmen. 'playable' kommt vom Backend (formatKaka); fehlt
         # das Feld (älteres Backend), gilt der Track als spielbar (Kompat).
         # So zählt der LED-Track-Balken nie ein Lied mit, das nie geladen
         # werden kann ("3/3 angezeigt, aber 3. Lied unerreichbar").
+        # trigger_sync=False: Resume-Aufrufe (z.B. nach dem Sync-Bestätigungssound)
+        # dürfen KEINEN neuen Sync auslösen — sonst Feedback→Sync→Feedback-Schleife.
         contents_data = [
             c for c in kaka.get("contents", []) if c.get("playable", True)
         ]
@@ -1262,7 +1318,8 @@ class Kakabox:
         # M1: Beim Auflegen sofort einen Sync anstoßen — so werden neu
         # verknüpfte Lieder gleich geladen (statt erst beim nächsten 5-Min-
         # Zyklus), und _jump_to lädt notfalls beim Erreichen blockierend nach.
-        self._trigger_background_sync("tag-placed")
+        if trigger_sync:
+            self._trigger_background_sync("tag-placed")
 
     # ------------------------------------------------------------------
     # Random-Mode (Encoder-Push ≥ 1s)

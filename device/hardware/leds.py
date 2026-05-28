@@ -93,6 +93,14 @@ NFC_PRESENT_PULSE_MAX_INTENSITY = 0.15
 NFC_PULSE_HZ = 1.0    # eine Schwingung pro Sekunde
 NFC_PULSE_FPS = 20    # 50 ms zwischen Updates — flüssig
 
+# Sync-Animation (Backend-Abgleich läuft): Status-LED pulsiert orange, der Ring
+# zeigt einen orangenen rotierenden Kometen. Default-Visual während eines Syncs;
+# Volume-/Speed-Feedback hat kurzzeitig Vorrang (siehe _sync_ring_loop).
+NFC_SYNC_COLOR_BASE: Tuple[int, int, int] = (255, 95, 0)   # sattes Orange
+SYNC_RING_COLOR_BASE: Tuple[int, int, int] = (255, 95, 0)
+SYNC_RING_TAIL_FACTOR = 0.30   # Schweif-LED gedimmt
+SYNC_RING_FPS = 12             # Rotationsgeschwindigkeit des Kometen
+
 # Streifen (links + rechts, je 8 LEDs = 16 zusammenhängend) —
 # Wiedergabe-Visualisierung. Zwei Modi:
 #   - "dance": tanzt im Rhythmus (echtes Audio-Spectrum sobald verfügbar,
@@ -122,6 +130,28 @@ def volume_to_led_count(percent: float) -> int:
     if percent <= 0:
         return 0
     return min(RING_SIZE, math.ceil(percent / (100 / RING_SIZE)))
+
+
+def sync_comet_frame(
+    head_pos: int,
+    ring_size: int = RING_SIZE,
+    base_color: Tuple[int, int, int] = SYNC_RING_COLOR_BASE,
+    tail_factor: float = SYNC_RING_TAIL_FACTOR,
+) -> list:
+    """Ring-Farben für einen Kometen-Frame: Kopf voll, eine LED Schweif gedimmt,
+    Rest aus. Pure function (testbar). ``head_pos`` rotiert 0..ring_size-1."""
+    head_pos %= ring_size
+    tail = tuple(int(c * tail_factor) for c in base_color)
+    frame = []
+    for i in range(ring_size):
+        d = (head_pos - i) % ring_size
+        if d == 0:
+            frame.append(tuple(base_color))
+        elif d == 1:
+            frame.append(tail)
+        else:
+            frame.append(BLACK)
+    return frame
 
 
 def scale_to_intensity(
@@ -393,6 +423,12 @@ class Leds:
         self._strips_user_enabled = False
         # Sweep-Thread läuft 1s — muss serialisieren mit Strips-Render-Loop.
         self._sweep_thread: threading.Thread | None = None
+        # Sync-Animation: orangener Komet auf dem Ring (eigener Daemon-Thread)
+        # + orangenes Pulsieren der Status-LED. _ring_busy_until pausiert den
+        # Kometen kurz, solange Volume-Feedback den Ring beansprucht.
+        self._sync_ring_thread: threading.Thread | None = None
+        self._sync_ring_stop = threading.Event()
+        self._ring_busy_until: float = 0.0
 
     # ---- Roh-Zugriff -----------------------------------------------------
 
@@ -561,6 +597,9 @@ class Leds:
         """
         count = volume_to_led_count(percent)
         color = VOLUME_COLORS[count - 1] if count > 0 else BLACK
+        # Ring kurz für Volume reservieren — der Sync-Komet pausiert solange
+        # und übernimmt erst wieder, wenn das Volume-Feedback abgelaufen ist.
+        self._ring_busy_until = time.monotonic() + VOLUME_AUTO_OFF_S
         with self._lock:
             for i in range(RING_SIZE):
                 self._pixels[i] = color if i < count else BLACK
@@ -652,6 +691,62 @@ class Leds:
                     return
         except Exception:
             logger.exception("Speed-Pulse-Loop crashed")
+
+    # ---- Sync-Animation (Backend-Abgleich läuft) ------------------------
+
+    def sync_start(self) -> None:
+        """Startet die Sync-Optik: Status-LED orange pulsieren + Ring-Komet.
+
+        Idempotent. Volume/Speed behalten Vorrang am Ring — der Komet pausiert
+        dann kurz und kommt danach zurück (siehe _sync_ring_loop).
+        """
+        self._start_nfc_pulse(NFC_SYNC_COLOR_BASE)
+        with self._lock:
+            if self._sync_ring_thread is not None and self._sync_ring_thread.is_alive():
+                return
+            self._sync_ring_stop.clear()
+            self._sync_ring_thread = threading.Thread(
+                target=self._sync_ring_loop, daemon=True, name="led-sync-ring",
+            )
+            self._sync_ring_thread.start()
+
+    def sync_stop(self) -> None:
+        """Stoppt den Ring-Kometen und löscht den Ring. Die Status-LED setzt der
+        Aufrufer danach via _restore_idle_led auf den passenden Zustand."""
+        self._sync_ring_stop.set()
+        thread = self._sync_ring_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        self._sync_ring_thread = None
+        with self._lock:
+            for i in range(*ZONE_RING.indices(LED_COUNT)):
+                self._pixels[i] = BLACK
+            self._pixels.show()
+
+    def _sync_ring_loop(self) -> None:
+        """Loop (SYNC_RING_FPS): orangener Komet rotiert um den Ring. Solange
+        Volume (innerhalb _ring_busy_until) oder Speed-Mode den Ring beansprucht,
+        wird NICHT gezeichnet — so gewinnt User-Feedback, der Komet kommt danach
+        zurück."""
+        frame_time = 1.0 / SYNC_RING_FPS
+        head = 0
+        try:
+            while not self._sync_ring_stop.is_set():
+                speed_active = (
+                    self._speed_pulse_thread is not None
+                    and self._speed_pulse_thread.is_alive()
+                )
+                if time.monotonic() >= self._ring_busy_until and not speed_active:
+                    colors = sync_comet_frame(head)
+                    with self._lock:
+                        for i in range(RING_SIZE):
+                            self._pixels[i] = colors[i]
+                        self._pixels.show()
+                    head = (head + 1) % RING_SIZE
+                if self._sync_ring_stop.wait(frame_time):
+                    return
+        except Exception:
+            logger.exception("Sync-Ring-Loop crashed")
 
     # ---- Streifen: Tanz + Track-Position --------------------------------
 
