@@ -587,12 +587,17 @@ class Kakabox:
 
     def _heartbeat_loop(self) -> None:
         self._send_heartbeat()
+        self._poll_commands()
         while self._running:
             for _ in range(HEARTBEAT_INTERVAL * 10):
                 if not self._running:
                     return
                 time.sleep(0.1)
             self._send_heartbeat()
+            # Webapp-Commands gleich nach dem Heartbeat abholen (#18). Ohne das
+            # blieben Modus-/Finder-/Volume-/Resync-Aktionen aus der Webapp ohne
+            # jede Wirkung auf der Box (nur Erfolgs-Toast, nichts passiert).
+            self._poll_commands()
 
     def _audio_sync_loop(self) -> None:
         time.sleep(5)
@@ -610,6 +615,11 @@ class Kakabox:
             "volume": self._volume,
             "wifi_ssid": read_wifi_ssid(),
         }
+        # Box-Modus mitmelden, damit die Webapp-Anzeige nicht dauerhaft stale
+        # ist (#44). Wird per set_mode/refresh_settings-Command gepflegt.
+        mode = self.config.get("mode")
+        if mode:
+            payload["mode"] = mode
         cpu_load = read_cpu_load_percent()
         if cpu_load is not None:
             # 1-Min-Schnitt aus /proc/loadavg. Wird auf einer Box auf der
@@ -621,6 +631,92 @@ class Kakabox:
             self.backend.heartbeat(payload)
         except Exception as e:
             logger.warning("heartbeat failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Webapp-Commands (Pull-Modell, #18)
+    # ------------------------------------------------------------------
+
+    def _poll_commands(self) -> None:
+        """Holt anstehende Webapp-Commands und führt sie aus.
+
+        Wird nach jedem Heartbeat aufgerufen. Ack erfolgt IMMER nach dem
+        Versuch — auch bei unbekanntem oder fehlerhaftem Command —, weil diese
+        Commands lokale, nicht-transiente Aktionen sind; ein nicht-ack'ter
+        Eintrag würde sonst bei jedem Heartbeat erneut feuern (Poison-Pill).
+        """
+        if not self.backend or not self.backend.is_connected:
+            return
+        try:
+            commands = self.backend.fetch_commands()
+        except Exception as e:
+            logger.warning("fetch_commands fehlgeschlagen: %s", e)
+            return
+        for cmd in commands:
+            cmd_id = cmd.get("id")
+            name = cmd.get("command")
+            payload = cmd.get("payload") or {}
+            try:
+                self._dispatch_command(name, payload)
+            except Exception as e:
+                logger.warning("Command '%s' (id=%s) warf %s — wird verworfen.", name, cmd_id, e)
+            if cmd_id is not None and self.backend:
+                self.backend.acknowledge_command(cmd_id)
+
+    def _dispatch_command(self, name: str, payload: dict) -> None:
+        """Führt einen einzelnen Webapp-Command aus. Siehe BoxCommand im
+        Backend für das Vokabular."""
+        if name == "set_volume":
+            vol = payload.get("volume")
+            if vol is not None:
+                self._set_volume(int(vol))
+        elif name == "set_mode":
+            mode = payload.get("mode")
+            if mode:
+                self._set_mode(str(mode))
+        elif name == "sync_audio":
+            # Voller Manifest-Sync (kaka_id im Payload ignorieren wir — der
+            # Sync deckt ohnehin alle Inhalte der Box ab).
+            self._trigger_background_sync("command")
+        elif name == "refresh_settings":
+            # max_volume + enable_zauberwort über den bestehenden Rule-Pfad.
+            self._apply_rule_from_manifest({
+                "max_volume": payload.get("max_volume"),
+                "enable_zauberwort": payload.get("enable_zauberwort"),
+            })
+            if payload.get("mode"):
+                self._set_mode(str(payload["mode"]))
+        elif name == "finder":
+            # Lokalisierungs-Ton in eigenem Thread, damit der Heartbeat-Loop
+            # nicht durch die Wiedergabe blockiert.
+            threading.Thread(target=self._play_finder, daemon=True, name="finder").start()
+        else:
+            logger.warning("Unbekannter Command '%s' — verworfen.", name)
+
+    def _set_mode(self, mode: str) -> None:
+        """Persistiert den Box-Modus (normal/abend/nacht/flug/offline) und meldet
+        ihn fortan im Heartbeat. Die konkrete Modus-Semantik (z.B. Nacht =
+        leiser) ist noch nicht implementiert — der Wert wird gespeichert, damit
+        Webapp-Anzeige und spätere Modus-Logik konsistent sind.
+        """
+        valid = {"normal", "abend", "nacht", "flug", "offline"}
+        if mode not in valid:
+            logger.warning("Unbekannter Modus '%s' ignoriert.", mode)
+            return
+        if self.config.get("mode") == mode:
+            return
+        logger.info("Box-Modus: %s → %s", self.config.get("mode", "normal"), mode)
+        self.config["mode"] = mode
+        save_config(self.config)
+
+    def _play_finder(self) -> None:
+        """Spielt einen lauten 'Box-suchen'-Ton. Nutzt finder.wav, falls
+        vorhanden — sonst eine vorhandene Ansage als hörbaren Fallback."""
+        loud = max(self._volume, 80)
+        if (PROMPTS_DIR / "finder.wav").is_file():
+            self._play_prompt("finder.wav", volume=loud)
+        else:
+            logger.info("Kein finder.wav vorhanden — Fallback-Ansage für Finder.")
+            self._play_prompt("ready_to_rumble.wav", volume=loud)
 
     def _trigger_background_sync(self, reason: str) -> None:
         """Stößt einen Audio-Sync sofort an (Hintergrund-Thread), statt auf den
@@ -2116,6 +2212,22 @@ class Kakabox:
         logger.info("⏩ Speed: %d%%", int(round(new_speed * 100)))
         if self.leds is not None:
             self.leds.show_speed(new_speed)
+
+    def _set_volume(self, volume: int) -> None:
+        """Setzt die Lautstärke ABSOLUT (0..100), gekappt durch _max_volume.
+
+        Genutzt von der lokalen REST-API (/volume, api/routes.py) und vom
+        set_volume-Command (#18). Delegiert an _adjust_volume, damit Player,
+        LED-Ring und config konsistent bleiben. (Vorher rief die API ein
+        nicht existierendes _set_volume → AttributeError.)
+        """
+        try:
+            target = int(volume)
+        except (TypeError, ValueError):
+            logger.warning("_set_volume: ungültiger Wert %r", volume)
+            return
+        target = max(0, min(self._max_volume, target))
+        self._adjust_volume(target - self._volume)
 
     def _adjust_volume(self, delta: int) -> None:
         # Hard-Cap aus rule.max_volume (Webapp / Eltern-Setting). Wenn die
