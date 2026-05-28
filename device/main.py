@@ -97,6 +97,11 @@ SPEED_MAX = 2.0
 VOICE_MAX_SECONDS = 7.0
 VOICE_SILENCE_SECONDS = 2.0
 VOICE_INITIAL_SILENCE_SECONDS = 3.0  # nichts gesagt nach 3s → Abbruch
+# Follow-up-Aufnahme für die Zauberwort-Rückfrage ("Wie heißt das Zauberwort?"):
+# kurze Nachlauf-Stille, damit nach erkanntem "bitte" praktisch sofort gestartet
+# wird (nicht erst nach 2s wie bei einem normalen Befehl). Max- und
+# Initial-Silence bleiben gleich (7s hart / mind. 3s lauschen).
+VOICE_ZAUBERWORT_SILENCE_SECONDS = 0.4
 
 
 def _kill_aplay_prompt() -> bool:
@@ -286,6 +291,9 @@ class Kakabox:
         self._active_tag_uid: Optional[str] = None
         self._last_kaka_memory: Optional[KakaMemory] = None
         self._playlist_lock = threading.Lock()
+        # Serialisiert Audio-Sync-Trigger: der 5-Min-Loop und der Sofort-Sync
+        # beim Auflegen einer Figur (M1) dürfen nicht gleichzeitig laufen.
+        self._sync_lock = threading.Lock()
 
         # Speed-Mode-State (siehe SPEED_* Konstanten)
         self._speed_mode = False
@@ -584,12 +592,17 @@ class Kakabox:
 
     def _heartbeat_loop(self) -> None:
         self._send_heartbeat()
+        self._poll_commands()
         while self._running:
             for _ in range(HEARTBEAT_INTERVAL * 10):
                 if not self._running:
                     return
                 time.sleep(0.1)
             self._send_heartbeat()
+            # Webapp-Commands gleich nach dem Heartbeat abholen (#18). Ohne das
+            # blieben Modus-/Finder-/Volume-/Resync-Aktionen aus der Webapp ohne
+            # jede Wirkung auf der Box (nur Erfolgs-Toast, nichts passiert).
+            self._poll_commands()
 
     def _audio_sync_loop(self) -> None:
         time.sleep(5)
@@ -607,6 +620,11 @@ class Kakabox:
             "volume": self._volume,
             "wifi_ssid": read_wifi_ssid(),
         }
+        # Box-Modus mitmelden, damit die Webapp-Anzeige nicht dauerhaft stale
+        # ist (#44). Wird per set_mode/refresh_settings-Command gepflegt.
+        mode = self.config.get("mode")
+        if mode:
+            payload["mode"] = mode
         cpu_load = read_cpu_load_percent()
         if cpu_load is not None:
             # 1-Min-Schnitt aus /proc/loadavg. Wird auf einer Box auf der
@@ -619,9 +637,121 @@ class Kakabox:
         except Exception as e:
             logger.warning("heartbeat failed: %s", e)
 
-    def _sync_audio_manifest(self) -> None:
+    # ------------------------------------------------------------------
+    # Webapp-Commands (Pull-Modell, #18)
+    # ------------------------------------------------------------------
+
+    def _poll_commands(self) -> None:
+        """Holt anstehende Webapp-Commands und führt sie aus.
+
+        Wird nach jedem Heartbeat aufgerufen. Ack erfolgt IMMER nach dem
+        Versuch — auch bei unbekanntem oder fehlerhaftem Command —, weil diese
+        Commands lokale, nicht-transiente Aktionen sind; ein nicht-ack'ter
+        Eintrag würde sonst bei jedem Heartbeat erneut feuern (Poison-Pill).
+        """
         if not self.backend or not self.backend.is_connected:
             return
+        try:
+            commands = self.backend.fetch_commands()
+        except Exception as e:
+            logger.warning("fetch_commands fehlgeschlagen: %s", e)
+            return
+        for cmd in commands:
+            cmd_id = cmd.get("id")
+            name = cmd.get("command")
+            payload = cmd.get("payload") or {}
+            try:
+                self._dispatch_command(name, payload)
+            except Exception as e:
+                logger.warning("Command '%s' (id=%s) warf %s — wird verworfen.", name, cmd_id, e)
+            if cmd_id is not None and self.backend:
+                self.backend.acknowledge_command(cmd_id)
+
+    def _dispatch_command(self, name: str, payload: dict) -> None:
+        """Führt einen einzelnen Webapp-Command aus. Siehe BoxCommand im
+        Backend für das Vokabular."""
+        if name == "set_volume":
+            vol = payload.get("volume")
+            if vol is not None:
+                self._set_volume(int(vol))
+        elif name == "set_mode":
+            mode = payload.get("mode")
+            if mode:
+                self._set_mode(str(mode))
+        elif name == "sync_audio":
+            # Voller Manifest-Sync (kaka_id im Payload ignorieren wir — der
+            # Sync deckt ohnehin alle Inhalte der Box ab).
+            self._trigger_background_sync("command")
+        elif name == "refresh_settings":
+            # max_volume + enable_zauberwort über den bestehenden Rule-Pfad.
+            self._apply_rule_from_manifest({
+                "max_volume": payload.get("max_volume"),
+                "enable_zauberwort": payload.get("enable_zauberwort"),
+            })
+            if payload.get("mode"):
+                self._set_mode(str(payload["mode"]))
+        elif name == "finder":
+            # Lokalisierungs-Ton in eigenem Thread, damit der Heartbeat-Loop
+            # nicht durch die Wiedergabe blockiert.
+            threading.Thread(target=self._play_finder, daemon=True, name="finder").start()
+        else:
+            logger.warning("Unbekannter Command '%s' — verworfen.", name)
+
+    def _set_mode(self, mode: str) -> None:
+        """Persistiert den Box-Modus (normal/abend/nacht/flug/offline) und meldet
+        ihn fortan im Heartbeat. Die konkrete Modus-Semantik (z.B. Nacht =
+        leiser) ist noch nicht implementiert — der Wert wird gespeichert, damit
+        Webapp-Anzeige und spätere Modus-Logik konsistent sind.
+        """
+        valid = {"normal", "abend", "nacht", "flug", "offline"}
+        if mode not in valid:
+            logger.warning("Unbekannter Modus '%s' ignoriert.", mode)
+            return
+        if self.config.get("mode") == mode:
+            return
+        logger.info("Box-Modus: %s → %s", self.config.get("mode", "normal"), mode)
+        self.config["mode"] = mode
+        save_config(self.config)
+
+    def _play_finder(self) -> None:
+        """Spielt einen lauten 'Box-suchen'-Ton. Nutzt finder.wav, falls
+        vorhanden — sonst eine vorhandene Ansage als hörbaren Fallback."""
+        loud = max(self._volume, 80)
+        if (PROMPTS_DIR / "finder.wav").is_file():
+            self._play_prompt("finder.wav", volume=loud)
+        else:
+            logger.info("Kein finder.wav vorhanden — Fallback-Ansage für Finder.")
+            self._play_prompt("ready_to_rumble.wav", volume=loud)
+
+    def _trigger_background_sync(self, reason: str) -> None:
+        """Stößt einen Audio-Sync sofort an (Hintergrund-Thread), statt auf den
+        nächsten 5-Min-Zyklus zu warten — z.B. wenn eine Figur aufgelegt wird
+        und ein neu verknüpftes Lied noch fehlt. _sync_audio_manifest ist gegen
+        Mehrfachläufe selbst abgesichert, ein paralleler Trigger ist also
+        gefahrlos (no-op, wenn schon einer läuft).
+        """
+        if not self.backend or not self.backend.is_connected:
+            return
+        threading.Thread(
+            target=self._sync_audio_manifest, daemon=True, name=f"sync-{reason}",
+        ).start()
+
+    def _sync_audio_manifest(self) -> None:
+        """Wrapper: serialisiert gleichzeitige Sync-Trigger (5-Min-Loop +
+        Sofort-Sync beim Auflegen). Läuft schon einer, wird der Trigger
+        verworfen — verhindert doppelte Downloads und Cleanup-Races.
+        """
+        if not self.backend or not self.backend.is_connected:
+            return
+        if not self._sync_lock.acquire(blocking=False):
+            logger.debug("Sync läuft bereits — Trigger übersprungen.")
+            return
+        try:
+            self._sync_audio_manifest_locked()
+        finally:
+            self._sync_lock.release()
+
+    def _sync_audio_manifest_locked(self) -> None:
         manifest = self.backend.audio_manifest()
         if not manifest:
             return
@@ -787,34 +917,45 @@ class Kakabox:
         save_config(self.config)
 
     def _apply_rule_from_manifest(self, rule: dict) -> None:
-        """Übernimmt ``rule.max_volume`` aus dem Manifest als Hard-Cap.
+        """Übernimmt die Box-Rule aus dem Manifest: ``max_volume`` (Hard-Cap)
+        und ``enable_zauberwort`` (Höflichkeits-Gate fürs Voice-Matching).
 
-        Der Cap begrenzt, wie weit der User die Lautstärke per Encoder
-        hochdrehen kann (Eltern-Schutz). Wenn die aktuelle Lautstärke nach
-        einem strenger werdenden Cap zu laut ist, wird sie sofort
-        runtergezogen — sonst bliebe die laufende Wiedergabe ungebremst.
-        Wird in config.json gespiegelt, damit Offline-Boot den letzten
-        Stand behält.
+        Beide Felder werden UNABHÄNGIG voneinander angewandt — ein fehlendes
+        Feld lässt den lokalen Stand unverändert (kein Reset auf Default). Der
+        max_volume-Cap begrenzt, wie weit der User per Encoder hochdrehen kann;
+        liegt die aktuelle Lautstärke nach einem strengeren Cap zu hoch, wird
+        sie sofort runtergezogen. Alles wird in config.json gespiegelt, damit
+        ein Offline-Boot den letzten Stand behält.
         """
+        # --- max_volume (Hard-Cap für die User-Lautstärke) ---
         max_vol = rule.get("max_volume")
-        if max_vol is None:
-            return
-        try:
-            max_vol = int(max_vol)
-        except (TypeError, ValueError):
-            logger.warning("rule.max_volume nicht numerisch: %r", max_vol)
-            return
-        max_vol = max(0, min(100, max_vol))
-        if max_vol == self._max_volume:
-            return
-        logger.info("max_volume vom Backend: %d → %d", self._max_volume, max_vol)
-        self._max_volume = max_vol
-        self.config["max_volume"] = max_vol
-        save_config(self.config)
-        # Aktuelle Lautstärke über dem neuen Cap? Sofort runter — mit dem
-        # üblichen _adjust_volume-Pfad, damit Player + LEDs konsistent sind.
-        if self._volume > self._max_volume:
-            self._adjust_volume(self._max_volume - self._volume)
+        if max_vol is not None:
+            try:
+                max_vol = max(0, min(100, int(max_vol)))
+            except (TypeError, ValueError):
+                logger.warning("rule.max_volume nicht numerisch: %r", max_vol)
+                max_vol = None
+            if max_vol is not None and max_vol != self._max_volume:
+                logger.info("max_volume vom Backend: %d → %d", self._max_volume, max_vol)
+                self._max_volume = max_vol
+                self.config["max_volume"] = max_vol
+                save_config(self.config)
+                # Aktuelle Lautstärke über dem neuen Cap? Sofort runter — mit dem
+                # üblichen _adjust_volume-Pfad, damit Player + LEDs konsistent sind.
+                if self._volume > self._max_volume:
+                    self._adjust_volume(self._max_volume - self._volume)
+
+        # --- enable_zauberwort (Höflichkeits-Gate) ---
+        # Spiegelt den Webapp-Toggle nach config['zauberwort_mode_enabled'],
+        # damit er ohne Box-Reboot greift (vorher las das Gerät die Rule nie aus
+        # → der Modus war faktisch tot, egal was in der Webapp stand).
+        zw = rule.get("enable_zauberwort")
+        if zw is not None:
+            zw = bool(zw)
+            if zw != bool(self.config.get("zauberwort_mode_enabled", False)):
+                logger.info("Zauberwort-Modus vom Backend: %s", "an" if zw else "aus")
+                self.config["zauberwort_mode_enabled"] = zw
+                save_config(self.config)
 
     # ------------------------------------------------------------------
     # NFC-Loop (mit Multi-Chip-Tracking)
@@ -951,7 +1092,11 @@ class Kakabox:
         bräuchten wir frische download_urls vom Server, also lieber den
         normalen Backend-Pfad nehmen.
         """
-        contents = kaka.get("contents") or []
+        # Nur abspielbare Inhalte betrachten — eine unveröffentlichte/dateilose
+        # Verknüpfung kann gar nicht lokal liegen und darf den Cache-First-Pfad
+        # nicht blockieren (sonst nie Instant-Start). Spiegelt den Filter in
+        # _start_kaka_playlist.
+        contents = [c for c in (kaka.get("contents") or []) if c.get("playable", True)]
         if not contents:
             return False
         for c in contents:
@@ -985,6 +1130,10 @@ class Kakabox:
 
         if status in ("play", "paired"):
             self._update_tag_cache(uid, kaka)
+            # M2: laufende Playlist live nachziehen, falls sich der Inhalt der
+            # noch aktiven Figur geändert hat (z.B. 3. Lied verknüpft) — ohne
+            # die aktuelle Wiedergabe zu unterbrechen.
+            self._refresh_active_playlist(uid, kaka)
             return
 
         if status in ("unknown", "foreign_household"):
@@ -1003,10 +1152,56 @@ class Kakabox:
                 except Exception as e:
                     logger.warning("Player.stop fehlgeschlagen: %s", e)
 
+    def _refresh_active_playlist(self, uid: str, kaka: dict) -> None:
+        """Zieht die Track-Liste der LAUFENDEN Playlist nach, falls ``uid`` noch
+        die aktive Figur ist. Baut KakaContent aus den (playable) Inhalten und
+        ruft ``Playlist.update_contents`` — das laufende Audio bricht NICHT ab.
+
+        Bei echter Änderung wird der LED-Track-Balken neu gesetzt und ein
+        Sofort-Sync angestoßen, damit ein neu hinzugekommenes (noch fehlendes)
+        Lied gleich geladen und beim Erreichen abspielbar ist.
+        """
+        new_contents = [
+            KakaContent(
+                content_id=c["id"],
+                title=c.get("title", ""),
+                file_hash=c.get("file_hash"),
+                download_url=c.get("download_url"),
+                cached_locally=bool(c.get("cached_locally")),
+                sort_order=int(c.get("sort_order", 0)),
+            )
+            for c in (kaka.get("contents") or [])
+            if c.get("id") and c.get("playable", True)
+        ]
+        # Leere Liste nicht anwenden — sonst würde eine laufende Wiedergabe
+        # ihre Track-Liste verlieren. (Status-Wechsel auf "keine Lieder" wird
+        # ohnehin über den normalen Tag-Scan-Pfad behandelt.)
+        if not new_contents:
+            return
+
+        with self._playlist_lock:
+            playlist = self._current_playlist if self._active_tag_uid == uid else None
+        if playlist is None:
+            return
+
+        if playlist.update_contents(new_contents):
+            if self.leds is not None:
+                self.leds.strips_show_position(
+                    playlist.current_index, playlist.length,
+                )
+            self._trigger_background_sync("content-changed")
+
     def _start_kaka_playlist(self, uid: str, kaka: dict) -> None:
-        contents_data = kaka.get("contents", [])
+        # Nur tatsächlich auslieferbare Lieder (veröffentlicht + Audiodatei) in
+        # die Playlist nehmen. 'playable' kommt vom Backend (formatKaka); fehlt
+        # das Feld (älteres Backend), gilt der Track als spielbar (Kompat).
+        # So zählt der LED-Track-Balken nie ein Lied mit, das nie geladen
+        # werden kann ("3/3 angezeigt, aber 3. Lied unerreichbar").
+        contents_data = [
+            c for c in kaka.get("contents", []) if c.get("playable", True)
+        ]
         if not contents_data:
-            logger.info("Kaka '%s' hat noch keine Lieder.", kaka.get("name"))
+            logger.info("Kaka '%s' hat noch keine abspielbaren Lieder.", kaka.get("name"))
             return
 
         contents = [
@@ -1064,6 +1259,10 @@ class Kakabox:
             self.leds.strips_show_position(
                 playlist.current_index, playlist.length,
             )
+        # M1: Beim Auflegen sofort einen Sync anstoßen — so werden neu
+        # verknüpfte Lieder gleich geladen (statt erst beim nächsten 5-Min-
+        # Zyklus), und _jump_to lädt notfalls beim Erreichen blockierend nach.
+        self._trigger_background_sync("tag-placed")
 
     # ------------------------------------------------------------------
     # Random-Mode (Encoder-Push ≥ 1s)
@@ -1851,15 +2050,9 @@ class Kakabox:
 
             logger.info("Voice transkribiert: «%s»", text)
 
-            # Zauberwort-Modus: nur abspielen, wenn "bitte" im Transkript steht.
-            # Sonst Prompt "Wie heißt das Zauberwort?" — Kind muss den Befehl
-            # nochmal mit Höflichkeit wiederholen. Der Modus wird per API
-            # (POST /zauberwort/enable) oder direkt in config.json geschaltet.
-            if self.config.get("zauberwort_mode_enabled") and not has_magic_word(text):
-                logger.info("Zauberwort fehlt in «%s» — Prompt statt Match.", text)
-                self._play_prompt("zauberwort.wav")
-                return
-
+            # Erst MATCHEN, dann erst das Zauberwort-Gate (Z2). So kommt der
+            # "Wie heißt das Zauberwort?"-Prompt nur, wenn das Lied wirklich
+            # gefunden wurde — bei Nicht-Treffer der normale Error-Ton (finally).
             catalog = build_catalog_from_file(VOICE_CATALOG_PATH)
             if not catalog:
                 logger.warning("Voice-Catalog leer — kein Match möglich.")
@@ -1867,14 +2060,25 @@ class Kakabox:
 
             cmd = parse_play_command(text, catalog)
             if cmd is None:
-                logger.info("Voice: kein Match für «%s»", text)
+                logger.info("Voice: kein Match für «%s» → Error-Ton.", text)
                 return
 
             logger.info(
                 "Voice match: kind=%s name='%s' score=%.2f query='%s'",
                 cmd.target.kind, cmd.target.name, cmd.score, cmd.query,
             )
-            # Match → Erfolgs-Feedback: NFC-LED static sattes Grün während
+
+            # Zauberwort-Gate: Lied gefunden, aber im aktiven Modus fehlt "bitte"
+            # → "Wie heißt das Zauberwort?" abspielen und ein zweites Mal
+            # lauschen. Sagt das Kind dann "bitte" (vorne/mitte/hinten), spielen
+            # wir; sonst kein Playback (finally → Error-Ton).
+            if self.config.get("zauberwort_mode_enabled") and not has_magic_word(text):
+                logger.info("Zauberwort fehlt in «%s» — frage nach.", text)
+                if not self._await_zauberwort():
+                    logger.info("Zauberwort nicht gesagt — kein Playback.")
+                    return
+
+            # Match (+ ggf. Zauberwort bestätigt) → Erfolgs-Feedback: NFC-LED static sattes Grün während
             # der success-Sound spielt. Danach Voice-Track. Der finally-Block
             # setzt die LED dann zurück auf den richtigen Pulse-Status (grün
             # falls Tag noch drauf via _voice_pending_tag_uid).
@@ -1913,6 +2117,37 @@ class Kakabox:
                 else:
                     self.leds.nfc_chip_absent()
             self._voice_lock.release()
+
+    def _await_zauberwort(self) -> bool:
+        """Spielt "Wie heißt das Zauberwort?" und lauscht ein zweites Mal.
+
+        Gibt True zurück, wenn das Kind "bitte" sagt (positionsunabhängig, via
+        has_magic_word). Follow-up-Timing (Z4): max 7s, mind. 3s lauschen bevor
+        bei Stille abgebrochen wird, nur ~0.4s Nachlauf-Stille → nach "bitte"
+        startet es praktisch sofort. Die NFC-LED bleibt blau ("lauscht"); das
+        grüne Erfolgs-Feedback setzt der aufrufende Erfolgs-Pfad.
+        """
+        if self.leds is not None:
+            self.leds.nfc_voice_active()
+        self._play_prompt("zauberwort.wav")
+        # Prompt fertig abspielen, sonst mischt er sich in die Aufnahme.
+        self.player.wait_until_idle(timeout=2.0)
+        try:
+            wav = self._mic_recorder.record_until_silence(
+                max_seconds=VOICE_MAX_SECONDS,
+                silence_seconds=VOICE_ZAUBERWORT_SILENCE_SECONDS,
+                initial_silence_seconds=VOICE_INITIAL_SILENCE_SECONDS,
+            )
+        except RecorderError as e:
+            logger.warning("Zauberwort-Aufnahme fehlgeschlagen: %s", e)
+            return False
+        try:
+            text = self._recognizer.transcribe_wav(wav)
+        except VoiceUnavailable as e:
+            logger.warning("ASR (Zauberwort) nicht verfügbar: %s", e)
+            return False
+        logger.info("Zauberwort-Antwort: «%s»", text)
+        return has_magic_word(text)
 
     def _stop_for_voice(self) -> None:
         """Räumt vor der Aufnahme: laufende Playlist stoppen, Tag-State leeren.
@@ -2018,6 +2253,22 @@ class Kakabox:
         logger.info("⏩ Speed: %d%%", int(round(new_speed * 100)))
         if self.leds is not None:
             self.leds.show_speed(new_speed)
+
+    def _set_volume(self, volume: int) -> None:
+        """Setzt die Lautstärke ABSOLUT (0..100), gekappt durch _max_volume.
+
+        Genutzt von der lokalen REST-API (/volume, api/routes.py) und vom
+        set_volume-Command (#18). Delegiert an _adjust_volume, damit Player,
+        LED-Ring und config konsistent bleiben. (Vorher rief die API ein
+        nicht existierendes _set_volume → AttributeError.)
+        """
+        try:
+            target = int(volume)
+        except (TypeError, ValueError):
+            logger.warning("_set_volume: ungültiger Wert %r", volume)
+            return
+        target = max(0, min(self._max_volume, target))
+        self._adjust_volume(target - self._volume)
 
     def _adjust_volume(self, delta: int) -> None:
         # Hard-Cap aus rule.max_volume (Webapp / Eltern-Setting). Wenn die
