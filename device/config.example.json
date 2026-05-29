@@ -1,13 +1,18 @@
 {
-  "volume": 70,
+  "volume": 25,
+  "system_volume": 40,
+  "max_volume": 60,
   "tags": {},
   "parental": {
     "disabled_albums": []
   },
+  "mode": "normal",
+  "zauberwort_mode_enabled": false,
+  "tts_voice": "male",
   "voice": {
     "backend": "whisper",
     "whisper": {
-      "model_path": "/usr/share/kakabox/voice/ggml-base.bin",
+      "model_path": "/usr/share/kakabox/voice/ggml-tiny.bin",
       "language": "de",
       "n_threads": 4
     },

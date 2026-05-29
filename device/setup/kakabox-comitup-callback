@@ -34,7 +34,9 @@ STATE="${1:-}"
 LOG=/var/log/kakabox-callback.log
 PROMPTS=/usr/share/kakabox/prompts
 STATE_DIR=/run/kakabox
-CONFIG=/home/riffi/Dokumente/kakabox/device/config.json
+# __DEVICE_DIR__ wird vom Installer (render()) durch das echte Clone-Verzeichnis
+# ersetzt — der Callback ist sonst identisch und nicht pfad-abhängig.
+CONFIG=__DEVICE_DIR__/config.json
 HOTSPOT_DELAY=12
 
 mkdir -p "$STATE_DIR"

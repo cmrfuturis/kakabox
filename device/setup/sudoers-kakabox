@@ -1,8 +1,9 @@
-# Erlaubt main.py (User riffi) zwei Hardware-Aktionen ohne Passwort.
-# Sehr eng eingegrenzt: NUR diese zwei festen Pfade ohne Argumente.
-# Wird vom Installer nach /etc/sudoers.d/kakabox installiert.
-riffi ALL=(root) NOPASSWD: /usr/local/bin/kakabox-poweroff
-riffi ALL=(root) NOPASSWD: /usr/local/bin/kakabox-wifi-clear
+# Erlaubt main.py (Box-User) ein paar Hardware-Aktionen ohne Passwort.
+# Sehr eng eingegrenzt: NUR diese festen Pfade mit festen Argumenten.
+# TEMPLATE — __RUN_USER__ wird vom Installer (render()) durch den echten
+# Box-User ersetzt, bevor die Datei nach /etc/sudoers.d/kakabox installiert wird.
+__RUN_USER__ ALL=(root) NOPASSWD: /usr/local/bin/kakabox-poweroff
+__RUN_USER__ ALL=(root) NOPASSWD: /usr/local/bin/kakabox-wifi-clear
 # CPU-Governor fürs Standby-Energiesparen — nur die zwei festen Argumente.
-riffi ALL=(root) NOPASSWD: /usr/local/bin/kakabox-cpu-governor powersave
-riffi ALL=(root) NOPASSWD: /usr/local/bin/kakabox-cpu-governor ondemand
+__RUN_USER__ ALL=(root) NOPASSWD: /usr/local/bin/kakabox-cpu-governor powersave
+__RUN_USER__ ALL=(root) NOPASSWD: /usr/local/bin/kakabox-cpu-governor ondemand

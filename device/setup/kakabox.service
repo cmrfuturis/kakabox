@@ -1,5 +1,10 @@
 # systemd-Unit für die Kakabox-Hauptanwendung.
 #
+# TEMPLATE — wird NICHT direkt installiert. install-wifi-onboarding.sh ersetzt
+# die Tokens __RUN_USER__/__RUN_GROUP__/__DEVICE_DIR__ beim Install durch den
+# tatsächlichen User bzw. das Clone-Verzeichnis (siehe render() im Installer),
+# damit dieselbe Box auch unter anderem User/Pfad provisioniert werden kann.
+#
 # Startet beim Boot (enabled), unabhängig vom WLAN — die Box soll auch ohne
 # Internet mit den lokal gecachten Kakas funktionieren. Backend-Funktionen
 # (Sync, Heartbeat) sind innerhalb von main.py best-effort und legen lahm,
@@ -19,10 +24,10 @@ StartLimitIntervalSec=120
 
 [Service]
 Type=simple
-User=riffi
-Group=riffi
-WorkingDirectory=/home/riffi/Dokumente/kakabox/device
-ExecStart=/home/riffi/Dokumente/kakabox/device/.venv/bin/python /home/riffi/Dokumente/kakabox/device/main.py
+User=__RUN_USER__
+Group=__RUN_GROUP__
+WorkingDirectory=__DEVICE_DIR__
+ExecStart=__DEVICE_DIR__/.venv/bin/python __DEVICE_DIR__/main.py
 # Always: auch bei sauberem Exit neu starten (z.B. unerwartetes return aus
 # main()). systemd supervised PID-event-driven — kein Polling, keine
 # Performance-Kosten. Manuelles 'systemctl stop' wird respektiert.
@@ -42,7 +47,7 @@ ProtectSystem=full
 # andere Home-Dirs nicht zugreifbar
 ProtectHome=read-only
 # einziger r/w-Pfad: das eigene Device-Verzeichnis (config.json, audio_cache, …)
-ReadWritePaths=/home/riffi/Dokumente/kakabox/device
+ReadWritePaths=__DEVICE_DIR__
 # eigener /tmp-Namespace, nichts persistiert über Restart
 PrivateTmp=true
 # cgroups read-only — kein Tampering mit Resource-Limits
@@ -59,7 +64,7 @@ LockPersonality=true
 RestrictNamespaces=true
 # kein Realtime-Scheduling, sonst lässt sich der Scheduler quälen
 RestrictRealtime=true
-# neu erstellte Dateien nur für riffi lesbar (config.json enthält API-Token)
+# neu erstellte Dateien nur für den Box-User lesbar (config.json enthält API-Token)
 UMask=0077
 
 # Bewusst NICHT gesetzt: NoNewPrivileges=true
