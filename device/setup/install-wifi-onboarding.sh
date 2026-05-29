@@ -69,9 +69,10 @@ install -m 0644 "$SCRIPT_DIR/wifi-powersave-off.conf" \
 step "Callback-Script installieren ($CALLBACK_PATH)"
 install -m 0755 "$SCRIPT_DIR/kakabox-comitup-callback" "$CALLBACK_PATH"
 
-step "Hardware-Helper installieren (poweroff + wifi-clear)"
-install -m 0755 "$SCRIPT_DIR/kakabox-poweroff"   /usr/local/bin/kakabox-poweroff
-install -m 0755 "$SCRIPT_DIR/kakabox-wifi-clear" /usr/local/bin/kakabox-wifi-clear
+step "Hardware-Helper installieren (poweroff + wifi-clear + cpu-governor)"
+install -m 0755 "$SCRIPT_DIR/kakabox-poweroff"     /usr/local/bin/kakabox-poweroff
+install -m 0755 "$SCRIPT_DIR/kakabox-wifi-clear"   /usr/local/bin/kakabox-wifi-clear
+install -m 0755 "$SCRIPT_DIR/kakabox-cpu-governor" /usr/local/bin/kakabox-cpu-governor
 # Alten wifi-nuke entfernen, falls aus früherer Installation noch da
 rm -f /usr/local/bin/kakabox-wifi-nuke
 install -m 0440 "$SCRIPT_DIR/sudoers-kakabox" /etc/sudoers.d/kakabox

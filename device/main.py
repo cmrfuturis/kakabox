@@ -116,6 +116,16 @@ VOICE_ZAUBERWORT_SILENCE_SECONDS = 0.4
 # sichtbar, damit der User es wahrnimmt. Danach der Bestätigungssound.
 SYNC_FEEDBACK_MIN_S = 2.0
 
+# Energiesparen: zweistufig bei Inaktivität (nichts spielt, kein Chip, kein Knopf).
+#   1) nach STANDBY_TIMEOUT_S → Software-Standby: LEDs aus, CPU 'powersave',
+#      Sync/Heartbeat pausiert, NFC-Poll gedrosselt. Aufwecken: beliebiger Knopf
+#      (nur wecken) oder Chip auflegen (wecken + spielen).
+#   2) nach SHUTDOWN_TIMEOUT_S → kompletter Shutdown mit "tschau kakau" (wie
+#      grünes 5s-Halten) — danach manuell wieder einschalten.
+STANDBY_TIMEOUT_S = 60
+SHUTDOWN_TIMEOUT_S = 300
+STANDBY_NFC_POLL_S = 0.6   # langsameres NFC-Polling im Standby (statt ~0.25s)
+
 
 def _kill_aplay_prompt() -> bool:
     """Bricht einen WLAN-Status-Prompt ab, der per ``aplay`` aus dem Comitup-
@@ -308,6 +318,13 @@ class Kakabox:
         # beim Auflegen einer Figur (M1) dürfen nicht gleichzeitig laufen.
         self._sync_lock = threading.Lock()
 
+        # Energiesparen (Standby/Shutdown bei Inaktivität, siehe *_TIMEOUT_S).
+        self._last_activity = time.monotonic()
+        self._standby = False
+        # Kurz nach dem Aufwecken Eingaben verwerfen, damit das Loslassen des
+        # Weck-Drucks (down→up-Paar) nicht doch eine Aktion auslöst.
+        self._wake_guard_until = 0.0
+
         # Speed-Mode-State (siehe SPEED_* Konstanten)
         self._speed_mode = False
         self._speed = 1.0
@@ -489,18 +506,19 @@ class Kakabox:
     def _wire_buttons(self) -> None:
         if self.buttons is None:
             return
-        self.buttons.on_green(self._on_green_pressed)
-        self.buttons.on_green_stop(self._on_green_stop)
-        self.buttons.on_green_held(self._on_green_held)
-        self.buttons.on_red(self._on_red_pressed)
-        self.buttons.on_red_stop(self._on_red_stop)
-        self.buttons.on_red_held(self._on_red_held)
-        self.buttons.on_push(self._on_push_pressed)
-        self.buttons.on_push_held(self._on_push_held)
-        self.buttons.on_yellow_down(self._on_yellow_down)
-        self.buttons.on_yellow(self._on_yellow_pressed)
-        self.buttons.on_yellow_held(self._on_yellow_held)
-        self.buttons.on_blue(self._on_blue_pressed)
+        w = self._wrap_input  # zählt als Aktivität + weckt aus Standby (Druck wird dann verbraucht)
+        self.buttons.on_green(w(self._on_green_pressed))
+        self.buttons.on_green_stop(w(self._on_green_stop))
+        self.buttons.on_green_held(w(self._on_green_held))
+        self.buttons.on_red(w(self._on_red_pressed))
+        self.buttons.on_red_stop(w(self._on_red_stop))
+        self.buttons.on_red_held(w(self._on_red_held))
+        self.buttons.on_push(w(self._on_push_pressed))
+        self.buttons.on_push_held(w(self._on_push_held))
+        self.buttons.on_yellow_down(w(self._on_yellow_down))
+        self.buttons.on_yellow(w(self._on_yellow_pressed))
+        self.buttons.on_yellow_held(w(self._on_yellow_held))
+        self.buttons.on_blue(w(self._on_blue_pressed))
 
     def _wire_encoder(self) -> None:
         if self.encoder is None:
@@ -510,8 +528,8 @@ class Kakabox:
         # ich kurz verwirrt — diese Variante ist die richtige).
         # Im Speed-Mode steuert der Encoder die Wiedergabegeschwindigkeit
         # statt der Lautstärke — siehe _on_encoder_*.
-        self.encoder.on_clockwise(self._on_encoder_cw)
-        self.encoder.on_counterclockwise(self._on_encoder_ccw)
+        self.encoder.on_clockwise(self._wrap_input(self._on_encoder_cw))
+        self.encoder.on_counterclockwise(self._wrap_input(self._on_encoder_ccw))
 
     def _on_encoder_cw(self) -> None:
         if self._speed_mode:
@@ -567,6 +585,9 @@ class Kakabox:
             threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat").start()
             threading.Thread(target=self._audio_sync_loop, daemon=True, name="audio-sync").start()
 
+        # Energiespar-Watcher: Standby nach 1 Min, Shutdown nach 5 Min Inaktivität.
+        threading.Thread(target=self._idle_watch_loop, daemon=True, name="idle-watch").start()
+
         # Audio-Level-Loop: pollt mpv-RMS 20×/s und füttert LED-Streifen. Bei
         # paused/idle/Stille liefert player.current_audio_level() 0.0, LEDs
         # zeigen dann schwarz (im Dance-Mode). Sehr leichtgewichtig (nur
@@ -600,6 +621,108 @@ class Kakabox:
             self._shutdown()
 
     # ------------------------------------------------------------------
+    # Energiesparen: Standby (LEDs/CPU/Loops) + Auto-Shutdown
+    # ------------------------------------------------------------------
+
+    def _note_activity(self) -> None:
+        self._last_activity = time.monotonic()
+
+    def _is_active(self) -> bool:
+        """True, wenn die Box gerade in Benutzung ist — dann kein Standby/Shutdown.
+
+        Bewusst NICHT an _current_playlist gekoppelt: das bleibt nach
+        "Playlist beendet" gesetzt und würde Standby dauerhaft verhindern.
+        Maßgeblich sind: Chip liegt auf, oder es läuft (nicht-pausiert) Audio.
+        Kurze Voice-Aufnahmen sind über die jüngste Knopf-Aktivität abgedeckt.
+        """
+        if self._active_tag_uid is not None:
+            return True
+        try:
+            st = self.player.get_state()
+            if getattr(st, "playing", False) and not getattr(st, "paused", False):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _wrap_input(self, fn):
+        """Wrapper für Knopf-/Encoder-Callbacks: zählt als Aktivität und weckt
+        aus dem Standby. Im Standby wird der erste Druck NUR zum Aufwecken
+        verbraucht (die eigentliche Aktion läuft nicht), damit niemand z.B.
+        durch plötzliches Lautwerden erschrickt.
+        """
+        def wrapped(*args, **kwargs):
+            self._note_activity()
+            if self._standby:
+                self._wake_from_standby("Knopf")
+                return None
+            # Direkt nach dem Aufwecken kurz alle Eingaben verwerfen (das
+            # Loslassen des Weck-Drucks würde sonst eine Aktion triggern).
+            if time.monotonic() < self._wake_guard_until:
+                return None
+            return fn(*args, **kwargs)
+        return wrapped
+
+    def _set_cpu_governor(self, name: str) -> None:
+        """CPU-Governor via sudo-Helper setzen (best-effort; ohne Helper no-op)."""
+        try:
+            subprocess.run(
+                ["sudo", "-n", "/usr/local/bin/kakabox-cpu-governor", name],
+                check=False, capture_output=True, timeout=5,
+            )
+        except Exception as e:
+            logger.debug("CPU-Governor %s nicht gesetzt: %s", name, e)
+
+    def _enter_standby(self) -> None:
+        if self._standby:
+            return
+        self._standby = True
+        logger.info("💤 Standby (nach %ds inaktiv) — LEDs aus, CPU powersave, Sync pausiert.",
+                    STANDBY_TIMEOUT_S)
+        if self.leds is not None:
+            try:
+                self.leds.standby()
+            except Exception as e:
+                logger.warning("LED-Standby fehlgeschlagen: %s", e)
+        self._set_cpu_governor("powersave")
+
+    def _wake_from_standby(self, reason: str = "") -> None:
+        if not self._standby:
+            return
+        self._standby = False
+        self._note_activity()
+        self._wake_guard_until = time.monotonic() + 1.0
+        logger.info("☀️  Aufgeweckt (%s).", reason or "Aktivität")
+        self._set_cpu_governor("ondemand")
+        if self.leds is not None:
+            try:
+                self._restore_idle_led()
+            except Exception:
+                pass
+
+    def _idle_watch_loop(self) -> None:
+        """Inaktivitäts-Überwachung: nach STANDBY_TIMEOUT_S → Standby, nach
+        SHUTDOWN_TIMEOUT_S → kompletter Shutdown (tschau kakau)."""
+        while self._running:
+            for _ in range(10):  # ~5s, reaktiv auf Stop
+                if not self._running:
+                    return
+                time.sleep(0.5)
+
+            if self._is_active():
+                self._note_activity()
+                continue
+
+            idle = time.monotonic() - self._last_activity
+            if idle >= SHUTDOWN_TIMEOUT_S:
+                logger.warning("⏻ %d Min inaktiv → Box fährt herunter.",
+                               SHUTDOWN_TIMEOUT_S // 60)
+                self._power_off("Auto-Shutdown nach Inaktivität")
+                return
+            if not self._standby and idle >= STANDBY_TIMEOUT_S:
+                self._enter_standby()
+
+    # ------------------------------------------------------------------
     # Hintergrund-Loops
     # ------------------------------------------------------------------
 
@@ -627,7 +750,7 @@ class Kakabox:
                 time.sleep(0.1)
 
     def _send_heartbeat(self) -> None:
-        if not self.backend:
+        if not self.backend or self._standby:
             return
         payload: dict = {
             "volume": self._volume,
@@ -662,7 +785,7 @@ class Kakabox:
         Commands lokale, nicht-transiente Aktionen sind; ein nicht-ack'ter
         Eintrag würde sonst bei jedem Heartbeat erneut feuern (Poison-Pill).
         """
-        if not self.backend or not self.backend.is_connected:
+        if not self.backend or not self.backend.is_connected or self._standby:
             return
         try:
             commands = self.backend.fetch_commands()
@@ -754,7 +877,7 @@ class Kakabox:
         Sofort-Sync beim Auflegen). Läuft schon einer, wird der Trigger
         verworfen — verhindert doppelte Downloads und Cleanup-Races.
         """
-        if not self.backend or not self.backend.is_connected:
+        if not self.backend or not self.backend.is_connected or self._standby:
             return
         if not self._sync_lock.acquire(blocking=False):
             logger.debug("Sync läuft bereits — Trigger übersprungen.")
@@ -1025,7 +1148,9 @@ class Kakabox:
                     self._handle_tag(new_active)
                 active_uid = new_active
 
-            time.sleep(0.05)
+            # Im Standby seltener pollen (spart CPU); ein aufgelegter Chip
+            # weckt dann innerhalb von ~STANDBY_NFC_POLL_S.
+            time.sleep(STANDBY_NFC_POLL_S if self._standby else 0.05)
 
     # ------------------------------------------------------------------
     # Tag-Handling
@@ -1033,6 +1158,11 @@ class Kakabox:
 
     def _handle_tag(self, uid: str) -> None:
         logger.info("NFC tag erkannt: %s", uid)
+        # Chip-Auflegen zählt als Aktivität und weckt aus dem Standby — anders
+        # als ein Knopf wird hier NICHT verbraucht: die Box wacht auf UND spielt.
+        self._note_activity()
+        if self._standby:
+            self._wake_from_standby("Chip")
         # Status-LED sofort grün — visuelles Feedback bevor wir Cache/Backend
         # befragen, damit der User direkt sieht "ja, Chip wurde gelesen".
         if self.leds is not None:
@@ -1715,7 +1845,15 @@ class Kakabox:
         die Box würde dann mitten im Lied ausgehen statt sauber zu verabschieden.
         """
         logger.warning("🟢🟢🟢 Grün 5s gehalten — Box wird ausgeschaltet.")
+        self._power_off("Grün 5s gehalten")
 
+    def _power_off(self, reason: str) -> None:
+        """Sauberer Shutdown: laufende Playlist hart räumen (sonst startet der
+        EOF-Callback nach dem Bye-Prompt den nächsten Track), tschau-kakau
+        abspielen, dann /usr/local/bin/kakabox-poweroff (sudoers NOPASSWD).
+        Genutzt vom grünen 5s-Halten UND vom Auto-Shutdown nach Inaktivität.
+        """
+        logger.warning("Power-off (%s).", reason)
         with self._playlist_lock:
             playlist = self._current_playlist
             self._current_playlist = None
@@ -1723,6 +1861,8 @@ class Kakabox:
         if playlist:
             playlist.stop()
 
+        # Falls im Standby: LEDs sind aus — der Bye-Prompt soll trotzdem hörbar
+        # sein (läuft über system_volume).
         self._play_prompt("tschau_kakau.wav")
         self.player.wait_until_idle(timeout=8.0)
 

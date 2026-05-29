@@ -1,0 +1,15 @@
+#!/bin/bash
+# Setzt den CPU-Governor — von main.py via sudo aufgerufen, um im Standby Strom
+# zu sparen (powersave) und beim Aufwecken wieder reaktiv zu sein (ondemand).
+# Der sudoers-Drop-in erlaubt riffi NOPASSWD NUR für genau diese zwei Argumente.
+set -u
+
+GOV="${1:-}"
+case "$GOV" in
+    powersave|ondemand) ;;
+    *) echo "usage: $0 powersave|ondemand" >&2; exit 2 ;;
+esac
+
+for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [ -w "$g" ] && echo "$GOV" > "$g"
+done

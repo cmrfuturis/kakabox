@@ -3,3 +3,6 @@
 # Wird vom Installer nach /etc/sudoers.d/kakabox installiert.
 riffi ALL=(root) NOPASSWD: /usr/local/bin/kakabox-poweroff
 riffi ALL=(root) NOPASSWD: /usr/local/bin/kakabox-wifi-clear
+# CPU-Governor fürs Standby-Energiesparen — nur die zwei festen Argumente.
+riffi ALL=(root) NOPASSWD: /usr/local/bin/kakabox-cpu-governor powersave
+riffi ALL=(root) NOPASSWD: /usr/local/bin/kakabox-cpu-governor ondemand

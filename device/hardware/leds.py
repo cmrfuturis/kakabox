@@ -447,6 +447,20 @@ class Leds:
         self._pixels.fill(BLACK)
         self._pixels.show()
 
+    def standby(self) -> None:
+        """Energiespar-Standby: ALLE Animations-Threads stoppen und komplett
+        dunkel schalten (sonst würde ein noch laufender Pulse-/Dance-/Komet-
+        Thread die LEDs gleich wieder anschalten). Den normalen Idle-Zustand
+        stellt der Aufrufer nach dem Aufwecken via _restore_idle_led wieder her.
+        """
+        for stop in (self.sync_stop, self.hide_speed, self.strips_dance_stop,
+                     self.nfc_chip_absent):
+            try:
+                stop()
+            except Exception:
+                pass
+        self.off()
+
     def fill(self, color: Color) -> None:
         """Alle LEDs in einer Farbe."""
         self._pixels.fill(color)

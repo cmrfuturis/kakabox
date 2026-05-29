@@ -23,7 +23,9 @@ class FakeCmdBackend:
 
 
 def _bare_box() -> "main.Kakabox":
-    return object.__new__(main.Kakabox)
+    box = object.__new__(main.Kakabox)
+    box._standby = False  # _poll_commands/_send_heartbeat prüfen das Flag
+    return box
 
 
 def test_poll_commands_dispatches_and_acks(monkeypatch):
