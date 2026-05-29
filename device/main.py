@@ -574,6 +574,11 @@ class Kakabox:
 
     def run(self) -> None:
         self._running = True
+        # Normalbetrieb auf reaktivem Governor starten. Wichtig: der Standby
+        # setzt 'powersave' — wird die Box im Standby neu gestartet/rebootet,
+        # bliebe der Governor sonst dauerhaft auf powersave (zu langsam für
+        # Voice-ASR/Playback).
+        self._set_cpu_governor("ondemand")
 
         # Reporter-Worker startet immer — auch ohne Backend-Verbindung. Die
         # Queue persistiert auf Disk und wird verarbeitet, sobald sich die
