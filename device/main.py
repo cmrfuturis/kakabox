@@ -54,7 +54,7 @@ from hardware.rotary_encoder import Encoder as RotaryEncoder
 from network import Backend, BackendError
 from network.play_sessions import PlaySessionReporter
 from voice.asr import VoiceUnavailable, build_recognizer
-from voice.catalog import build_catalog_from_file
+from voice.catalog import build_catalog_from_file, build_title_map_from_file
 from voice.intent import Candidate, has_magic_word, is_random_request, parse_play_command
 from voice.recorder import MicRecorder, RecorderError
 
@@ -2470,6 +2470,12 @@ class Kakabox:
         if target.kind == "genre":
             random.shuffle(content_ids)
 
+        # Echten Einzeltitel pro content_id nachschlagen: Bei Artist/Genre ist
+        # target.name nur der Künstler-/Kategoriename — für korrekte Playback-
+        # Logs UND die spätere Titel-Ansage ("Wie heißt dieses Lied?") brauchen
+        # die Tracks ihren echten Titel. Fallback target.name nur bei Map-Miss.
+        title_map = build_title_map_from_file(VOICE_CATALOG_PATH)
+
         contents: list[KakaContent] = []
         for cid in content_ids:
             path = self.audio_cache.path_for(cid)
@@ -2478,7 +2484,7 @@ class Kakabox:
                 continue
             contents.append(KakaContent(
                 content_id=cid,
-                title=target.name,
+                title=title_map.get(cid, target.name),
                 file_hash=None,
                 download_url=None,
                 cached_locally=True,

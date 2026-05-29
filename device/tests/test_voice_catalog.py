@@ -6,9 +6,14 @@ Stellt sicher, dass:
   - Gleiche Genres zu einem Genre-Candidate zusammengefasst werden
   - Genre-Aufrufe ("spiele ein Urlaubslied") gegen den Genre-Candidate matchen
 """
+import json
+
 import pytest
 
-from voice.catalog import build_catalog_from_songs
+from voice.catalog import (
+    build_catalog_from_songs,
+    build_title_map_from_file,
+)
 from voice.intent import parse_play_command
 
 
@@ -82,3 +87,32 @@ def test_genre_phrase_matches_genre_candidate(phrase, expected_ids):
 
 def test_empty_songs_yields_empty_catalog():
     assert build_catalog_from_songs([]) == []
+
+
+# --- Titel-Map (content_id → echter Titel) -----------------------------------
+
+def test_title_map_from_file(tmp_path):
+    p = tmp_path / "voice_catalog.json"
+    p.write_text(json.dumps({"songs": SONGS}), encoding="utf-8")
+    tmap = build_title_map_from_file(p)
+    assert tmap[1] == "DIKKA - Superkind"
+    assert tmap[3] == "Am Strand"
+    assert tmap[5] == "Stille Nacht"
+    # int-Keys, alle 6 Songs (auch der ohne Genre hat einen Titel).
+    assert all(isinstance(k, int) for k in tmap)
+    assert len(tmap) == len(SONGS)
+
+
+def test_title_map_missing_file_is_empty(tmp_path):
+    assert build_title_map_from_file(tmp_path / "fehlt.json") == {}
+
+
+def test_title_map_skips_entries_without_id_or_title(tmp_path):
+    p = tmp_path / "voice_catalog.json"
+    p.write_text(json.dumps({"songs": [
+        {"content_id": 1, "title": "Gut"},
+        {"content_id": None, "title": "Kein ID"},
+        {"content_id": 2, "title": ""},
+        {"title": "Kein content_id"},
+    ]}), encoding="utf-8")
+    assert build_title_map_from_file(p) == {1: "Gut"}

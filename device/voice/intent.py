@@ -109,6 +109,59 @@ def is_random_request(text: str) -> bool:
     return bool(tokens) and all(t in _RANDOM_WORDS for t in tokens)
 
 
+# --- Frage-Intent "Wie heißt dieses Lied?" -----------------------------------
+# Strukturelle Erkennung (kein Catalog-Match): Die Antwort — der aktuell
+# laufende Titel — kennt nur der Main-Loop. Hier wird rein grammatisch
+# entschieden. Bewusst getrennt von has_play_intent, damit "spiele das lied
+# wo der hund bellt" NICHT als Frage gilt (es fehlt das Fragewort).
+_QUESTION_WORDS = {"wie", "was", "welches", "welcher", "welche", "wer", "wieso", "wessen"}
+_TRACK_NOUNS = {"lied", "song", "titel", "musik", "stück", "liedchen", "songs", "liedlein"}
+_NAME_VERBS = {"heißt", "heisst", "heist", "heißen", "nennt", "nennst", "genannt"}
+_PLAYING_VERBS = {
+    "läuft", "lauft", "spielt", "kommt", "tönt", "toent", "dröhnt",
+    "höre", "hör", "hören", "hörst",
+}
+# Demonstrativ-Bezug auf den laufenden Track ("das"/"dieses" Lied).
+_QUESTION_DEMO = {"das", "dieses", "dieser", "diese", "der", "dem", "den"}
+_HERE_NOW = {"da", "gerade", "jetzt", "grad", "hier", "eben", "denn"}
+
+
+def is_song_name_question(text: str) -> bool:
+    """True, wenn der Text fragt "wie heißt das gerade laufende Lied?".
+
+    Kein Catalog-Match — die Antwort (der aktuelle Titel) kennt nur main.py.
+    Entscheidet rein strukturell: Fragewort (Pflicht-Gate) + Bezug auf den
+    laufenden Titel über eines von drei Mustern:
+
+      A) Name-Verb + (Track-Nomen oder Demonstrativ) — "wie heißt das lied"
+      B) Track-Nomen + Demonstrativ ohne Name-Verb   — "welches lied ist das"
+      C) Lauf-/Hör-Verb + (Hier/Jetzt | Demonstrativ | Track-Nomen)
+                                                       — "was läuft da"
+
+    WICHTIG (Reihenfolge im Flow): "was spielt gerade" enthält das Play-Verb
+    "spielt" und reduziert sich auf "was" (∈ Random-Wörter) — diese Funktion
+    MUSS daher VOR is_random_request/parse_play_command geprüft werden, sonst
+    landet die Frage fälschlich im Random-Modus.
+    """
+    tokset = set(_tokenize(text))
+    if not tokset:
+        return False
+    if not (tokset & _QUESTION_WORDS):  # Fragewort ist Pflicht
+        return False
+    has_demo = bool(tokset & _QUESTION_DEMO)
+    has_noun = bool(tokset & _TRACK_NOUNS)
+    has_name = bool(tokset & _NAME_VERBS)
+    has_playing = bool(tokset & _PLAYING_VERBS)
+    has_here = bool(tokset & _HERE_NOW)
+    if has_name and (has_noun or has_demo):        # Muster A
+        return True
+    if has_noun and has_demo and not has_name:     # Muster B
+        return True
+    if has_playing and (has_here or has_demo or has_noun):  # Muster C
+        return True
+    return False
+
+
 def has_magic_word(text: str, word: str = "bitte") -> bool:
     """True, wenn ``word`` als eigenständiges Token im Transkript steht.
 

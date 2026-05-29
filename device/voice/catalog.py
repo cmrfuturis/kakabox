@@ -136,10 +136,10 @@ def build_catalog_from_songs(songs: list[dict]) -> list[Candidate]:
     return tracks + artists + genres
 
 
-def build_catalog_from_file(path: Path | str) -> list[Candidate]:
-    """Liest ``voice_catalog.json`` und delegiert an ``build_catalog_from_songs``.
+def _load_songs(path: Path | str) -> list[dict]:
+    """Liest die ``songs``-Liste aus ``voice_catalog.json`` (best-effort).
 
-    Fehlende oder kaputte Datei → leere Liste (best-effort, kein Crash).
+    Fehlende oder kaputte Datei → leere Liste (kein Crash).
     """
     p = Path(path)
     if not p.is_file():
@@ -149,4 +149,29 @@ def build_catalog_from_file(path: Path | str) -> list[Candidate]:
     except (OSError, ValueError) as e:
         logger.warning("voice_catalog.json nicht lesbar: %s", e)
         return []
-    return build_catalog_from_songs(data.get("songs") or [])
+    return data.get("songs") or []
+
+
+def build_catalog_from_file(path: Path | str) -> list[Candidate]:
+    """Liest ``voice_catalog.json`` und delegiert an ``build_catalog_from_songs``.
+
+    Fehlende oder kaputte Datei → leere Liste (best-effort, kein Crash).
+    """
+    return build_catalog_from_songs(_load_songs(path))
+
+
+def build_title_map_from_file(path: Path | str) -> dict[int, str]:
+    """``content_id → echter Einzeltitel`` aus ``voice_catalog.json``.
+
+    Wird gebraucht, damit per-Sprache gestartete Artist-/Genre-Playlists (die
+    nur ``content_ids`` sammeln) ihren Tracks den richtigen Titel geben statt
+    des Kategorie-/Künstlernamens — und damit "Wie heißt dieses Lied?" den
+    echten Titel ansagen kann. Gleiche Quelle wie der Catalog, also konsistent.
+    """
+    out: dict[int, str] = {}
+    for s in _load_songs(path):
+        cid = s.get("content_id")
+        title = s.get("title")
+        if cid and title:
+            out[int(cid)] = title
+    return out

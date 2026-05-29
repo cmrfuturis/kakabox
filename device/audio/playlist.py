@@ -335,6 +335,14 @@ class Playlist:
             return self._contents[self._index]
         return None
 
+    def current_title(self) -> Optional[str]:
+        """Titel des gerade laufenden Tracks (oder None, wenn nichts läuft).
+
+        Public-Getter für die Voice-Frage "Wie heißt dieses Lied?".
+        """
+        content = self._current_content()
+        return content.title if content else None
+
     def _emit_track_start(self, content: KakaContent) -> None:
         if self._on_track_start is None:
             return

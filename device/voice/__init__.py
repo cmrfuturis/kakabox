@@ -13,6 +13,7 @@ from .intent import (
     PlayCommand,
     has_play_intent,
     is_random_request,
+    is_song_name_question,
     parse_play_command,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "PlayCommand",
     "has_play_intent",
     "is_random_request",
+    "is_song_name_question",
     "parse_play_command",
 ]

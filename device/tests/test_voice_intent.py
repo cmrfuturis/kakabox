@@ -13,6 +13,7 @@ from voice.intent import (
     Candidate,
     has_play_intent,
     is_random_request,
+    is_song_name_question,
     parse_play_command,
 )
 
@@ -149,3 +150,62 @@ def test_random_words_dont_break_artist_match():
     cmd = parse_play_command("spiele etwas von DIKKA", CATALOG)
     assert cmd is not None
     assert cmd.target.id == "artist:dikka"
+
+
+# --- Frage-Intent "Wie heißt dieses Lied?" -----------------------------------
+
+@pytest.mark.parametrize("phrase", [
+    "wie heißt das lied",
+    "wie heißt dieses lied",
+    "wie heißt der song",
+    "wie heißt der titel",
+    "wie heißt das hier",
+    "wie nennt sich das lied",
+    "was ist das für ein lied",
+    "was ist das denn für ein lied",
+    "was ist das hier für musik",
+    "welches lied ist das",
+    "welcher song ist das",
+    "was läuft da",
+    "was läuft hier gerade",
+    "was spielt gerade",
+    "was spielt da gerade",
+    "was höre ich da",
+    "was hör ich da gerade",
+    "wie heißt das lied das gerade läuft",
+    "wie heißt das lied das da spielt",
+])
+def test_is_song_name_question_positive(phrase):
+    assert is_song_name_question(phrase)
+
+
+@pytest.mark.parametrize("phrase", [
+    "spiele bambi",
+    "spiele das dschungelbuch",
+    "spiele das lied wo der hund bellt",
+    "spiele das nächste lied",
+    "spiele irgendwas",
+    "spiel mir was",
+    "spiele was random",
+    "spiele was von dikka",
+    "spiele ein urlaubslied",
+    "spiele bitte",
+    "ich mag bambi",
+    "hallo box",
+    "mach lauter",
+    "stopp",
+    "wie geht es dir",
+    "wer hat das gemacht",
+    "was kostet das",
+    "",
+])
+def test_is_song_name_question_negative(phrase):
+    assert not is_song_name_question(phrase)
+
+
+def test_song_question_takes_priority_over_random():
+    # "was spielt gerade" matcht (gewollt) AUCH is_random_request — der Flow
+    # MUSS die Frage zuerst prüfen. Dieser Test dokumentiert die Kollision,
+    # damit die Reihenfolge in main.py nicht versehentlich gedreht wird.
+    assert is_song_name_question("was spielt gerade")
+    assert is_random_request("was spielt gerade")  # ← deshalb Frage zuerst!
