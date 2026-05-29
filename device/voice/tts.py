@@ -51,12 +51,37 @@ class TitleSpeaker:
         self._model_path = Path(model_path)
         self._cache_dir = Path(cache_dir)
         self._voice = None  # type: ignore  # lazy PiperVoice
+        # Pfad, AUS DEM ``_voice`` geladen wurde — wird atomar mit _voice gesetzt
+        # und mitgeliefert, damit der Cache-Dateiname IMMER zur tatsächlich
+        # synthetisierten Stimme passt (auch wenn parallel set_model umschaltet).
+        self._voice_model_path: Optional[Path] = None
         # Wenn Paket/Modell dauerhaft fehlen, merken wir uns das und sparen den
         # wiederholten Import-/Datei-Check (transiente Synth-Fehler zählen NICHT).
         self._piper_failed = False
         # Schützt den Lazy-Load: Boot-Warmup-Thread und erster Push-to-Talk
         # könnten sonst das Modell parallel laden.
         self._load_lock = threading.Lock()
+
+    def set_model(self, model_path: Path) -> None:
+        """Wechselt die Stimme (z.B. männlich↔weiblich vom Backend).
+
+        Setzt das geladene Modell zurück; der nächste ``warmup``/``synth_to_wav``
+        lädt das neue. Der Cache ist pro Modell getrennt (Dateiname enthält den
+        Modell-Stem), eine alte Ansage kommt also nie in der falschen Stimme.
+        """
+        model_path = Path(model_path)
+        with self._load_lock:
+            if model_path == self._model_path:
+                return
+            self._model_path = model_path
+            self._voice = None
+            self._piper_failed = False
+        logger.info("TTS-Stimme gewechselt auf %s", model_path.stem)
+
+    def _cache_path(self, text: str) -> Path:
+        """Cache-Datei pro (Stimme, Titel) — Modell-Stem im Namen trennt die
+        Stimmen, damit ein Stimmwechsel nie eine alte WAV der anderen liefert."""
+        return self._cache_dir / f"{self._model_path.stem}_{_cache_key(text)}.wav"
 
     def warmup(self) -> None:
         """Lädt das Piper-Modell vorab in den RAM (idempotent). Wirft nicht —
@@ -69,12 +94,18 @@ class TitleSpeaker:
             logger.exception("TTS-Warmup unerwartet fehlgeschlagen")
 
     def _load_piper(self):
+        """Lädt (lazy) das Piper-Modell und gibt ``(voice, model_path)`` zurück —
+        beide aus DERSELBEN Generation, damit der Aufrufer die Cache-Datei nach
+        dem tatsächlich geladenen Modell benennt (verhindert Cache-Poisoning bei
+        parallelem Stimmwechsel)."""
         # Double-checked: erst lockfrei (häufiger Fall: Modell schon geladen).
+        # _voice_model_path wird mit _voice gekoppelt (set_model nullt _voice bei
+        # Pfadwechsel), das Paar ist also konsistent.
         if self._voice is not None:
-            return self._voice
+            return self._voice, self._voice_model_path
         with self._load_lock:
             if self._voice is not None:
-                return self._voice
+                return self._voice, self._voice_model_path
             if self._piper_failed:
                 raise TtsUnavailable("Piper bereits als nicht verfügbar markiert.")
             try:
@@ -104,14 +135,18 @@ class TitleSpeaker:
                 )
             logger.info("Lade Piper-Modell %s …", self._model_path)
             try:
-                self._voice = PiperVoice.load(str(self._model_path))
+                loaded = PiperVoice.load(str(self._model_path))
             except Exception as e:
                 # Korruptes Modell/Config → dauerhaft als nicht verfügbar merken,
                 # damit folgende Ansagen sofort auf espeak fallen statt erneut
                 # teuer/laut zu scheitern.
                 self._piper_failed = True
                 raise TtsUnavailable(f"Piper-Modell konnte nicht geladen werden: {e}") from e
-            return self._voice
+            # _voice_model_path VOR _voice setzen: ein lockfreier Leser, der _voice
+            # ≠ None sieht, liest dann garantiert den passenden Pfad.
+            self._voice_model_path = self._model_path
+            self._voice = loaded
+            return self._voice, self._voice_model_path
 
     def synth_to_wav(self, text: str) -> Optional[Path]:
         """Text → Pfad einer WAV-Datei. ``None``, wenn weder Piper noch espeak gehen.
@@ -123,13 +158,19 @@ class TitleSpeaker:
         if not text:
             return None
 
-        cache_path = self._cache_dir / f"{_cache_key(text)}.wav"
-        if cache_path.is_file():
-            return cache_path
+        # Schneller Hit-Check mit der aktuellen Stimme (ohne Modell-Load).
+        if self._cache_path(text).is_file():
+            return self._cache_path(text)
 
-        # 1) Piper (gecacht)
+        # 1) Piper (gecacht). Der SCHREIB-Pfad wird aus dem TATSÄCHLICH geladenen
+        # Modell abgeleitet (model_path aus _load_piper), nicht aus self._model_path
+        # — sonst könnte ein paralleler set_model die neue Stimme unter dem alten
+        # Dateinamen ablegen (Cache-Poisoning).
         try:
-            voice = self._load_piper()
+            voice, model_path = self._load_piper()
+            cache_path = self._cache_dir / f"{Path(model_path).stem}_{_cache_key(text)}.wav"
+            if cache_path.is_file():
+                return cache_path
             self._cache_dir.mkdir(parents=True, exist_ok=True)
             tmp = cache_path.with_suffix(".tmp.wav")
             try:

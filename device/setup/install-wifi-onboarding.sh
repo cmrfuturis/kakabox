@@ -41,7 +41,13 @@ DEVICE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROMPTS_DIR=/usr/share/kakabox/prompts
 TTS_DIR=/usr/share/kakabox/tts
 TTS_CACHE_DIR=/var/lib/kakabox/tts-cache
-TTS_MODEL_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx"
+PIPER_VOICES_BASE="https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE"
+# Beide Stimmen ausliefern — die Box schaltet per Backend-Setting tts_voice um
+# (männlich=thorsten, weiblich=kerstin). Format: "<modellname> <hf-unterpfad>".
+TTS_MODELS_TO_FETCH=(
+    "de_DE-thorsten-medium thorsten/medium"
+    "de_DE-kerstin-low kerstin/low"
+)
 COMITUP_TEMPLATES_DIR=/usr/share/comitup/web/templates
 COMITUP_CONF=/etc/comitup.conf
 CALLBACK_PATH=/usr/local/bin/kakabox-comitup-callback
@@ -168,34 +174,36 @@ install_prompt "Cartoonish successful.wav"      voice_success.wav   de 140 50 \
 install_prompt "Cartoonish error.wav"           voice_error.wav     de 140 50 \
     "Habe nichts verstanden."
 
-# Titel-Ansage ("Wie heißt dieses Lied?"): Trägerphrase + danach der per Piper
-# gesprochene Songtitel. Ideal eine eingesprochene, verspielte Trägerphrase in
-# branding/audio/ ablegen; sonst espeak-Fallback.
-install_prompt "Dieses-Lied-heisst.wav"         voice_title_intro.wav de 140 50 \
-    "Dieses Lied heißt"
-
+# "Weiß ich gerade nicht"-Fallback (wenn nichts läuft / TTS scheitert). Die
+# eigentliche Titel-Ansage ("Dieses Lied heißt …") spricht die Box per Piper-TTS
+# in der gewählten Stimme — kein fester Trägerphrasen-Prompt mehr nötig.
 install_prompt "Weiss-ich-gerade-nicht.wav"     voice_no_title.wav  de 140 50 \
     "Das weiß ich gerade nicht."
 
-# Piper-TTS-Stimmmodell für die Titel-Ansage. Modell wird NICHT ins Repo
-# committet (~63 MB) — hier von HuggingFace ziehen, falls noch nicht da.
-# Nicht-fatal: fehlt das Modell, fällt voice/tts.py auf espeak-ng zurück.
+# Piper-TTS-Stimmmodelle (beide: männlich thorsten + weiblich kerstin). Werden
+# NICHT ins Repo committet (~63 MB je) — hier von HuggingFace ziehen, falls noch
+# nicht da. Nicht-fatal: fehlt ein Modell, fällt voice/tts.py auf espeak-ng zurück.
 mkdir -p "$TTS_DIR"
 install -d -o riffi -g riffi -m 0775 "$TTS_CACHE_DIR"
-if [[ -f "$TTS_DIR/de_DE-thorsten-medium.onnx" ]]; then
-    echo "  ✓ Piper-Modell bereits vorhanden"
-else
-    if curl --fail --silent --show-error --location --retry 2 --max-time 120 \
-            -o "$TTS_DIR/de_DE-thorsten-medium.onnx"      "$TTS_MODEL_URL" && \
-       curl --fail --silent --show-error --location --retry 2 --max-time 30 \
-            -o "$TTS_DIR/de_DE-thorsten-medium.onnx.json" "$TTS_MODEL_URL.json"; then
-        chmod 0644 "$TTS_DIR"/de_DE-thorsten-medium.onnx*
-        echo "  ✓ Piper-Modell de_DE-thorsten-medium geladen ($(stat -c%s "$TTS_DIR/de_DE-thorsten-medium.onnx") Bytes)"
-    else
-        rm -f "$TTS_DIR"/de_DE-thorsten-medium.onnx*
-        echo "  ⚠ Piper-Modell-Download fehlgeschlagen — Titel-Ansage nutzt espeak-Fallback"
+for entry in "${TTS_MODELS_TO_FETCH[@]}"; do
+    model_name="${entry%% *}"
+    sub_path="${entry##* }"
+    if [[ -f "$TTS_DIR/$model_name.onnx" ]]; then
+        echo "  ✓ Piper-Modell $model_name bereits vorhanden"
+        continue
     fi
-fi
+    url="$PIPER_VOICES_BASE/$sub_path/$model_name.onnx"
+    if curl --fail --silent --show-error --location --retry 2 --max-time 120 \
+            -o "$TTS_DIR/$model_name.onnx"      "$url" && \
+       curl --fail --silent --show-error --location --retry 2 --max-time 30 \
+            -o "$TTS_DIR/$model_name.onnx.json" "$url.json"; then
+        chmod 0644 "$TTS_DIR/$model_name.onnx"*
+        echo "  ✓ Piper-Modell $model_name geladen ($(stat -c%s "$TTS_DIR/$model_name.onnx") Bytes)"
+    else
+        rm -f "$TTS_DIR/$model_name.onnx"*
+        echo "  ⚠ Piper-Modell $model_name fehlgeschlagen — ggf. espeak-Fallback"
+    fi
+done
 
 # ──────────────────────────────────────────────────────────────────────────
 # 5. systemd-Units

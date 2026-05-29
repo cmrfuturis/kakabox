@@ -80,6 +80,18 @@ VOICE_CATALOG_PATH = Path(__file__).parent / "voice_catalog.json"
 PLAY_SESSION_QUEUE_PATH = Path(__file__).parent / "play_sessions_queue.json"
 PROMPTS_DIR = Path("/usr/share/kakabox/prompts")  # vom Installer befüllt
 APLAY_PROMPT_PID = Path("/run/kakabox/prompt_pid")  # vom Comitup-Callback geschrieben
+TTS_DIR = Path("/usr/share/kakabox/tts")
+# Vom Backend per ``tts_voice`` umschaltbare Stimmen (männlich/weiblich). Beide
+# Modelle liegen auf der Box (Installer lädt beide) → Umschalten = nur Modellpfad
+# wechseln, kein Download zur Laufzeit.
+TTS_MODELS = {
+    "male": TTS_DIR / "de_DE-thorsten-medium.onnx",
+    "female": TTS_DIR / "de_DE-kerstin-low.onnx",
+}
+TTS_VOICE_DEFAULT = "male"
+# Trägerphrase vor dem Titel ("Dieses Lied heißt … <Titel>"). Wird per TTS in
+# der GEWÄHLTEN Stimme gesprochen, damit männlich/weiblich durchgängig passt.
+TTS_TITLE_INTRO = "Dieses Lied heißt"
 VOLUME_STEP = 5            # Encoder-Klick = 5 Prozentpunkte
 HEARTBEAT_INTERVAL = 30
 AUDIO_SYNC_INTERVAL = 300  # 5 Minuten
@@ -440,8 +452,12 @@ class Kakabox:
         self._recognizer = build_recognizer(self.config.get("voice"))
         # TTS für die Titel-Ansage ("Wie heißt dieses Lied?"). Piper primär,
         # espeak-ng-Fallback, beides lazy/optional — fehlt das Modell, bleibt
-        # die Box voll funktionsfähig und sagt einen festen Prompt an.
-        self._speaker = TitleSpeaker()
+        # die Box voll funktionsfähig und sagt einen festen Prompt an. Stimme
+        # (männlich/weiblich) kommt vom Backend, persistiert in config['tts_voice'].
+        _voice_name = self.config.get("tts_voice", TTS_VOICE_DEFAULT)
+        self._speaker = TitleSpeaker(
+            model_path=TTS_MODELS.get(_voice_name, TTS_MODELS[TTS_VOICE_DEFAULT])
+        )
         threading.Thread(
             target=self._warmup_voice, daemon=True, name="voice-warmup"
         ).start()
@@ -898,6 +914,8 @@ class Kakabox:
             })
             if payload.get("mode"):
                 self._set_mode(str(payload["mode"]))
+            # TTS-Stimme (männlich/weiblich) sofort umschalten, falls im Payload.
+            self._apply_tts_voice(payload.get("tts_voice"))
         elif name == "finder":
             # Lokalisierungs-Ton in eigenem Thread, damit der Heartbeat-Loop
             # nicht durch die Wiedergabe blockiert.
@@ -1121,26 +1139,46 @@ class Kakabox:
             logger.warning("Voice-Catalog konnte nicht geschrieben werden: %s", e)
 
     def _apply_settings_from_manifest(self, settings: dict) -> None:
-        """Übernimmt Per-Box-Settings (aktuell: system_volume) aus dem Manifest.
+        """Übernimmt Per-Box-Settings (system_volume, tts_voice) aus dem Manifest.
 
         Override-Logik: Webapp-Wert gewinnt, wird in config.json gespiegelt
         damit ein Neustart nach Offline-Phase den letzten Stand behält. Fehlende
-        oder ungültige Werte werden ignoriert (kein Reset auf Default).
+        oder ungültige Werte werden ignoriert (kein Reset auf Default). Jedes Feld
+        wird UNABHÄNGIG angewandt.
         """
         sys_vol = settings.get("system_volume")
-        if sys_vol is None:
+        if sys_vol is not None:
+            try:
+                sys_vol = max(0, min(100, int(sys_vol)))
+                if sys_vol != self._system_volume:
+                    logger.info("system_volume vom Backend: %d → %d", self._system_volume, sys_vol)
+                    self._system_volume = sys_vol
+                    self.config["system_volume"] = sys_vol
+                    save_config(self.config)
+            except (TypeError, ValueError):
+                pass
+
+        self._apply_tts_voice(settings.get("tts_voice"))
+
+    def _apply_tts_voice(self, voice_name) -> None:
+        """Schaltet die TTS-Stimme (männlich/weiblich) gemäß Backend-Vorgabe um.
+
+        Nur bei gültigem, geändertem Wert: config spiegeln, Modell wechseln und
+        im Hintergrund vorladen (damit die erste Ansage nach dem Wechsel nicht
+        auf den Modell-Load wartet). Unbekannte/leere Werte → ignorieren.
+        """
+        if voice_name not in TTS_MODELS:
             return
-        try:
-            sys_vol = int(sys_vol)
-        except (TypeError, ValueError):
+        if voice_name == self.config.get("tts_voice", TTS_VOICE_DEFAULT):
             return
-        sys_vol = max(0, min(100, sys_vol))
-        if sys_vol == self._system_volume:
-            return
-        logger.info("system_volume vom Backend: %d → %d", self._system_volume, sys_vol)
-        self._system_volume = sys_vol
-        self.config["system_volume"] = sys_vol
+        logger.info(
+            "TTS-Stimme vom Backend: %s → %s",
+            self.config.get("tts_voice", TTS_VOICE_DEFAULT), voice_name,
+        )
+        self.config["tts_voice"] = voice_name
         save_config(self.config)
+        self._speaker.set_model(TTS_MODELS[voice_name])
+        threading.Thread(target=self._speaker.warmup, daemon=True, name="tts-revoice").start()
 
     def _apply_rule_from_manifest(self, rule: dict) -> None:
         """Übernimmt die Box-Rule aus dem Manifest: ``max_volume`` (Hard-Cap)
@@ -2636,33 +2674,30 @@ class Kakabox:
             logger.warning("Player.stop vor Voice fehlgeschlagen: %s", e)
 
     def _speak_current_title(self, title: str) -> None:
-        """Sagt den Titel an: verspielte Trägerphrase + TTS-gesprochener Titel.
-
-        ``voice_title_intro.wav`` ist die (optional vom Nutzer aufgenommene)
-        Trägerphrase "Dieses Lied heißt …"; fehlt sie, wird nur der Titel
-        gesprochen. Der TTS-WAV liegt außerhalb von PROMPTS_DIR (Cache bzw.
-        /tmp), muss also DIREKT über den Player laufen — ``_play_prompt``
-        würde ihn nur unter PROMPTS_DIR suchen. Schlägt die Synthese ganz fehl,
-        kommt der "weiß ich gerade nicht"-Prompt statt Stille.
+        """Sagt den Titel in der konfigurierten Stimme an: Trägerphrase
+        "Dieses Lied heißt" + Titel — BEIDES per TTS, damit männlich/weiblich
+        durchgängig passt. Die TTS-WAVs liegen außerhalb von PROMPTS_DIR (Cache),
+        laufen also DIREKT über den Player (``_play_prompt`` sucht nur unter
+        PROMPTS_DIR). Schlägt die Titel-Synthese fehl, kommt der feste "weiß ich
+        gerade nicht"-Prompt statt Stille.
         """
         if self.leds is not None:
             self.leds.nfc_flash_success()
-        # Trägerphrase (falls installiert) — _play_prompt schluckt eine fehlende
-        # Datei still, dann geht's direkt zum gesprochenen Titel.
-        self._play_prompt("voice_title_intro.wav")
-        self.player.wait_until_idle(timeout=4.0)
-
-        wav = self._speaker.synth_to_wav(title)
-        if wav is None:
+        intro = self._speaker.synth_to_wav(TTS_TITLE_INTRO)  # pro Stimme gecacht
+        title_wav = self._speaker.synth_to_wav(title)
+        if title_wav is None:
             logger.warning("TTS lieferte keine WAV für «%s».", title)
             self._play_prompt("voice_no_title.wav")
             self.player.wait_until_idle(timeout=4.0)
             return
         try:
-            self.player.play_prompt(str(wav), self._volume)
+            if intro is not None:
+                self.player.play_prompt(str(intro), self._volume)
+                self.player.wait_until_idle(timeout=4.0)
+            self.player.play_prompt(str(title_wav), self._volume)
             self.player.wait_until_idle(timeout=8.0)
         except Exception as e:
-            logger.warning("Titel-WAV abspielen fehlgeschlagen: %s", e)
+            logger.warning("Titel-Ansage abspielen fehlgeschlagen: %s", e)
 
     def _play_voice_target(self, target: Candidate) -> None:
         """Spielt den per Voice gewählten Target ab.
