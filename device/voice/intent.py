@@ -121,9 +121,20 @@ _PLAYING_VERBS = {
     "läuft", "lauft", "spielt", "kommt", "tönt", "toent", "dröhnt",
     "höre", "hör", "hören", "hörst",
 }
-# Demonstrativ-Bezug auf den laufenden Track ("das"/"dieses" Lied).
-_QUESTION_DEMO = {"das", "dieses", "dieser", "diese", "der", "dem", "den"}
+# Demonstrativ-Bezug auf den laufenden Track ("das"/"dieses" Lied). "es" ist
+# generisch, wird aber nur in Kombination mit einem Name-/Lauf-Verb gewertet
+# (Muster A/C) — "wie heißt es" funktioniert, "was kostet es" nicht.
+_QUESTION_DEMO = {"das", "dieses", "dieser", "diese", "der", "dem", "den", "es"}
 _HERE_NOW = {"da", "gerade", "jetzt", "grad", "hier", "eben", "denn"}
+
+# Gesamtes "Frage-Struktur"-Vokabular. Bleibt nach dem Strippen von Play-Verben
+# + Stopwords NUR solches übrig, ist es eine Frage ("was spielt da gerade").
+# Taucht ein Wort AUSSERHALB auf, ist es ein echter Titel → Play-Befehl
+# ("spiele das lied TAGE WIE DIESE").
+_QUESTION_VOCAB = (
+    _QUESTION_WORDS | _TRACK_NOUNS | _NAME_VERBS
+    | _PLAYING_VERBS | _QUESTION_DEMO | _HERE_NOW | _RANDOM_WORDS
+)
 
 
 def is_song_name_question(text: str) -> bool:
@@ -148,6 +159,19 @@ def is_song_name_question(text: str) -> bool:
         return False
     if not (tokset & _QUESTION_WORDS):  # Fragewort ist Pflicht
         return False
+    # Echter Abspielwunsch mit Titel? "spiele das lied tage wie diese" enthält
+    # Fragewort + "lied" + Demonstrativ, ist aber ein Play-Befehl. Greift nur bei
+    # vorhandenem Play-Verb: bleibt nach dem Strippen ein Wort AUSSERHALB des
+    # Frage-Vokabulars übrig (= echter Titel-Token), ist es eine Wiedergabe-
+    # Anweisung, keine Frage. "was spielt da gerade" übersteht das (Rest nur
+    # was/da ∈ Frage-Vokabular).
+    if has_play_intent(text):
+        residual = [
+            t for t in _tokenize(text)
+            if not _is_play_verb(t) and t not in _STOPWORDS
+        ]
+        if any(t not in _QUESTION_VOCAB for t in residual):
+            return False
     has_demo = bool(tokset & _QUESTION_DEMO)
     has_noun = bool(tokset & _TRACK_NOUNS)
     has_name = bool(tokset & _NAME_VERBS)

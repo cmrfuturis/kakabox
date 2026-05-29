@@ -55,8 +55,15 @@ from network import Backend, BackendError
 from network.play_sessions import PlaySessionReporter
 from voice.asr import VoiceUnavailable, build_recognizer
 from voice.catalog import build_catalog_from_file, build_title_map_from_file
-from voice.intent import Candidate, has_magic_word, is_random_request, parse_play_command
+from voice.intent import (
+    Candidate,
+    has_magic_word,
+    is_random_request,
+    is_song_name_question,
+    parse_play_command,
+)
 from voice.recorder import MicRecorder, RecorderError
+from voice.tts import TitleSpeaker
 
 # Optional: REST-API (von Max) — startet eine FastAPI parallel zum main-Loop.
 # Wird best-effort geladen; falls Modul fehlt oder Port belegt ist, läuft die
@@ -425,8 +432,12 @@ class Kakabox:
         # transcribe_wav als Fallback aktiv und der echte Push-to-Talk wirft den
         # Fehler dann sichtbar.
         self._recognizer = build_recognizer(self.config.get("voice"))
+        # TTS für die Titel-Ansage ("Wie heißt dieses Lied?"). Piper primär,
+        # espeak-ng-Fallback, beides lazy/optional — fehlt das Modell, bleibt
+        # die Box voll funktionsfähig und sagt einen festen Prompt an.
+        self._speaker = TitleSpeaker()
         threading.Thread(
-            target=self._warmup_recognizer, daemon=True, name="asr-warmup"
+            target=self._warmup_voice, daemon=True, name="voice-warmup"
         ).start()
         self._mic_recorder = MicRecorder()
         self._voice_lock = threading.Lock()  # nur eine Voice-Session gleichzeitig
@@ -2181,14 +2192,14 @@ class Kakabox:
             if current_spectrum is not None:
                 current_spectrum.close()
 
-    def _warmup_recognizer(self) -> None:
-        """Lädt das ASR-Modell beim Service-Start in den RAM.
+    def _warmup_voice(self) -> None:
+        """Lädt ASR- UND TTS-Modell beim Service-Start in den RAM.
 
         Läuft in einem Daemon-Thread, damit der Boot nicht blockiert und der
         Rest der Box (NFC-Loop, Buttons, Heartbeat) sofort verfügbar ist.
-        Spart ~1–3 s beim ersten Push-to-Talk. Bei Paket/Modell-Fehlern wird
-        nur geloggt — der Lazy-Load-Pfad in ``transcribe_wav`` greift dann
-        beim echten Trigger und der Fehler wird dort sichtbar.
+        Spart ~1–3 s beim ersten Push-to-Talk (ASR) und ~3 s beim ersten
+        "Wie heißt dieses Lied?" (Piper-Modell-Load). Bei Paket/Modell-Fehlern
+        wird nur geloggt — die Lazy-Load-Pfade greifen dann beim echten Trigger.
         """
         try:
             t0 = time.monotonic()
@@ -2203,6 +2214,12 @@ class Kakabox:
             # Unerwarteter Fehler — den fangen wir bewusst weit, damit
             # ein Modell-Lade-Crash NIE den Box-Start kaputt macht.
             logger.exception("ASR-Warmup unerwartet fehlgeschlagen")
+
+        # TTS separat — eigener try, damit ein TTS-Problem das ASR-Warmup-Log
+        # nicht verschluckt. TitleSpeaker.warmup schluckt seine Fehler selbst.
+        t1 = time.monotonic()
+        self._speaker.warmup()
+        logger.info("TTS-Warmup fertig (%.1fs)", time.monotonic() - t1)
 
     def _on_blue_pressed(self) -> None:
         """Blau gedrückt → Voice-Push-to-Talk.
@@ -2240,11 +2257,21 @@ class Kakabox:
         # Snapshot des aktuellen Zustands für Recovery
         saved_tag_uid = self._active_tag_uid
         saved_random_mode = self._random_mode
+        # War vorher eine per-Sprache gewählte Auswahl aktiv (Track/Artist/Genre)?
+        # Die setzt KEIN _active_tag_uid — ohne eigenes Merken bliebe die Box nach
+        # einer Titel-Frage stumm (kein Tag, kein Random → nichts zu resumen).
+        saved_voice_target = self._voice_last_target if self._voice_mode else None
+        saved_voice_pending = self._voice_pending_tag_uid
         saved_track_index = 0
         saved_position = 0.0
+        # Titel des laufenden Tracks JETZT merken — _stop_for_voice() (gleich)
+        # löscht Playlist + Player-State, danach ist er für die "Wie heißt
+        # dieses Lied?"-Antwort nicht mehr abrufbar.
+        saved_title: Optional[str] = None
         with self._playlist_lock:
             if self._current_playlist:
                 saved_track_index = self._current_playlist.current_index
+                saved_title = self._current_playlist.current_title()
                 try:
                     saved_position = self.player.current_position_seconds()
                 except Exception:
@@ -2254,6 +2281,7 @@ class Kakabox:
         def _restore_previous(reason: str) -> None:
             """Helper: vorheriges Playback fortsetzen.
             - Kakafigur drauf → resume mit gemerkter Position
+            - Per-Sprache gewählte Auswahl → neu starten (Track/Artist/Genre)
             - Random war an → Random neu starten
             - Sonst → nichts (war ja vorher auch nichts)
             """
@@ -2271,6 +2299,16 @@ class Kakabox:
                     saved_tag_uid,
                     self._tag_cache[saved_tag_uid].get("kaka") or {},
                 )
+            elif saved_voice_target is not None:
+                # Voice-Auswahl neu anstoßen (kein Positions-Resume — bei Genre
+                # neu gemischt). Pending-Tag erhalten, damit ein späteres Track-
+                # Ende wie zuvor zur Kakafigur bzw. Random zurückführt.
+                logger.info(
+                    "Voice abgebrochen (%s) → Voice-Auswahl '%s' wieder an",
+                    reason, saved_voice_target.name,
+                )
+                self._voice_pending_tag_uid = saved_voice_pending
+                self._play_voice_target(saved_voice_target)
             elif saved_random_mode:
                 logger.info("Voice abgebrochen (%s) → Random-Modus wieder an", reason)
                 self._start_random_mode()
@@ -2311,6 +2349,23 @@ class Kakabox:
                 return
 
             logger.info("Voice transkribiert: «%s»", text)
+
+            # Titel-Frage ("Wie heißt dieses Lied?") — MUSS als ERSTE Verzweigung
+            # laufen: "was spielt gerade" enthält das Play-Verb "spielt" und
+            # reduziert sich auf "was" (∈ Random-Wörter) — ein späterer Check
+            # würde die Frage fälschlich in den Random-Modus routen. Kein
+            # Zauberwort-Gate (eine Frage ist kein Play). Antwort = der vorm
+            # _stop_for_voice gemerkte Titel; danach läuft die Musik weiter.
+            if is_song_name_question(text):
+                logger.info("Voice: Titel-Frage erkannt → Titel: %s", saved_title)
+                if saved_title:
+                    self._speak_current_title(saved_title)
+                else:
+                    self._play_prompt("voice_no_title.wav")
+                    self.player.wait_until_idle(timeout=4.0)
+                _restore_previous("titel-frage beantwortet")
+                recovered = True
+                return
 
             # Random-Wunsch ("spiele irgendwas") — VOR dem Catalog-Match, weil
             # er kein Entity matcht, sondern den Random-Modus startet. Gleiche
@@ -2450,6 +2505,35 @@ class Kakabox:
             self.player.stop()
         except Exception as e:
             logger.warning("Player.stop vor Voice fehlgeschlagen: %s", e)
+
+    def _speak_current_title(self, title: str) -> None:
+        """Sagt den Titel an: verspielte Trägerphrase + TTS-gesprochener Titel.
+
+        ``voice_title_intro.wav`` ist die (optional vom Nutzer aufgenommene)
+        Trägerphrase "Dieses Lied heißt …"; fehlt sie, wird nur der Titel
+        gesprochen. Der TTS-WAV liegt außerhalb von PROMPTS_DIR (Cache bzw.
+        /tmp), muss also DIREKT über den Player laufen — ``_play_prompt``
+        würde ihn nur unter PROMPTS_DIR suchen. Schlägt die Synthese ganz fehl,
+        kommt der "weiß ich gerade nicht"-Prompt statt Stille.
+        """
+        if self.leds is not None:
+            self.leds.nfc_flash_success()
+        # Trägerphrase (falls installiert) — _play_prompt schluckt eine fehlende
+        # Datei still, dann geht's direkt zum gesprochenen Titel.
+        self._play_prompt("voice_title_intro.wav")
+        self.player.wait_until_idle(timeout=4.0)
+
+        wav = self._speaker.synth_to_wav(title)
+        if wav is None:
+            logger.warning("TTS lieferte keine WAV für «%s».", title)
+            self._play_prompt("voice_no_title.wav")
+            self.player.wait_until_idle(timeout=4.0)
+            return
+        try:
+            self.player.play_prompt(str(wav), self._volume)
+            self.player.wait_until_idle(timeout=8.0)
+        except Exception as e:
+            logger.warning("Titel-WAV abspielen fehlgeschlagen: %s", e)
 
     def _play_voice_target(self, target: Candidate) -> None:
         """Spielt den per Voice gewählten Target ab.

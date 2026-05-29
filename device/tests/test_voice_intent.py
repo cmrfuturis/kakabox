@@ -174,6 +174,7 @@ def test_random_words_dont_break_artist_match():
     "was hör ich da gerade",
     "wie heißt das lied das gerade läuft",
     "wie heißt das lied das da spielt",
+    "wie heißt es",  # #7: generisches "es" + Name-Verb
 ])
 def test_is_song_name_question_positive(phrase):
     assert is_song_name_question(phrase)
@@ -197,6 +198,10 @@ def test_is_song_name_question_positive(phrase):
     "wie geht es dir",
     "wer hat das gemacht",
     "was kostet das",
+    "was kostet es",            # #7: generisches "es" OHNE Name-/Lauf-Verb
+    # #2: Play-Befehle mit Fragewort/Track-Nomen im Titel bleiben Play-Befehle
+    "spiele das lied tage wie diese",
+    "spiele bitte das lied wie heißt der wind",
     "",
 ])
 def test_is_song_name_question_negative(phrase):

@@ -50,6 +50,15 @@ class Player:
         self._prompt_active: bool = False
         self._volume_before_prompt: Optional[int] = None
 
+        # Wiedergabe-Generation: wird bei JEDEM Start/Stopp einer Wiedergabe
+        # hochgezählt. Der EOF-Loop merkt sich, zu welcher Generation der zuletzt
+        # spielende Track gehörte, und feuert das Track-Ende NUR, wenn dieselbe
+        # Generation noch aktuell ist. Verhindert eine Race, bei der ein direkt
+        # nach einem Prompt frisch gestarteter Track (z.B. Musik-Resume nach der
+        # Titel-Ansage) durch die noch "idle" stehende mpv-Phase fälschlich als
+        # beendet gewertet und entwertet wird.
+        self._play_gen: int = 0
+
         # Track-Ende-Erkennung via Polling auf idle-active. Robuster als der
         # eof-reached Property-Observer (der nach play() nicht zuverlässig feuerte
         # und bei Auto-Advance-Tracks komplett ausfiel).
@@ -77,6 +86,7 @@ class Player:
         self._state.current_track = track
         self._state.playing = True
         self._state.paused = False
+        self._play_gen += 1
         self._mpv.play(track.path)
         logger.info("Playing: %s", track.title)
 
@@ -98,7 +108,8 @@ class Player:
         except Exception as e:
             logger.warning("Prompt-Volume konnte nicht gesetzt werden: %s", e)
         # play_file kümmert sich um das eigentliche Abspielen + State-Reset.
-        self.play_file(path, title=Path(path).stem)
+        # _is_prompt=True: Prompt-Modus/Lautstärke NICHT zurücksetzen.
+        self.play_file(path, title=Path(path).stem, _is_prompt=True)
 
     def is_prompt_playing(self) -> bool:
         return self._prompt_active
@@ -117,7 +128,8 @@ class Player:
         except Exception as e:
             logger.warning("Volume-Restore nach Prompt fehlgeschlagen: %s", e)
 
-    def play_file(self, path: str, title: str = "", start_seconds: float = 0.0) -> None:
+    def play_file(self, path: str, title: str = "", start_seconds: float = 0.0,
+                  _is_prompt: bool = False) -> None:
         """Play an arbitrary file path (used by playlist with locally cached audio).
 
         Disables album auto-advance — caller controls the next-track logic via
@@ -126,11 +138,22 @@ class Player:
         ``start_seconds`` lässt mpv die Wiedergabe direkt an dieser Position starten —
         wird für Resume-on-Replace genutzt.
 
+        ``_is_prompt`` markiert den internen Aufruf aus ``play_prompt`` — dann wird
+        der Prompt-Modus NICHT verlassen (Lautstärke bleibt auf Prompt-Pegel).
+        Bei echter Musik-Wiedergabe (Default) wird ein evtl. noch aktiver Prompt
+        sauber beendet (User-Lautstärke zurück), damit ein direkt nach einem
+        Prompt gestarteter Track sofort am richtigen Pegel und ohne hängenden
+        Prompt-State läuft.
+
         Defensive Sequenz: erst stop, kurz warten, dann play. Ohne das geht
         mpv beim 2. Track auf dem Multi-Device kakabox_audio (snd-aloop +
         MAX98357A) nach 250ms in "idle" → Track wird sofort übersprungen.
         Vermutlich Multi-Device-Race nach incomplete teardown des Vorgängers.
         """
+        if not _is_prompt:
+            # Echte Musik nach einem Prompt → Prompt-Modus verlassen (Volume +
+            # Flag), bevor der neue Track startet. Idempotent (no-op ohne Prompt).
+            self._restore_after_prompt()
         try:
             self._mpv.stop()
         except Exception:
@@ -141,6 +164,7 @@ class Player:
         self._state.current_track = synthetic
         self._state.playing = True
         self._state.paused = False
+        self._play_gen += 1
         if start_seconds and start_seconds > 0:
             # mpv "start"-Property gilt für die nächste loadfile-Action
             self._mpv["start"] = str(start_seconds)
@@ -191,6 +215,7 @@ class Player:
             self.pause()
 
     def stop(self) -> None:
+        self._play_gen += 1
         self._mpv.stop()
         # mpv hält pause als eigenes Property — wenn vorher pause war und wir
         # jetzt stoppen, würde der nächste play_file() den Track stumm in
@@ -282,6 +307,7 @@ class Player:
         self._state.current_track = track
         self._state.playing = True
         self._state.paused = False
+        self._play_gen += 1
         self._mpv.play(track.path)
         logger.info("Playing [%d/%d]: %s", self._state.track_index + 1,
                     len(album.tracks), track.title)
@@ -295,43 +321,59 @@ class Player:
         Lebensdauer; Selbstabbruch durch Garbage-Collection des Players.
         """
         prev_idle = True  # vor erstem play() ist mpv idle
+        # Generation des Tracks, der zuletzt als "spielend" (idle=False) gesehen
+        # wurde. Nur wenn diese beim idle-Übergang noch aktuell ist, war es ein
+        # echtes Track-Ende — sonst wurde inzwischen ein neuer Track gestartet.
+        playing_gen = self._play_gen
         while True:
             try:
                 idle = bool(self._mpv.idle_active)
             except Exception:
                 # mpv terminated → Loop beenden
                 return
-
-            if idle and not prev_idle and self._state.playing and not self._state.paused:
-                # Übergang Playing → Idle = Track-Ende
-                self._state.playing = False
-                self._state.current_track = None
-                logger.info("Track-Ende erkannt (mpv idle).")
-
-                # War das ein System-Prompt? Dann User-Lautstärke wieder her —
-                # bevor der Callback ggf. einen neuen Track startet.
-                was_prompt = self._prompt_active
-                self._restore_after_prompt()
-
-                # Callback-Aufruf außerhalb des Lock-State, damit der Callback
-                # neue play_file()-Aufrufe machen kann. Bei Prompts gibt's keine
-                # Playlist-Logik zu triggern — der Callback prüft selbst, ob er
-                # was zu tun hat.
-                cb = self._on_track_end
-                if cb and not was_prompt:
-                    try:
-                        cb()
-                    except Exception as e:
-                        logger.error("on_track_end callback fehlgeschlagen: %s", e)
-
-                # Album-Auto-Advance bleibt erhalten (für lokale Bibliothek).
-                album = self._state.current_album
-                if album and self._state.track_index < len(album.tracks) - 1:
-                    self._state.track_index += 1
-                    self._play_current()
-
-            prev_idle = idle
+            prev_idle, playing_gen = self._eof_step(idle, prev_idle, playing_gen)
             time.sleep(0.2)
+
+    def _eof_step(self, idle: bool, prev_idle: bool, playing_gen: int) -> tuple[bool, int]:
+        """Eine Iteration der Track-Ende-Erkennung. Gibt (prev_idle, playing_gen)
+        für die nächste Iteration zurück.
+
+        Ausgelagert aus ``_eof_watch_loop`` für deterministische Unit-Tests der
+        Generation-Logik (Race TTS-Prompt-Ende ↔ Musik-Resume).
+        """
+        if not idle:
+            # Ein Track läuft → seine Generation merken.
+            playing_gen = self._play_gen
+        elif (not prev_idle and self._state.playing and not self._state.paused
+              and playing_gen == self._play_gen):
+            # Übergang Playing → Idle für DIESELBE Generation = echtes Track-Ende.
+            self._state.playing = False
+            self._state.current_track = None
+            logger.info("Track-Ende erkannt (mpv idle).")
+
+            # War das ein System-Prompt? Dann User-Lautstärke wieder her —
+            # bevor der Callback ggf. einen neuen Track startet.
+            was_prompt = self._prompt_active
+            self._restore_after_prompt()
+
+            # Callback-Aufruf außerhalb des Lock-State, damit der Callback
+            # neue play_file()-Aufrufe machen kann. Bei Prompts gibt's keine
+            # Playlist-Logik zu triggern — der Callback prüft selbst, ob er
+            # was zu tun hat.
+            cb = self._on_track_end
+            if cb and not was_prompt:
+                try:
+                    cb()
+                except Exception as e:
+                    logger.error("on_track_end callback fehlgeschlagen: %s", e)
+
+            # Album-Auto-Advance bleibt erhalten (für lokale Bibliothek).
+            album = self._state.current_album
+            if album and self._state.track_index < len(album.tracks) - 1:
+                self._state.track_index += 1
+                self._play_current()
+
+        return idle, playing_gen
 
     def __del__(self):
         try:

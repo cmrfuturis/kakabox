@@ -13,3 +13,10 @@ vosk==0.3.45
 #   Baut auf Pi 5 ARM64 aus den Sources (cmake nötig: sudo apt install cmake).
 #   ~3–5 Min Build, danach läuft das Modell auf CPU mit 4 Threads.
 pywhispercpp==1.4.1
+#
+# --- Piper-TTS (Sprachausgabe: "Wie heißt dieses Lied?") ---
+#   Fertiges aarch64-Wheel (kein Build), zieht onnxruntime mit (~16 MB).
+#   Modell de_DE-thorsten-medium.onnx(.json) nach /usr/share/kakabox/tts/.
+#   device/voice/tts.py importiert lazy → ohne Paket/Modell Fallback auf
+#   espeak-ng, sonst fester Prompt. Modell-Download siehe install-wifi-onboarding.sh.
+piper-tts==1.4.2
