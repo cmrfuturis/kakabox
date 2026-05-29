@@ -12,10 +12,11 @@ Eingaben:
     🔴 Rot ≥ 1s         → STOP: Wiedergabe beenden + Resume-Position vergessen
     🔴 Rot ≥ 5s         → WLAN-Profile löschen (kein Reboot — Box bleibt an,
                           comitup öffnet Hotspot zum Re-Onboarding)
-    🟦 Encoder-Push      → Pause/Play-Toggle
-    🟦 Encoder-Push ≥ 1s → Voice-Push-to-Talk ("spiele bitte XY")
-    🟦 Encoder im UZS    → Lauter
-    🟦 Encoder gegen UZS → Leiser
+    🟦 Encoder-Push      → 4× schnell während Wiedergabe → Speed-/Fast-Mode
+    🟦 Encoder-Push ≥ 1s → STOP (Kaka/Voice/Random); bei Stille → Random starten
+    🟦 Encoder im UZS    → Lauter (im Speed-Mode: schneller)
+    🟦 Encoder gegen UZS → Leiser (im Speed-Mode: langsamer)
+    (Pause/Play liegt auf Gelb, Voice-Push-to-Talk auf Blau.)
 
 Auto-Pairing:
     Server erkennt unbekannte Tags automatisch (auto_pairing_enabled),
@@ -92,6 +93,11 @@ TTS_VOICE_DEFAULT = "male"
 # Trägerphrase vor dem Titel ("Dieses Lied heißt … <Titel>"). Wird per TTS in
 # der GEWÄHLTEN Stimme gesprochen, damit männlich/weiblich durchgängig passt.
 TTS_TITLE_INTRO = "Dieses Lied heißt"
+# Trägerphrase fürs gesprochene Voice-Feedback nach erkanntem + (ggf.)
+# zauberwort-bestätigtem Befehl: "Ich spiele … <Name>". Gleicher Mechanismus
+# wie TTS_TITLE_INTRO (Trägerphrase einmal pro Stimme gecacht, Name separat —
+# der Name-Cache wird mit der Titel-Ansage geteilt).
+TTS_NOW_PLAYING_INTRO = "Ich spiele"
 VOLUME_STEP = 5            # Encoder-Klick = 5 Prozentpunkte
 HEARTBEAT_INTERVAL = 30
 AUDIO_SYNC_INTERVAL = 300  # 5 Minuten
@@ -129,6 +135,14 @@ VOICE_INITIAL_SILENCE_SECONDS = 3.0  # nichts gesagt nach 3s → Abbruch
 # wird (nicht erst nach 2s wie bei einem normalen Befehl). Max- und
 # Initial-Silence bleiben gleich (7s hart / mind. 3s lauschen).
 VOICE_ZAUBERWORT_SILENCE_SECONDS = 0.4
+# Bare-Title-Fallback: Kinder sagen oft nur den Titel ("Der Zug hat keine
+# Bremsen") OHNE "spiele" davor — dann lehnt der reguläre Parser mangels
+# Play-Verb ab. Wir versuchen dann einen verb-freien Match, aber mit deutlich
+# strengerem Score-Threshold als beim klaren "spiele …"-Befehl (0.55), damit
+# zufälliges Gerede/Nuscheln nicht fälschlich einen Song auslöst. Empirisch:
+# selbst stark vernuscheltes ASR landet beim richtigen Titel bei ~0.73+, klar
+# daneben deutlich darunter — 0.70 trennt das sauber.
+VOICE_BARE_TITLE_THRESHOLD = 0.70
 
 # Mindestdauer der Orange-Sync-Optik bei erkannter Dongel-Änderung — auch wenn
 # der Sync sofort fertig ist (nichts zu laden), bleibt das Feedback so lange
@@ -2079,12 +2093,13 @@ class Kakabox:
         self._play_prompt("setup_active.wav")
 
     def _on_push_pressed(self) -> None:
-        """Encoder-Druck — ausschließlich für Speed-Mode-Gestik.
+        """Encoder-Kurzklick → Speed-/Fast-Mode-Gestik (Easter-Egg).
 
-        - Im Speed-Mode: ein Druck verlässt den Modus.
+        - Im Speed-Mode: ein Klick verlässt den Modus wieder.
         - Sonst: zählt zum Burst-Sliding-Window. 4× innerhalb SPEED_BURST_WINDOW
-          während Wiedergabe → Speed-Mode an.
-        - Kein Pause/Play mehr (das macht gelb), kein Voice (das macht blau).
+          während Wiedergabe → Speed-Mode an (Tempo dann per Drehen).
+        - Kein Pause/Play (Gelb), kein Voice (Blau). STOP liegt auf dem
+          ≥1s-Hold (_on_push_held) — Kurz-Klick und Hold schließen sich aus.
         """
         if self._abort_prompt_if_playing():
             return
@@ -2113,25 +2128,35 @@ class Kakabox:
             self._enter_speed_mode()
 
     def _on_push_held(self) -> None:
-        """Encoder-Push ≥ 1s → Random-Modus an/aus toggeln.
+        """Encoder-Push ≥ 1s → STOP wenn etwas läuft; sonst Random starten.
 
-        - Random schon an → stoppen (alles aus, Stille).
-        - Random aus → starten (zufällige Reihenfolge aus allen Tracks).
-        - Speed-Mode beenden falls aktiv.
+        Stop gilt für JEDE Quelle (Kaka/RFID, Voice, Random): ``_full_stop``
+        beendet hart und leert das Resume-Memory — danach Stille. Liegt eine Kaka
+        noch auf, bleibt es still (die NFC-Schleife triggert nur bei Tag-WECHSEL);
+        zum Weiterhören Kaka abnehmen + wieder auflegen → startet von vorne.
 
-        Im Hintergrund-Thread, weil _start_random_mode die Playlist-Init
-        + erstes play_file machen kann, und der gpiozero-Hold-Callback nicht
-        lange blocken soll.
+        Läuft gerade NICHTS, dient derselbe ≥1s-Hold zum Random-Start (zufällige
+        Reihenfolge aus allen Tracks) — so bleibt das Starten ohne Chip erreichbar.
+        Der kurze Klick ist davon getrennt (Speed-/Fast-Mode, _on_push_pressed).
+
+        Im Hintergrund-Thread, weil _start_random_mode die Playlist-Init + erstes
+        play_file machen kann und der gpiozero-Hold-Callback nicht blocken soll.
         """
         if self._abort_prompt_if_playing():
             return
         if self._speed_mode:
             self._exit_speed_mode()
-        if self._random_mode:
-            logger.info("🎲 Encoder-Push ≥ 1s — Random-Modus stoppen")
-            self._full_stop("Push-Hold Random-Stop")
+        playing = (
+            self.player.get_state().playing
+            or self._active_tag_uid is not None
+            or self._random_mode
+            or self._voice_mode
+        )
+        if playing:
+            logger.info("🟦 Encoder-Push ≥ 1s — Wiedergabe stoppen (Kaka/Voice/Random)")
+            self._full_stop("Push-Hold Stop")
             return
-        logger.info("🎲 Encoder-Push ≥ 1s — Random-Modus starten")
+        logger.info("🎲 Encoder-Push ≥ 1s — nichts läuft → Random-Modus starten")
         threading.Thread(
             target=self._start_random_mode,
             daemon=True,
@@ -2266,6 +2291,24 @@ class Kakabox:
         last_pos: float = 0.0
         try:
             while not self._spectrum_stop.is_set():
+                # Streifen aus (Default!) → der teure Pfad (zweiter ffmpeg-Decode
+                # derselben Datei + 20-Hz-FFT) bringt nichts: _render_dance
+                # verwirft das Spektrum, solange _strips_user_enabled False ist.
+                # Also Decoder abbauen und langsam leerlaufen, bis der User die
+                # Streifen per Gelb-Hold einschaltet. Das ist die Hauptersparnis
+                # beim reinen Musikhören — sonst decodiert die Box jeden Song
+                # doppelt, nur um das Ergebnis wegzuwerfen.
+                if not self._strips_user_enabled:
+                    if current_spectrum is not None:
+                        current_spectrum.close()
+                        current_spectrum = None
+                    current_path = None
+                    # 5 Hz statt 20 Hz im Leerlauf — reicht, um das Einschalten
+                    # der Streifen zügig zu bemerken, kostet aber fast nichts.
+                    if self._spectrum_stop.wait(0.2):
+                        return
+                    continue
+
                 try:
                     path = self.player.current_track_path()
                     pos = self.player.current_position_seconds()
@@ -2566,6 +2609,21 @@ class Kakabox:
 
             cmd = parse_play_command(text, catalog)
             if cmd is None:
+                # Bare-Title-Fallback: Titel ohne "spiele" davor (s.
+                # VOICE_BARE_TITLE_THRESHOLD). Läuft NACH Frage- und Random-
+                # Gate, ist hier also weder Frage noch Random — ein reiner
+                # Titel-Versuch. Strenger Threshold gegen Fehltreffer.
+                cmd = parse_play_command(
+                    text, catalog,
+                    threshold=VOICE_BARE_TITLE_THRESHOLD,
+                    require_play_verb=False,
+                )
+                if cmd is not None:
+                    logger.info(
+                        "Voice: Bare-Title-Treffer «%s» → %s (Score %.2f)",
+                        text, cmd.target.name, cmd.score,
+                    )
+            if cmd is None:
                 logger.info("Voice: kein Match für «%s» → Error-Ton.", text)
                 return
 
@@ -2592,8 +2650,14 @@ class Kakabox:
             self._voice_last_target = cmd.target
             if self.leds is not None:
                 self.leds.nfc_flash_success()
-            self._play_prompt("voice_success.wav")
-            self.player.wait_until_idle(timeout=2.0)
+            # Gesprochenes Feedback "Ich spiele <Name>" in der TTS-Stimme —
+            # zeitgleich mit dem Grün-Flash (die Lampe steht statisch, während
+            # die Ansage läuft). Kommt erst hier, also nach erkanntem Befehl UND
+            # bestandenem Zauberwort-Gate. Fällt die TTS ganz aus, kommt der
+            # feste Erfolgston, damit immer eine hörbare Bestätigung bleibt.
+            if not self._speak_now_playing(cmd.target.name):
+                self._play_prompt("voice_success.wav")
+                self.player.wait_until_idle(timeout=2.0)
             self._play_voice_target(cmd.target)
             recovered = True  # neue Wiedergabe läuft, kein Restore nötig
         finally:
@@ -2698,6 +2762,35 @@ class Kakabox:
             self.player.wait_until_idle(timeout=8.0)
         except Exception as e:
             logger.warning("Titel-Ansage abspielen fehlgeschlagen: %s", e)
+
+    def _speak_now_playing(self, name: str) -> bool:
+        """Sagt "Ich spiele <name>" in der konfigurierten Stimme an — Trägerphrase
+        + Name, beides per TTS (wie _speak_current_title), damit männlich/weiblich
+        durchgängig passt. Der Grün-Flash setzt der Aufrufer VORHER, sodass Lampe
+        und Ansage zusammen kommen.
+
+        Gibt True zurück, wenn die Ansage lief; False, wenn die TTS keine WAV
+        lieferte (Piper+espeak beide weg) — dann spielt der Aufrufer den festen
+        ``voice_success.wav``-Erfolgston, damit IMMER ein Feedback kommt.
+        """
+        name = (name or "").strip()
+        if not name:
+            return False
+        intro = self._speaker.synth_to_wav(TTS_NOW_PLAYING_INTRO)  # pro Stimme gecacht
+        name_wav = self._speaker.synth_to_wav(name)  # Name-Cache geteilt mit Titel-Ansage
+        if name_wav is None:
+            logger.info("TTS lieferte keine WAV für «%s» → Erfolgston-Fallback.", name)
+            return False
+        try:
+            if intro is not None:
+                self.player.play_prompt(str(intro), self._volume)
+                self.player.wait_until_idle(timeout=4.0)
+            self.player.play_prompt(str(name_wav), self._volume)
+            self.player.wait_until_idle(timeout=8.0)
+            return True
+        except Exception as e:
+            logger.warning("Now-Playing-Ansage abspielen fehlgeschlagen: %s", e)
+            return False
 
     def _play_voice_target(self, target: Candidate) -> None:
         """Spielt den per Voice gewählten Target ab.

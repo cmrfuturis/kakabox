@@ -234,18 +234,26 @@ def parse_play_command(
     text: str,
     catalog: Sequence[Candidate],
     threshold: float = 0.55,
+    require_play_verb: bool = True,
 ) -> PlayCommand | None:
     """Erkennt 'spiele/play X' und matched X gegen ``catalog``.
 
     Rückgabe:
-        - ``PlayCommand`` wenn Play-Verb erkannt und Match-Score ≥ threshold
-        - ``None`` sonst (kein Verb, leere Query, oder Match zu schwach)
+        - ``PlayCommand`` wenn (Play-Verb erkannt ODER ``require_play_verb=False``)
+          und Match-Score ≥ threshold
+        - ``None`` sonst (Verb fehlt obwohl gefordert, leere Query, Match zu schwach)
 
     Threshold ist bewusst niedrig (0.55) — Kinder verschlucken Endungen
     und der Katalog ist meist klein genug, dass False-Positives selten sind.
     Höher anziehen, wenn Falsch-Triggers stören.
+
+    ``require_play_verb=False`` lockert die Verb-Pflicht für den Bare-Title-
+    Fallback: Kinder sagen oft nur den Titel ("Der Zug hat keine Bremsen")
+    ohne "spiele" davor. Dann steht und fällt die Trefferqualität allein am
+    ``threshold`` — der Aufrufer sollte ihn höher setzen, damit zufälliges
+    Gerede nicht fälschlich einen Song auslöst.
     """
-    if not has_play_intent(text):
+    if require_play_verb and not has_play_intent(text):
         return None
     query = extract_query(text)
     if not query:

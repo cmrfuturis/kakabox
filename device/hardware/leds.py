@@ -109,7 +109,8 @@ SYNC_RING_FPS = 12             # Rotationsgeschwindigkeit des Kometen
 #     schon gespielt sind (z.B. 3/5 → 10 von 16 LEDs leuchten)
 # Wechselt automatisch nach Ablauf zurück zu "dance".
 STRIPS_TOTAL = (ZONE_STRIP_RIGHT.stop - ZONE_STRIP_LEFT.start)  # = 16
-DANCE_FPS = 20  # 50 ms zwischen Frames — visuell flüssig, weniger CPU als 25 fps
+DANCE_FPS = 15  # 66 ms zwischen Frames — fürs Pulsieren weiterhin flüssig,
+                # spart ggü. 20 fps ~25 % FFT-/SPI-Last beim aktiven Tanz-Modus.
 PSEUDO_DANCE_BPM = 120  # virtueller Beat für die Fallback-Animation
 # Wenn alle FFT-Bänder unter diesem Wert liegen, behandeln wir es als Stille
 # und schalten die Streifen aus — sonst würde die Box auch bei Pause oder
