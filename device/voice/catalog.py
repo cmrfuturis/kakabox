@@ -12,6 +12,11 @@ Backend-Songs mit Titel + Aliasen) und produziert eine Liste von
     Match die Wiedergabe ALLER Songs dieses Artists triggert. So funktioniert
     "spiele DIKKA" automatisch als Künstler-Playlist.
 
+  - **Pro Genre** ein ``kind="genre"``-Candidate, der ALLE Songs dieses Genres
+    sammelt — "spiele ein Urlaubslied" spielt die ganze Urlaub-Kategorie
+    (gemischt, siehe ``_play_voice_target``). Aliase decken die typischen
+    Sprechweisen ab ("Urlaubslied", "Urlaubssong", "Urlaubsmusik").
+
 Reine Funktion ohne I/O-Abhängigkeit zum Player — die Voice-Aktivierung im
 Main-Loop bekommt von ``Candidate.content_ids`` die abzuspielenden IDs und
 baut daraus eine Playlist.
@@ -41,6 +46,20 @@ def _parse_artist(title: str) -> tuple[str | None, str]:
     return m.group(1).strip(), m.group(2).strip()
 
 
+# Sprechweisen für Genre-Aufrufe: "Urlaub" → auch "Urlaubslied(er)", "Urlaubssong(s)",
+# "Urlaubsmusik". Mit Fugen-s, weil Kinder genau so reden ("ein Urlaubslied").
+# Der Genre-Name selbst bleibt der Haupt-Treffer; die Fuzzy-Logik fängt den Rest.
+_GENRE_ALIAS_SUFFIXES = ("slied", "slieder", "ssong", "ssongs", "smusik")
+
+
+def _genre_aliases(genre: str) -> tuple[str, ...]:
+    """Erzeugt Aufruf-Aliase für ein Genre. Leeres/zu kurzes Genre → keine."""
+    g = genre.strip()
+    if len(g) < 3:
+        return ()
+    return tuple(f"{g}{suffix}" for suffix in _GENRE_ALIAS_SUFFIXES)
+
+
 def build_catalog_from_songs(songs: list[dict]) -> list[Candidate]:
     """Erzeugt Track- und Artist-Candidates aus einer Liste von Song-Dicts.
 
@@ -57,6 +76,7 @@ def build_catalog_from_songs(songs: list[dict]) -> list[Candidate]:
     """
     tracks: list[Candidate] = []
     artist_to_ids: dict[str, list[int]] = {}
+    genre_to_ids: dict[str, list[int]] = {}
 
     for song in songs:
         cid = song.get("content_id")
@@ -88,6 +108,10 @@ def build_catalog_from_songs(songs: list[dict]) -> list[Candidate]:
         if artist:
             artist_to_ids.setdefault(artist, []).append(cid)
 
+        genre = (song.get("genre") or "").strip()
+        if genre:
+            genre_to_ids.setdefault(genre, []).append(cid)
+
     artists = [
         Candidate(
             id=f"artist:{artist}",
@@ -98,7 +122,18 @@ def build_catalog_from_songs(songs: list[dict]) -> list[Candidate]:
         for artist, ids in sorted(artist_to_ids.items(), key=lambda kv: kv[0].lower())
     ]
 
-    return tracks + artists
+    genres = [
+        Candidate(
+            id=f"genre:{genre}",
+            name=genre,
+            kind="genre",
+            aliases=_genre_aliases(genre),
+            content_ids=tuple(ids),
+        )
+        for genre, ids in sorted(genre_to_ids.items(), key=lambda kv: kv[0].lower())
+    ]
+
+    return tracks + artists + genres
 
 
 def build_catalog_from_file(path: Path | str) -> list[Candidate]:

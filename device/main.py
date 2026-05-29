@@ -55,7 +55,7 @@ from network import Backend, BackendError
 from network.play_sessions import PlaySessionReporter
 from voice.asr import VoiceUnavailable, build_recognizer
 from voice.catalog import build_catalog_from_file
-from voice.intent import Candidate, has_magic_word, parse_play_command
+from voice.intent import Candidate, has_magic_word, is_random_request, parse_play_command
 from voice.recorder import MicRecorder, RecorderError
 
 # Optional: REST-API (von Max) — startet eine FastAPI parallel zum main-Loop.
@@ -191,6 +191,43 @@ def read_cpu_load_percent() -> int | None:
     return max(0, min(100, percent))
 
 
+# Bekannte Display-Server / Wayland-Compositoren. Läuft einer, sind wir im
+# Desktop — das passiert auf der Box nur beim Entwickeln. Im Normalbetrieb
+# (headless/Konsole) läuft keiner.
+_GUI_SERVER_PROCS = "(Xorg|Xwayland|wayfire|labwc)"
+_gui_active_cache: tuple[float, bool] | None = None
+_GUI_CACHE_TTL_S = 30.0
+
+
+def graphical_session_active() -> bool:
+    """True, wenn gerade eine grafische Oberfläche läuft (= Dev-Modus).
+
+    Erkennung über einen laufenden Display-Server/Compositor (``pgrep``), NICHT
+    über ``$DISPLAY`` — der systemd-Service erbt keine Display-Env. Socket-Pfade
+    (``/tmp/.X11-unix``) scheiden wegen ``PrivateTmp=true`` aus, ``/proc`` ist
+    aber sichtbar. Ergebnis wird ``_GUI_CACHE_TTL_S`` gecacht, damit der
+    Idle-Watcher nicht alle paar Sekunden einen Prozess spawnt.
+
+    Fällt ``pgrep`` aus, behandeln wir das als "keine GUI" → der Auto-Shutdown
+    bleibt scharf (sicheres Verhalten im Feld, wo pgrep immer existiert).
+    """
+    global _gui_active_cache
+    now = time.monotonic()
+    if _gui_active_cache is not None and now - _gui_active_cache[0] < _GUI_CACHE_TTL_S:
+        return _gui_active_cache[1]
+    try:
+        # pgrep -x + gruppierte Alternation → exakter Match auf den ganzen
+        # Prozessnamen (ein "(a|b)" wird sauber zu ^(a|b)$ verankert).
+        res = subprocess.run(
+            ["pgrep", "-x", _GUI_SERVER_PROCS], capture_output=True, timeout=2
+        )
+        active = res.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        active = False
+    _gui_active_cache = (now, active)
+    return active
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
@@ -321,6 +358,9 @@ class Kakabox:
         # Energiesparen (Standby/Shutdown bei Inaktivität, siehe *_TIMEOUT_S).
         self._last_activity = time.monotonic()
         self._standby = False
+        # Verhindert Log-Spam, wenn der Auto-Shutdown im Dev-Modus (Desktop
+        # läuft) wiederholt ausgesetzt wird — wir loggen das nur einmal.
+        self._shutdown_suppressed_logged = False
         # Kurz nach dem Aufwecken Eingaben verwerfen, damit das Loslassen des
         # Weck-Drucks (down→up-Paar) nicht doch eine Aktion auslöst.
         self._wake_guard_until = 0.0
@@ -720,6 +760,16 @@ class Kakabox:
 
             idle = time.monotonic() - self._last_activity
             if idle >= SHUTDOWN_TIMEOUT_S:
+                if graphical_session_active():
+                    # Desktop läuft → wir entwickeln gerade. Kein Auto-Shutdown,
+                    # sonst stirbt die Box mitten in der Arbeit weg. Der Standby
+                    # (1 Min) ist davon unberührt und greift weiterhin. Nur
+                    # einmal loggen, nicht alle paar Sekunden.
+                    if not self._shutdown_suppressed_logged:
+                        logger.info("🖥️  Grafische Oberfläche aktiv → "
+                                    "Auto-Shutdown ausgesetzt (Dev-Modus).")
+                        self._shutdown_suppressed_logged = True
+                    continue
                 logger.warning("⏻ %d Min inaktiv → Box fährt herunter.",
                                SHUTDOWN_TIMEOUT_S // 60)
                 self._power_off("Auto-Shutdown nach Inaktivität")
@@ -1006,6 +1056,7 @@ class Kakabox:
                 continue
             title = entry.get("title") or ""
             aliases = list(entry.get("aliases") or [])
+            genre = (entry.get("genre") or "").strip() or None
             key = entry.get("file_hash") or title.strip().lower()
             if not key:
                 continue
@@ -1022,6 +1073,7 @@ class Kakabox:
                 "content_id": int(cid),
                 "title": title,
                 "aliases": aliases,
+                "genre": genre,
             })
         payload = {
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -2260,6 +2312,28 @@ class Kakabox:
 
             logger.info("Voice transkribiert: «%s»", text)
 
+            # Random-Wunsch ("spiele irgendwas") — VOR dem Catalog-Match, weil
+            # er kein Entity matcht, sondern den Random-Modus startet. Gleiche
+            # Erfolgs-Choreo wie ein Treffer (Flash-Grün + success-Sound), das
+            # Zauberwort-Gate gilt auch hier.
+            if is_random_request(text):
+                if self.config.get("zauberwort_mode_enabled") and not has_magic_word(text):
+                    logger.info("Random-Wunsch ohne Zauberwort in «%s» — frage nach.", text)
+                    if not self._await_zauberwort():
+                        logger.info("Zauberwort nicht gesagt — kein Playback.")
+                        return
+                logger.info("Voice: Random-Wunsch erkannt → Random-Modus.")
+                if self.leds is not None:
+                    self.leds.nfc_flash_success()
+                self._play_prompt("voice_success.wav")
+                self.player.wait_until_idle(timeout=2.0)
+                self._start_random_mode()
+                # Nur als "recovered" werten, wenn Random wirklich lief (sonst
+                # gibt's keine gecachten Tracks → finally spielt Error + Restore).
+                if self._random_mode:
+                    recovered = True
+                return
+
             # Erst MATCHEN, dann erst das Zauberwort-Gate (Z2). So kommt der
             # "Wie heißt das Zauberwort?"-Prompt nur, wenn das Lied wirklich
             # gefunden wurde — bei Nicht-Treffer der normale Error-Ton (finally).
@@ -2381,15 +2455,23 @@ class Kakabox:
         """Spielt den per Voice gewählten Target ab.
 
         ``kind="track"`` → einzelne Datei aus dem Cache; ``kind="artist"`` →
-        alle Tracks des Künstlers als Playlist. Nicht-gecachte Tracks werden
-        übersprungen (kein Online-Download während des Voice-Flows).
+        alle Tracks des Künstlers als Playlist; ``kind="genre"`` → alle Tracks
+        des Genres in zufälliger Reihenfolge (wie eine frische Genre-Session).
+        Nicht-gecachte Tracks werden übersprungen (kein Online-Download während
+        des Voice-Flows).
         """
         if not target.content_ids:
             logger.warning("Voice-Target ohne content_ids: %s", target.name)
             return
 
+        # Genre fühlt sich wie Random innerhalb der Kategorie an → mischen. Track
+        # und Artist behalten ihre Catalog-Reihenfolge.
+        content_ids = list(target.content_ids)
+        if target.kind == "genre":
+            random.shuffle(content_ids)
+
         contents: list[KakaContent] = []
-        for cid in target.content_ids:
+        for cid in content_ids:
             path = self.audio_cache.path_for(cid)
             if not path.is_file():
                 logger.warning("Voice: Track %d nicht im Cache (%s)", cid, path)

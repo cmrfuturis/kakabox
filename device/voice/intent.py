@@ -18,6 +18,15 @@ from typing import Sequence
 _PLAY_VERB_STEMS = ("spiel", "abspiel", "play")
 _PLAY_VERB_EXTRA = {"starte", "starten", "leg"}
 
+# Wörter, die "spiel irgendwas" bedeuten → lösen den Random-Modus aus statt
+# eines Catalog-Matches. Greift NUR, wenn die ganze Query daraus besteht (siehe
+# is_random_request) — sonst bliebe "spiele etwas von DIKKA" kein Artist-Match.
+_RANDOM_WORDS = {
+    "irgendwas", "irgendetwas", "etwas", "irgendein", "irgendeine",
+    "irgendeinen", "irgendeins", "was", "random", "zufällig", "zufall",
+    "egal", "alles", "querbeet",
+}
+
 # Höflichkeits-/Füllwörter, die das eigentliche Entity verschleiern.
 _COURTESY = {"bitte", "mal", "doch", "nochmal", "noch"}
 _FILLER = {
@@ -77,6 +86,27 @@ def _is_play_verb(token: str) -> bool:
 def has_play_intent(text: str) -> bool:
     """Heuristik: enthält der Text ein Play-Verb?"""
     return any(_is_play_verb(t) for t in _tokenize(text))
+
+
+def is_random_request(text: str) -> bool:
+    """True, wenn der Text 'spiel irgendwas' meint → Random-Modus.
+
+    Bedingung: ein Play-Verb ist da UND die verbleibende Query (nach Strippen
+    von Verb + Stopwords) besteht *ausschließlich* aus Random-Wörtern. So bleibt
+    "spiele etwas von DIKKA" ein Artist-Match (Query enthält "dikka"), während
+    "spiele irgendwas" / "spiele mir was" den Random-Modus auslöst.
+
+    Eine leere Query (z.B. "spiel bitte") zählt bewusst NICHT als Random — das
+    kann auch ein abgeschnittenes/vernuscheltes Kommando sein, und der bestehende
+    Pfad liefert dafür schon den Error-Ton.
+    """
+    if not has_play_intent(text):
+        return False
+    tokens = [
+        t for t in _tokenize(text)
+        if not _is_play_verb(t) and t not in _STOPWORDS
+    ]
+    return bool(tokens) and all(t in _RANDOM_WORDS for t in tokens)
 
 
 def has_magic_word(text: str, word: str = "bitte") -> bool:

@@ -9,7 +9,12 @@ Unit-tests sollen sicherstellen dass:
 """
 import pytest
 
-from voice.intent import Candidate, has_play_intent, parse_play_command
+from voice.intent import (
+    Candidate,
+    has_play_intent,
+    is_random_request,
+    parse_play_command,
+)
 
 
 CATALOG = [
@@ -17,6 +22,7 @@ CATALOG = [
     Candidate(id="bambi", name="Bambi", kind="album"),
     Candidate(id="dschungelbuch", name="Das Dschungelbuch", kind="album"),
     Candidate(id="benjamin", name="Benjamin Blümchen", kind="album"),
+    Candidate(id="artist:dikka", name="DIKKA", kind="artist"),
 ]
 
 
@@ -107,3 +113,39 @@ def test_has_play_intent_positive(phrase):
 ])
 def test_has_play_intent_negative(phrase):
     assert not has_play_intent(phrase)
+
+
+# --- Random-Wunsch ("spiele irgendwas") --------------------------------------
+
+@pytest.mark.parametrize("phrase", [
+    "spiele irgendwas",
+    "spiel irgendetwas",
+    "spiele mir was",
+    "spiel etwas",
+    "spiele mir bitte irgendein lied",
+    "spiele was random",
+    "spiel mir egal was",  # "egal" + "was" beide Random-Wörter
+    "spiele querbeet",
+])
+def test_is_random_request_positive(phrase):
+    assert is_random_request(phrase)
+
+
+@pytest.mark.parametrize("phrase", [
+    "spiele etwas von DIKKA",  # Entity dahinter → kein Random, sondern Artist
+    "spiele bambi",
+    "spiel bitte",             # leere Query zählt NICHT als Random
+    "ich mag irgendwas",       # kein Play-Verb
+    "spiele irgendein bibi",   # konkretes Entity → kein Random
+    "",
+])
+def test_is_random_request_negative(phrase):
+    assert not is_random_request(phrase)
+
+
+def test_random_words_dont_break_artist_match():
+    # "spiele etwas von DIKKA" darf weiterhin DIKKA matchen, nicht Random sein.
+    assert not is_random_request("spiele etwas von DIKKA")
+    cmd = parse_play_command("spiele etwas von DIKKA", CATALOG)
+    assert cmd is not None
+    assert cmd.target.id == "artist:dikka"

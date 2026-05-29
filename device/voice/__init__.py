@@ -12,6 +12,7 @@ from .intent import (
     Candidate,
     PlayCommand,
     has_play_intent,
+    is_random_request,
     parse_play_command,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "Candidate",
     "PlayCommand",
     "has_play_intent",
+    "is_random_request",
     "parse_play_command",
 ]
