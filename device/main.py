@@ -412,6 +412,12 @@ class Kakabox:
         # darf jede ID erneut probiert werden — falls der Backend-Admin
         # die Datei zwischenzeitlich nachgereicht hat.
         self._sync_failures: dict[int, float] = {}
+        # Referenzzähler-Besitz der orangen Sync-Optik: Download-Loop UND Dongel-
+        # Feedback teilen sich denselben Ring/Status-Puls. Nur der erste Pfad
+        # startet, nur der letzte stoppt — verhindert, dass ein Pfad die Optik
+        # eines parallel laufenden anderen vorzeitig abwürgt.
+        self._sync_led_lock = threading.Lock()
+        self._sync_led_owners = 0
 
         # Audio-Level-Poller: liest 20×/s den RMS-Pegel von mpv (via astats-
         # Filter, siehe player.AUDIO_DEVICE/af) und reicht ihn an die LED-
@@ -966,51 +972,67 @@ class Kakabox:
         downloaded = 0
         failed_new = 0
         skipped_backoff = 0
+        # Orange Sync-Optik (Kometen-Ring + Status-LED-Puls) während echter
+        # Downloads. Lazy gestartet erst beim ersten tatsächlichen Download —
+        # ein reiner No-op-Poll (alles gecached) blinkt also nicht.
+        sync_led_started = False
 
-        for entry in files:
-            if not self._running:
-                return
-            content_id = entry.get("content_id")
-            file_hash = entry.get("file_hash")
-            if not content_id or not file_hash:
-                continue
-            if self.audio_cache.is_cached(content_id, file_hash):
-                cached_already += 1
-                continue
-            # Dedup: liegt der gleiche Inhalt (Hash) schon unter einer anderen
-            # content_id im Cache? Backend hat manche Songs doppelt eingespielt
-            # (gleicher Hash, andere ID) — kein zweiter Download nötig, einfach
-            # hardlinken. Spart Bandbreite + Speicher.
-            existing = self.audio_cache.find_by_hash(file_hash)
-            if existing is not None:
-                if self.audio_cache.link_from(existing, content_id):
-                    cached_already += 1
-                    self.backend.report_audio_cached(content_id, file_hash)
+        try:
+            for entry in files:
+                if not self._running:
+                    return
+                content_id = entry.get("content_id")
+                file_hash = entry.get("file_hash")
+                if not content_id or not file_hash:
                     continue
-            # Backoff: wenn der Download vor < SYNC_RETRY_BACKOFF_SECONDS
-            # bereits fehlgeschlagen ist, nicht nochmal versuchen. Spart
-            # Log-Spam + Bandbreite, wenn das Backend dauerhaft 404 liefert.
-            last_fail = self._sync_failures.get(content_id)
-            if last_fail and now - last_fail < SYNC_RETRY_BACKOFF_SECONDS:
-                skipped_backoff += 1
-                continue
+                if self.audio_cache.is_cached(content_id, file_hash):
+                    cached_already += 1
+                    continue
+                # Dedup: liegt der gleiche Inhalt (Hash) schon unter einer anderen
+                # content_id im Cache? Backend hat manche Songs doppelt eingespielt
+                # (gleicher Hash, andere ID) — kein zweiter Download nötig, einfach
+                # hardlinken. Spart Bandbreite + Speicher.
+                existing = self.audio_cache.find_by_hash(file_hash)
+                if existing is not None:
+                    if self.audio_cache.link_from(existing, content_id):
+                        cached_already += 1
+                        self.backend.report_audio_cached(content_id, file_hash)
+                        continue
+                # Backoff: wenn der Download vor < SYNC_RETRY_BACKOFF_SECONDS
+                # bereits fehlgeschlagen ist, nicht nochmal versuchen. Spart
+                # Log-Spam + Bandbreite, wenn das Backend dauerhaft 404 liefert.
+                last_fail = self._sync_failures.get(content_id)
+                if last_fail and now - last_fail < SYNC_RETRY_BACKOFF_SECONDS:
+                    skipped_backoff += 1
+                    continue
 
-            logger.debug("Sync: lade '%s' (id=%d)", entry.get("title"), content_id)
-            target = self.audio_cache.path_for(content_id)
-            if self.backend.download_audio(content_id, target):
-                actual_hash = self.audio_cache.compute_hash(target)
-                if actual_hash != file_hash:
-                    logger.error("Sync: Hash-Mismatch für content=%d — verworfen", content_id)
-                    target.unlink(missing_ok=True)
+                # Erster echter Download → orange Optik an (referenzgezählt, teilt
+                # sich die Optik sauber mit einer evtl. parallelen Dongel-Animation).
+                if not sync_led_started:
+                    self._sync_led_acquire()
+                    sync_led_started = True
+
+                logger.debug("Sync: lade '%s' (id=%d)", entry.get("title"), content_id)
+                target = self.audio_cache.path_for(content_id)
+                if self.backend.download_audio(content_id, target):
+                    actual_hash = self.audio_cache.compute_hash(target)
+                    if actual_hash != file_hash:
+                        logger.error("Sync: Hash-Mismatch für content=%d — verworfen", content_id)
+                        target.unlink(missing_ok=True)
+                        self._sync_failures[content_id] = now
+                        failed_new += 1
+                    else:
+                        self.backend.report_audio_cached(content_id, file_hash)
+                        self._sync_failures.pop(content_id, None)
+                        downloaded += 1
+                else:
                     self._sync_failures[content_id] = now
                     failed_new += 1
-                else:
-                    self.backend.report_audio_cached(content_id, file_hash)
-                    self._sync_failures.pop(content_id, None)
-                    downloaded += 1
-            else:
-                self._sync_failures[content_id] = now
-                failed_new += 1
+        finally:
+            # Optik freigeben, sobald die Downloads durch sind (oder bei
+            # Shutdown-Return mittendrin). Nur wenn wir sie selbst geholt haben.
+            if sync_led_started:
+                self._sync_led_release()
 
         # Eine kompakte Summary-Zeile statt 70+ einzelne Warnings.
         # Nur loggen wenn was passiert ist UND was zusagen ist.
@@ -1413,8 +1435,7 @@ class Kakabox:
         laden ist), danach der Voice-Success-Sound als Bestätigung, dass der Sync
         geklappt hat. Läuft im Hintergrund — Wiedergabe/Bedienung bleiben möglich.
         """
-        if self.leds is not None:
-            self.leds.sync_start()
+        self._sync_led_acquire()
         t0 = time.monotonic()
         try:
             self._sync_audio_manifest()
@@ -1422,9 +1443,7 @@ class Kakabox:
             remaining = SYNC_FEEDBACK_MIN_S - (time.monotonic() - t0)
             if remaining > 0:
                 time.sleep(remaining)
-            if self.leds is not None:
-                self.leds.sync_stop()
-                self._restore_idle_led()
+            self._sync_led_release()
         self._play_sync_confirmation(uid, kaka)
 
     def _play_sync_confirmation(self, uid: str, kaka: dict) -> None:
@@ -1619,6 +1638,56 @@ class Kakabox:
             # Random-Indikator auf NFC-LED: lila pulsierend, damit der
             # User auf einen Blick sieht "ich bin im Random-Modus".
             self.leds.nfc_random_active()
+
+    def _resume_in_place(self, session: Optional[dict]) -> bool:
+        """Setzt die exakt vorher laufende Playlist an derselben Stelle fort.
+
+        Nach der Titel-Frage ("Wie heißt dieses Lied?"): dieselbe Track-Liste,
+        derselbe Index, dieselbe Position — egal ob Kaka, Random oder Voice-
+        Auswahl. So läuft DAS LIED weiter, statt neu zu mischen oder das nächste
+        zu starten. ``session`` ist der Snapshot aus ``_run_voice_activation``.
+        Gibt True zurück, wenn fortgesetzt wurde.
+        """
+        if not session or not session.get("contents"):
+            return False
+        source = session.get("source", "manual")
+        used_zw = bool(self.config.get("zauberwort_mode_enabled")) if source == "voice" else False
+        on_start, on_end = self._playback_session_callbacks(
+            source=source, kaka_id=session.get("kaka_id"), used_zauberwort=used_zw,
+        )
+        with self._playlist_lock:
+            if self._current_playlist:
+                self._current_playlist.stop()
+            playlist = Playlist(
+                contents=list(session["contents"]),
+                cache=self.audio_cache,
+                download_fn=lambda cid, path: bool(self.backend) and self.backend.download_audio(cid, path),
+                play_fn=self.player.play_file,
+                stop_fn=self.player.stop,
+                position_fn=self.player.current_position_seconds,
+                seek_fn=self.player.seek_to,
+                on_track_start=on_start,
+                on_track_end=on_end,
+            )
+            self._current_playlist = playlist
+            self._active_tag_uid = session.get("tag_uid")
+            self._random_mode = bool(session.get("random_mode"))
+            self._voice_mode = bool(session.get("voice_mode"))
+            self._voice_pending_tag_uid = session.get("voice_pending")
+            self._voice_last_target = session.get("voice_target")
+
+        if not playlist.start(start_index=session.get("index", 0),
+                              start_position=session.get("position", 0.0)):
+            logger.warning("Resume nach Titel-Frage konnte nicht starten.")
+            return False
+        logger.info(
+            "Titel-Frage: setze fort (Track %d ab %.1fs, Quelle=%s).",
+            session.get("index", 0) + 1, session.get("position", 0.0), source,
+        )
+        if self.leds is not None:
+            self.leds.strips_dance_start()
+            self.leds.strips_show_position(playlist.current_index, playlist.length)
+        return True
 
     def _compute_resume(self, uid: str) -> tuple[int, float]:
         """Wenn die zuletzt entfernte Kaka derselben UID = jetzt aufgelegt: resume."""
@@ -2094,16 +2163,49 @@ class Kakabox:
         else:
             self.leds.strips_user_disable()
 
-    def _restore_idle_led(self) -> None:
-        """Setzt die NFC-LED auf den passenden "läuft normal"-Status:
-        grün=Tag aktiv, lila=Random-Modus, sonst aus.
+    def _sync_led_acquire(self) -> None:
+        """Orange Sync-Optik referenzgezählt einschalten (über alle Sync-Pfade).
 
-        Wird nach Pause/Resume + Track-Skip aufgerufen, damit die LED nicht
-        im falschen Zustand hängenbleibt.
+        Nur der 0→1-Übergang startet die Optik tatsächlich — ein zweiter
+        paralleler Pfad (z.B. Dongel-Feedback während eines Hintergrund-Downloads)
+        erhöht nur den Zähler.
         """
         if self.leds is None:
             return
-        if self._active_tag_uid is not None:
+        with self._sync_led_lock:
+            self._sync_led_owners += 1
+            first = self._sync_led_owners == 1
+        if first:
+            self.leds.sync_start()
+
+    def _sync_led_release(self) -> None:
+        """Sync-Optik ausschalten, sobald der LETZTE Pfad fertig ist (1→0)."""
+        if self.leds is None:
+            return
+        with self._sync_led_lock:
+            if self._sync_led_owners > 0:
+                self._sync_led_owners -= 1
+            last = self._sync_led_owners == 0
+        if last:
+            self.leds.sync_stop()
+            self._restore_idle_led()
+
+    def _restore_idle_led(self) -> None:
+        """Setzt die NFC-LED auf den passenden "läuft normal"-Status:
+        gelb=pausiert (mit Tag/Random), grün=Tag aktiv, lila=Random, sonst aus.
+
+        Wird nach Pause/Resume, Track-Skip und nach der Sync-Optik aufgerufen,
+        damit die LED nicht im falschen Zustand hängenbleibt. Der Pause-Zweig
+        spiegelt die Gelb-Knopf-Logik — sonst würde z.B. ein Hintergrund-Sync
+        eine pausierte Box fälschlich auf grün ("läuft") setzen.
+        """
+        if self.leds is None:
+            return
+        if self.player.get_state().paused and (
+            self._active_tag_uid is not None or self._random_mode
+        ):
+            self.leds.nfc_chip_paused()
+        elif self._active_tag_uid is not None:
             self.leds.nfc_chip_present()
         elif self._random_mode:
             self.leds.nfc_random_active()
@@ -2268,6 +2370,9 @@ class Kakabox:
         # löscht Playlist + Player-State, danach ist er für die "Wie heißt
         # dieses Lied?"-Antwort nicht mehr abrufbar.
         saved_title: Optional[str] = None
+        # Vollständiger Wiedergabe-Snapshot, um nach der Titel-Frage EXAKT dasselbe
+        # Lied an derselben Position fortzusetzen (statt Reshuffle/Neustart).
+        saved_session: Optional[dict] = None
         with self._playlist_lock:
             if self._current_playlist:
                 saved_track_index = self._current_playlist.current_index
@@ -2276,6 +2381,26 @@ class Kakabox:
                     saved_position = self.player.current_position_seconds()
                 except Exception:
                     saved_position = 0.0
+                # Quelle/kaka_id für die Session-Callbacks aus dem aktiven Modus.
+                if self._active_tag_uid:
+                    _src = "kaka"
+                    _kid = ((self._tag_cache.get(self._active_tag_uid) or {}).get("kaka") or {}).get("id")
+                elif self._voice_mode:
+                    _src, _kid = "voice", None
+                else:
+                    _src, _kid = "manual", None
+                saved_session = {
+                    "contents": self._current_playlist.contents_snapshot(),
+                    "index": saved_track_index,
+                    "position": saved_position,
+                    "source": _src,
+                    "kaka_id": _kid,
+                    "tag_uid": self._active_tag_uid,
+                    "random_mode": self._random_mode,
+                    "voice_mode": self._voice_mode,
+                    "voice_pending": self._voice_pending_tag_uid,
+                    "voice_target": self._voice_last_target,
+                }
         recovered = False  # True sobald entweder ein neuer Track läuft oder wir resumed haben
 
         def _restore_previous(reason: str) -> None:
@@ -2363,7 +2488,11 @@ class Kakabox:
                 else:
                     self._play_prompt("voice_no_title.wav")
                     self.player.wait_until_idle(timeout=4.0)
-                _restore_previous("titel-frage beantwortet")
+                # EXAKT dasselbe Lied an derselben Position fortsetzen (User-
+                # Wunsch: weiterspielen, nicht das nächste / nicht neu mischen).
+                # Fällt das aus (kein Snapshot), regulärer Restore als Fallback.
+                if not self._resume_in_place(saved_session):
+                    _restore_previous("titel-frage beantwortet")
                 recovered = True
                 return
 

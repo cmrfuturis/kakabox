@@ -343,6 +343,15 @@ class Playlist:
         content = self._current_content()
         return content.title if content else None
 
+    def contents_snapshot(self) -> list:
+        """Kopie der aktuellen Track-Liste (in Abspiel-Reihenfolge).
+
+        Ermöglicht ein exaktes "an dieser Stelle fortsetzen": dieselbe Liste +
+        ``current_index`` rekonstruiert die identische Playlist (z.B. nach der
+        Titel-Frage, damit dasselbe Lied weiterläuft statt neu zu mischen).
+        """
+        return list(self._contents)
+
     def _emit_track_start(self, content: KakaContent) -> None:
         if self._on_track_start is None:
             return
