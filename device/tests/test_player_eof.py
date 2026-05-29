@@ -25,6 +25,7 @@ def _make_player():
     p._volume_before_prompt = None
     p._on_track_end = None
     p._play_gen = 0
+    p._playing_since = 0.0
     return p
 
 
@@ -36,11 +37,11 @@ def test_normal_track_end_fires_callback():
     p._play_gen = 1
     p._state.playing = True
     prev_idle, gen = True, 0
-    # idle=False → playing_gen merkt sich die laufende Generation.
-    prev_idle, gen = p._eof_step(False, prev_idle, gen)
+    # idle=False → playing_gen merkt sich die laufende Generation (Start bei now=0).
+    prev_idle, gen = p._eof_step(False, prev_idle, gen, now=0.0)
     assert (prev_idle, gen) == (False, 1)
-    # idle=True bei gleicher Generation → echtes Track-Ende.
-    prev_idle, gen = p._eof_step(True, prev_idle, gen)
+    # idle=True bei gleicher Generation, 5s gespielt → echtes Track-Ende.
+    prev_idle, gen = p._eof_step(True, prev_idle, gen, now=5.0)
     assert p._state.playing is False
     assert calls == [1]
 
@@ -54,17 +55,17 @@ def test_resume_after_prompt_not_wiped():
     p._on_track_end = lambda: calls.append(1)
     p._play_gen = 1
     p._state.playing = True
-    prev_idle, gen = p._eof_step(False, True, 0)  # Prompt spielt → playing_gen=1
+    prev_idle, gen = p._eof_step(False, True, 0, now=0.0)  # Prompt spielt → playing_gen=1
     # Resume-Track startet (play_file erhöht gen):
     p._play_gen = 2
     p._state.playing = True
     # EOF sieht jetzt die (noch) idle-Phase, aber Generation hat sich geändert:
-    prev_idle, gen = p._eof_step(True, prev_idle, gen)
+    prev_idle, gen = p._eof_step(True, prev_idle, gen, now=0.1)
     assert p._state.playing is True          # Resume bleibt am Leben
     assert calls == []                        # kein falsches Track-Ende
     # Wenn der Resume-Track später WIRKLICH endet, greift es korrekt:
-    prev_idle, gen = p._eof_step(False, prev_idle, gen)  # Resume spielt → playing_gen=2
-    prev_idle, gen = p._eof_step(True, prev_idle, gen)   # Resume endet
+    prev_idle, gen = p._eof_step(False, prev_idle, gen, now=1.0)  # Resume spielt → playing_gen=2, Start now=1.0
+    prev_idle, gen = p._eof_step(True, prev_idle, gen, now=3.0)   # 2s gespielt → Resume endet
     assert p._state.playing is False
     assert calls == [1]
 
@@ -79,12 +80,39 @@ def test_prompt_end_restores_volume_and_suppresses_callback():
     p._volume_before_prompt = 65
     p._play_gen = 1
     p._state.playing = True
-    prev_idle, gen = p._eof_step(False, True, 0)   # Prompt spielt
-    prev_idle, gen = p._eof_step(True, prev_idle, gen)  # Prompt endet (gleiche gen)
+    prev_idle, gen = p._eof_step(False, True, 0, now=0.0)   # Prompt spielt
+    # Prompt endet schon nach 0.1s — Prompts sind vom MIN_PLAY_SECONDS-Schutz
+    # AUSGENOMMEN, das Ende greift also trotzdem (sonst bliebe die Lautstärke
+    # auf Prompt-Pegel hängen).
+    prev_idle, gen = p._eof_step(True, prev_idle, gen, now=0.1)
     assert p._state.playing is False
     assert p._prompt_active is False
     assert p._mpv.volume == 65       # User-Lautstärke zurück
     assert calls == []               # Prompt triggert keine Playlist-Logik
+
+
+def test_premature_track_end_suppressed():
+    # Race/Glitch: ein Musik-Track "endet" <MIN_PLAY_SECONDS nach Start (z.B.
+    # veralteter idle-Read direkt nach play, oder 250ms-Idle-Glitch der
+    # Soundkarte). Das darf KEIN echtes Track-Ende sein — sonst überspielt z.B.
+    # der Voice-Continue/Random den gerade gewählten Einzeltitel.
+    from audio.player import MIN_PLAY_SECONDS
+    assert MIN_PLAY_SECONDS >= 0.5  # Schutzfenster muss die Race (~0.2s) abdecken
+    p = _make_player()
+    calls = []
+    p._on_track_end = lambda: calls.append(1)
+    p._play_gen = 1
+    p._state.playing = True
+    prev_idle, gen = p._eof_step(False, True, 0, now=0.0)        # Track läuft an (Start now=0)
+    # idle schon 0.2s später → verfrüht, wird verworfen:
+    prev_idle, gen = p._eof_step(True, prev_idle, gen, now=0.2)
+    assert p._state.playing is True       # NICHT entwertet
+    assert calls == []                    # kein falsches Track-Ende
+    # Track spielt weiter und endet später WIRKLICH (>MIN gespielt):
+    prev_idle, gen = p._eof_step(False, prev_idle, gen, now=0.4)
+    prev_idle, gen = p._eof_step(True, prev_idle, gen, now=2.0)
+    assert p._state.playing is False
+    assert calls == [1]
 
 
 def test_paused_does_not_fire():

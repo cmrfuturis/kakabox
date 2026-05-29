@@ -27,6 +27,11 @@ class _FakeRecorder:
 def _wire(box, transcript=None, recorder=None):
     box.leds = None
     box._mic_recorder = recorder or _FakeRecorder()
+    # Primärer Zauberwort-Pfad: schneller Vosk-Keyword-Erkenner (nimmt grammar).
+    box._magic_word_recognizer = types.SimpleNamespace(
+        transcribe_wav=lambda w, grammar=None: transcript
+    )
+    # Whisper-Fallback (ohne grammar) — greift nur, wenn _magic_word_recognizer None ist.
     box._recognizer = types.SimpleNamespace(transcribe_wav=lambda w: transcript)
     box._play_prompt = lambda *a, **k: None
     box.player = types.SimpleNamespace(wait_until_idle=lambda **k: None)
@@ -64,3 +69,11 @@ def test_await_zauberwort_false_on_recorder_error():
     rec = _FakeRecorder(raises=main.RecorderError("kein Mic"))
     box = _wire(_bare_box(), transcript="bitte", recorder=rec)
     assert box._await_zauberwort() is False
+
+
+def test_await_zauberwort_fallback_to_whisper_without_vosk():
+    # Ohne Vosk-Keyword-Erkenner fällt die Prüfung auf den Haupt-Recognizer
+    # (Whisper) zurück — das Gate funktioniert auch ohne Vosk.
+    box = _wire(_bare_box(), transcript="ja bitte")
+    box._magic_word_recognizer = None
+    assert box._await_zauberwort() is True

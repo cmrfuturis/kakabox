@@ -17,6 +17,17 @@ logger = logging.getLogger(__name__)
 # müssen einen anderen Weg finden (z.B. mpv af=astats).
 AUDIO_DEVICE = "alsa/plughw:CARD=sndrpigooglevoi,DEV=0"
 
+# Mindest-Spielzeit, bevor ein "mpv idle" als echtes Track-Ende zählt. Direkt
+# nach play() kann der EOF-Watcher einen veralteten idle-Read sehen (Race mit
+# dem gerade frisch gestarteten Track) ODER die Soundkarte glitcht kurz auf
+# idle ("250ms-idle" auf dem googlevoicehat). Ein Musik-Track, der <MIN_PLAY_
+# SECONDS nach Start "endet", ist daher KEIN echtes Ende → wird verworfen.
+# Symptom ohne diesen Schutz: ein per Voice gestarteter Einzeltitel ([1/1])
+# wird im selben Moment als beendet gewertet → Voice-Continue → Random-Modus
+# überspielt das gerade gewählte Lied. Prompts sind AUSGENOMMEN (dürfen kurz
+# sein und brauchen ihr Ende für den Lautstärke-Restore).
+MIN_PLAY_SECONDS = 1.0
+
 
 @dataclass
 class PlaybackState:
@@ -58,6 +69,10 @@ class Player:
         # Titel-Ansage) durch die noch "idle" stehende mpv-Phase fälschlich als
         # beendet gewertet und entwertet wird.
         self._play_gen: int = 0
+        # Zeitpunkt (monotonic), zu dem die aktuell laufende Generation als
+        # spielend (idle=False) gesehen wurde — Basis für den MIN_PLAY_SECONDS-
+        # Schutz im EOF-Watcher gegen verfrühte/fälschliche Track-Enden.
+        self._playing_since: float = 0.0
 
         # Track-Ende-Erkennung via Polling auf idle-active. Robuster als der
         # eof-reached Property-Observer (der nach play() nicht zuverlässig feuerte
@@ -334,18 +349,36 @@ class Player:
             prev_idle, playing_gen = self._eof_step(idle, prev_idle, playing_gen)
             time.sleep(0.2)
 
-    def _eof_step(self, idle: bool, prev_idle: bool, playing_gen: int) -> tuple[bool, int]:
+    def _eof_step(self, idle: bool, prev_idle: bool, playing_gen: int,
+                  now: float | None = None) -> tuple[bool, int]:
         """Eine Iteration der Track-Ende-Erkennung. Gibt (prev_idle, playing_gen)
         für die nächste Iteration zurück.
 
         Ausgelagert aus ``_eof_watch_loop`` für deterministische Unit-Tests der
-        Generation-Logik (Race TTS-Prompt-Ende ↔ Musik-Resume).
+        Generation-Logik (Race TTS-Prompt-Ende ↔ Musik-Resume). ``now`` ist für
+        Tests injizierbar; sonst monotone Zeit.
         """
+        if now is None:
+            now = time.monotonic()
         if not idle:
-            # Ein Track läuft → seine Generation merken.
+            # Ein Track läuft → seine Generation merken. Wechselt die Generation
+            # (neuer Track gerade angelaufen), den Startzeitpunkt festhalten.
+            if playing_gen != self._play_gen:
+                self._playing_since = now
             playing_gen = self._play_gen
         elif (not prev_idle and self._state.playing and not self._state.paused
               and playing_gen == self._play_gen):
+            # Glitch-/Race-Schutz: Ein MUSIK-Track, der <MIN_PLAY_SECONDS nach
+            # Start "endet", ist ein veralteter idle-Read direkt nach play() oder
+            # ein kurzes Soundkarten-Idle-Glitch — KEIN echtes Ende. Verwerfen,
+            # der Track läuft weiter; das echte Ende kommt später (elapsed>=MIN).
+            # Prompts ausgenommen (kurz erlaubt, brauchen Ende für Volume-Restore).
+            if not self._prompt_active and (now - self._playing_since) < MIN_PLAY_SECONDS:
+                logger.debug(
+                    "Track-Ende verworfen — nur %.2fs gespielt (Race/Glitch-Schutz).",
+                    now - self._playing_since,
+                )
+                return idle, playing_gen
             # Übergang Playing → Idle für DIESELBE Generation = echtes Track-Ende.
             self._state.playing = False
             self._state.current_track = None

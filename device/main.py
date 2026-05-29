@@ -54,7 +54,7 @@ from hardware.nfc import PN532
 from hardware.rotary_encoder import Encoder as RotaryEncoder
 from network import Backend, BackendError
 from network.play_sessions import PlaySessionReporter
-from voice.asr import VoiceUnavailable, build_recognizer
+from voice.asr import Recognizer, VoiceUnavailable, build_recognizer
 from voice.catalog import build_catalog_from_file, build_title_map_from_file
 from voice.intent import (
     Candidate,
@@ -128,7 +128,11 @@ SPEED_MAX = 2.0
 # damit längere Sätze möglich sind aber die Box nicht endlos wartet, wenn
 # jemand nichts sagt.
 VOICE_MAX_SECONDS = 7.0
-VOICE_SILENCE_SECONDS = 2.0
+VOICE_SILENCE_SECONDS = 1.0  # Nachlauf-Stille nach dem Sprechen, bis die
+                             # Aufnahme abbricht. 1s statt früher 2s → jeder
+                             # Befehl ~1s schneller. Schneidet nur Stille weg,
+                             # keine Wörter (Sprache setzt den Stille-Zähler
+                             # zurück, siehe recorder.py Hold-Zone).
 VOICE_INITIAL_SILENCE_SECONDS = 3.0  # nichts gesagt nach 3s → Abbruch
 # Follow-up-Aufnahme für die Zauberwort-Rückfrage ("Wie heißt das Zauberwort?"):
 # kurze Nachlauf-Stille, damit nach erkanntem "bitte" praktisch sofort gestartet
@@ -464,6 +468,22 @@ class Kakabox:
         # transcribe_wav als Fallback aktiv und der echte Push-to-Talk wirft den
         # Fehler dann sichtbar.
         self._recognizer = build_recognizer(self.config.get("voice"))
+        # Schneller Keyword-Erkenner NUR fürs Zauberwort "bitte": Vosk (Kaldi,
+        # streamt → ~1s) statt Whisper (fixe ~3.3s pro 30s-Encoder-Fenster, egal
+        # wie kurz der Clip). Das Zauberwort ist EIN häufiges Wort — dafür ist
+        # Vosk-small völlig ausreichend und spart bei der Rückfrage ~2s. Backend
+        # bleibt sonst Whisper; nur der Zauberwort-Check geht über diesen Vosk.
+        # Modellpfad aus dem vosk-Block der config (Default greift sonst).
+        _vosk_cfg = dict((self.config.get("voice") or {}).get("vosk") or {})
+        if "model_dir" in _vosk_cfg:
+            _vosk_cfg["model_dir"] = Path(_vosk_cfg["model_dir"])
+        try:
+            self._magic_word_recognizer: Optional[Recognizer] = Recognizer(
+                backend="vosk", **_vosk_cfg
+            )
+        except Exception as e:
+            logger.info("Magic-Word-Vosk nicht verfügbar (%s) — Whisper-Fallback.", e)
+            self._magic_word_recognizer = None
         # TTS für die Titel-Ansage ("Wie heißt dieses Lied?"). Piper primär,
         # espeak-ng-Fallback, beides lazy/optional — fehlt das Modell, bleibt
         # die Box voll funktionsfähig und sagt einen festen Prompt an. Stimme
@@ -2398,6 +2418,17 @@ class Kakabox:
             # ein Modell-Lade-Crash NIE den Box-Start kaputt macht.
             logger.exception("ASR-Warmup unerwartet fehlgeschlagen")
 
+        # Vosk-Keyword-Modell fürs Zauberwort vorab laden — sonst zahlt die erste
+        # "bitte"-Rückfrage den einmaligen ~1-3s Modell-Load. Best-effort.
+        if self._magic_word_recognizer is not None:
+            try:
+                self._magic_word_recognizer.warmup()
+                logger.info("Zauberwort-ASR (vosk) vorgeladen.")
+            except VoiceUnavailable as e:
+                logger.info("Zauberwort-ASR-Warmup übersprungen: %s", e)
+            except Exception:
+                logger.exception("Zauberwort-ASR-Warmup fehlgeschlagen")
+
         # TTS separat — eigener try, damit ein TTS-Problem das ASR-Warmup-Log
         # nicht verschluckt. TitleSpeaker.warmup schluckt seine Fehler selbst.
         t1 = time.monotonic()
@@ -2711,13 +2742,33 @@ class Kakabox:
         except RecorderError as e:
             logger.warning("Zauberwort-Aufnahme fehlgeschlagen: %s", e)
             return False
+        return self._detect_magic_word(wav)
+
+    def _detect_magic_word(self, wav) -> bool:
+        """Prüft schnell, ob "bitte" in der Aufnahme steckt.
+
+        Nutzt den leichten Vosk-Keyword-Erkenner mit Grammar nur ``["bitte"]``
+        (~1s) statt der vollen Whisper-Transkription (~3.3s, fixes 30s-Fenster).
+        Vosk-small erkennt das eine, häufige Wort sehr zuverlässig. Fällt Vosk
+        aus (Paket/Modell fehlt), Fallback auf den Haupt-Recognizer (Whisper),
+        damit das Zauberwort-Gate auch ohne Vosk funktioniert.
+        """
+        if self._magic_word_recognizer is not None:
+            try:
+                text = self._magic_word_recognizer.transcribe_wav(wav, grammar=["bitte"])
+                logger.info("Zauberwort-Check (vosk): «%s»", text)
+                return has_magic_word(text)
+            except VoiceUnavailable as e:
+                logger.info("Vosk-Zauberwort nicht verfügbar (%s) → Whisper-Fallback.", e)
+            except Exception:
+                logger.exception("Vosk-Zauberwort-Check fehlgeschlagen → Whisper-Fallback.")
         try:
             text = self._recognizer.transcribe_wav(wav)
+            logger.info("Zauberwort-Antwort (whisper): «%s»", text)
+            return has_magic_word(text)
         except VoiceUnavailable as e:
             logger.warning("ASR (Zauberwort) nicht verfügbar: %s", e)
             return False
-        logger.info("Zauberwort-Antwort: «%s»", text)
-        return has_magic_word(text)
 
     def _stop_for_voice(self) -> None:
         """Räumt vor der Aufnahme: laufende Playlist stoppen, Tag-State leeren.
