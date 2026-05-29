@@ -78,7 +78,15 @@ HEARTBEAT_INTERVAL = 30
 AUDIO_SYNC_INTERVAL = 300  # 5 Minuten
 SYNC_RETRY_BACKOFF_SECONDS = 3600  # 1h: failed Downloads nicht jeden Zyklus retry'en
                                    # (verhindert Log-Spam bei kaputten Backend-Storage-IDs)
-TAG_REMOVAL_THRESHOLD = 2  # NFC: aufeinanderfolgende Leer-Reads bis "Chip entfernt"
+TAG_REMOVAL_THRESHOLD = 5  # NFC: aufeinanderfolgende Leer-Reads bis "Chip entfernt".
+                           # Bei ~0.25s/Poll = ~1.25s. Vorher 2 (~0.5s) → ein
+                           # physisch aufliegender Chip, der nur intermittierend
+                           # liest (PN532-Glitch), wurde ständig fälschlich als
+                           # "entfernt" gewertet → Stop/Start-Schleife (Musik
+                           # bricht ab) UND der Hintergrund-Refresh (neue Lieder
+                           # + Orange-Animation) wurde abgebrochen, bevor er
+                           # durchlief. Höhere Schwelle toleriert Lese-Aussetzer;
+                           # echtes Abnehmen wird ~1.25s später erkannt (ok).
 
 # Geheimer Speed-Mode (Easter Egg): 4× Encoder-Push in 3s während Wiedergabe →
 # danach steuert der Encoder die Wiedergabegeschwindigkeit statt Lautstärke.
