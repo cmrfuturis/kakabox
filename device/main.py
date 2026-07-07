@@ -36,6 +36,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -2936,56 +2937,108 @@ class Kakabox:
             # Voice wäre bis zum Reboot tot).
 
     def _save_voice_sample(self, rec, transcript, route) -> None:
-        """Stufe-0-Testset-Aufbau (ASR-Plan): Voice-Aufnahme + Metadaten behalten.
+        """Persistiert eine Voice-Aufnahme — zwei unabhängige Senken:
 
-        Nur aktiv mit ``voice.keep_samples: true`` in config.json — Default AUS
-        (Kinder-Stimmdaten!). Samples bleiben lokal unter device/voice_samples/
-        (per .gitignore ausgeschlossen, landet nie in Git oder Backups) und
-        werden nach ``voice.samples_keep_days`` (Default 14) automatisch
-        gelöscht. Pro Sample eine Sidecar-JSON mit Live-Transkript und
-        Routing-Ergebnis — beim Labeln wird dann nur korrigiert statt neu
-        getippt. Best-effort: Fehler hier dürfen den Voice-Flow nie brechen.
+        - ``voice.keep_samples`` (Default AUS): lokales Stufe-0-Testset unter
+          device/voice_samples/ (gitignored, N-Tage-Retention) inkl. Sidecar-
+          JSON zum Labeln. Behält ALLE Aufnahmen (auch no_speech — die braucht
+          die VAD-Kalibrierung).
+        - ``voice.upload_commands`` (Default AUS): Upload nach kakaland zum
+          Ansehen/Abhören in der Webapp. Nur Aufnahmen MIT erkannter Sprache
+          (kein Zuspammen der Liste mit versehentlichen Knopfdrücken).
+
+        Kinder-Stimmdaten → beide Defaults AUS. Best-effort: Fehler hier dürfen
+        den Voice-Flow nie brechen.
         """
         cfg = self.config.get("voice") or {}
-        if not cfg.get("keep_samples", False):
+        keep = bool(cfg.get("keep_samples", False))
+        upload = bool(cfg.get("upload_commands", False))
+        if not keep and not upload:
             return
-        try:
-            samples_dir = Path(__file__).parent / "voice_samples"
-            samples_dir.mkdir(exist_ok=True)
-            # Retention: Alt-Samples beim nächsten Schreiben wegräumen.
-            keep_days = float(cfg.get("samples_keep_days", 14))
-            cutoff = time.time() - keep_days * 86400
-            for old in samples_dir.iterdir():
-                try:
-                    if old.is_file() and old.stat().st_mtime < cutoff:
-                        old.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            ts = time.strftime("%Y%m%d-%H%M%S")
-            stem = samples_dir / f"sample-{ts}"
-            shutil.copyfile(rec.path, stem.with_suffix(".wav"))
-            cmd = route.command if route is not None else None
-            meta = {
-                "recorded_at": ts,
-                "duration_seconds": round(rec.duration_seconds, 2),
-                "speech_seen": rec.speech_seen,
-                "transcript": transcript,
-                "action": route.action if route is not None else "no_speech",
-                "matched": {
-                    "name": cmd.target.name,
-                    "kind": cmd.target.kind,
-                    "id": cmd.target.id,
-                    "score": round(cmd.score, 3),
-                    "margin": round(cmd.margin, 3),
-                } if cmd is not None else None,
-                # Zum Labeln ergänzen: ground_truth_text, expected_intent,
-                # expected_song_id, alter, distanz (siehe tools/eval_voice.py).
-            }
-            stem.with_suffix(".json").write_text(
-                json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8",
-            )
-        except Exception as e:
-            logger.warning("Voice-Sample nicht gespeichert: %s", e)
+        cmd = route.command if route is not None else None
+        action = route.action if route is not None else "no_speech"
+
+        if keep:
+            try:
+                samples_dir = Path(__file__).parent / "voice_samples"
+                samples_dir.mkdir(exist_ok=True)
+                # Retention: Alt-Samples beim nächsten Schreiben wegräumen.
+                keep_days = float(cfg.get("samples_keep_days", 14))
+                cutoff = time.time() - keep_days * 86400
+                for old in samples_dir.iterdir():
+                    try:
+                        if old.is_file() and old.stat().st_mtime < cutoff:
+                            old.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                stem = samples_dir / f"sample-{ts}"
+                shutil.copyfile(rec.path, stem.with_suffix(".wav"))
+                meta = {
+                    "recorded_at": ts,
+                    "duration_seconds": round(rec.duration_seconds, 2),
+                    "speech_seen": rec.speech_seen,
+                    "transcript": transcript,
+                    "action": action,
+                    "matched": {
+                        "name": cmd.target.name,
+                        "kind": cmd.target.kind,
+                        "id": cmd.target.id,
+                        "score": round(cmd.score, 3),
+                        "margin": round(cmd.margin, 3),
+                    } if cmd is not None else None,
+                    # Zum Labeln ergänzen: ground_truth_text, expected_intent,
+                    # expected_song_id, alter, distanz (siehe tools/eval_voice.py).
+                }
+                stem.with_suffix(".json").write_text(
+                    json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8",
+                )
+            except Exception as e:
+                logger.warning("Voice-Sample nicht gespeichert: %s", e)
+
+        if upload and rec.speech_seen and self.backend and self.backend.is_connected:
+            try:
+                # matched_content_id nur bei echtem Einzeltitel-Treffer — Artist/
+                # Genre sind Sammlungen, kein einzelnes "erkanntes Lied".
+                matched_content_id = None
+                if cmd is not None and cmd.target.kind == "track" and cmd.target.content_ids:
+                    matched_content_id = int(cmd.target.content_ids[0])
+                up_meta = {
+                    "transcript": transcript,
+                    "action": action,
+                    "matched_name": cmd.target.name if cmd is not None else None,
+                    "matched_kind": cmd.target.kind if cmd is not None else None,
+                    "matched_content_id": matched_content_id,
+                    "score": round(cmd.score, 3) if cmd is not None else None,
+                    "duration_seconds": round(rec.duration_seconds, 2),
+                    "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+                # Stabile Kopie: rec.path (/tmp/kakabox_ptt.wav) wird beim
+                # nächsten Befehl überschrieben — der Upload-Thread überlebt aber
+                # die Lock-Freigabe. Kopie im Thread nach dem Upload löschen.
+                upload_wav = None
+                if rec.path and Path(rec.path).is_file():
+                    fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="vc-upload-")
+                    os.close(fd)
+                    shutil.copyfile(rec.path, tmp)
+                    upload_wav = tmp
+
+                def _do_upload(path, meta):
+                    try:
+                        self.backend.upload_voice_command(path or "", meta)
+                    finally:
+                        if path:
+                            try:
+                                os.unlink(path)
+                            except OSError:
+                                pass
+
+                threading.Thread(
+                    target=_do_upload, args=(upload_wav, up_meta),
+                    daemon=True, name="vc-upload",
+                ).start()
+            except Exception as e:
+                logger.warning("Voice-Command-Upload nicht gestartet: %s", e)
 
     def _await_zauberwort(self) -> bool:
         """Spielt "Wie heißt das Zauberwort?" und lauscht ein zweites Mal.

@@ -188,3 +188,57 @@ def test_play_session_401_clears_local_token(backend, identity_path):
     assert backend.play_session({"source": "kaka"}) is False
     saved = json.loads(identity_path.read_text())
     assert saved["api_token"] is None
+
+
+@responses.activate
+def test_upload_voice_command_sends_audio_and_meta(backend, tmp_path):
+    """Der Box-Upload-Vertrag: WAV als multipart 'audio' + Metadaten als
+    Form-Felder, None-Werte rausgefiltert (kein literales 'None')."""
+    responses.post("https://test/api/box/voice-command",
+                   json={"status": "ok", "id": 5}, status=201)
+    wav = tmp_path / "cmd.wav"
+    wav.write_bytes(b"RIFF....WAVEdata")
+
+    ok = backend.upload_voice_command(wav, {
+        "transcript": "spiele bibi",
+        "action": "play",
+        "matched_name": "Bibi & Tina",
+        "matched_kind": "artist",
+        "matched_content_id": None,   # muss NICHT als Feld gesendet werden
+        "duration_seconds": 3.1,
+        "recorded_at": "2026-07-07T22:30:00",
+    })
+
+    assert ok is True
+    req = responses.calls[0].request
+    assert req.headers["Authorization"] == "Bearer test-plain-token"
+    body = req.body  # multipart
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    assert 'name="audio"' in body
+    assert "spiele bibi" in body
+    assert 'name="matched_content_id"' not in body  # None gefiltert
+
+
+@responses.activate
+def test_upload_voice_command_without_audio_sends_meta_only(backend, tmp_path):
+    responses.post("https://test/api/box/voice-command",
+                   json={"status": "ok", "id": 6}, status=201)
+    missing = tmp_path / "gibtsnicht.wav"
+
+    ok = backend.upload_voice_command(missing, {"action": "no_match", "transcript": "häää"})
+
+    assert ok is True
+    body = responses.calls[0].request.body
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    assert 'name="audio"' not in body
+    assert "no_match" in body
+
+
+def test_upload_voice_command_offline_returns_false(tmp_path):
+    from network.backend import Backend
+    p = tmp_path / "id.json"
+    p.write_text('{"serial_number":"S","activation_code":"C","registered_at":"pending"}')
+    b = Backend(identity_path=p, base_url="https://test")   # kein api_token → offline
+    assert b.upload_voice_command(tmp_path / "x.wav", {"action": "play"}) is False

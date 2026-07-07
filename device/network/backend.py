@@ -306,6 +306,45 @@ class Backend:
             return False
         return resp.ok
 
+    def upload_voice_command(self, wav_path: Path, meta: dict[str, Any]) -> bool:
+        """Lädt einen aufgenommenen Sprachbefehl (WAV + Metadaten) zur Ansicht/
+        zum Abhören in die Webapp hoch. Best-effort: bei fehlendem Netz/Token
+        einfach False — der Voice-Flow darf davon nie abhängen.
+
+        ``meta``-Felder: transcript, action, matched_name, matched_kind,
+        matched_content_id, score, duration_seconds, recorded_at.
+        """
+        if not self.is_connected:
+            return False
+        # None-Werte rauswerfen — der Server validiert 'nullable', aber ein
+        # multipart-Feld mit literalem "None" wäre ein String, kein Null.
+        data = {k: v for k, v in meta.items() if v is not None}
+        try:
+            wav_path = Path(wav_path)
+            if wav_path.is_file():
+                with wav_path.open("rb") as fh:
+                    resp = self._session.post(
+                        f"{self._base_url}/api/box/voice-command",
+                        data=data,
+                        files={"audio": ("command.wav", fh, "audio/wav")},
+                        headers=self._auth_headers(),
+                        timeout=DEFAULT_DOWNLOAD_TIMEOUT,
+                    )
+            else:
+                # Kein Audio (z.B. VAD sah keine Sprache) — nur Metadaten.
+                resp = self._session.post(
+                    f"{self._base_url}/api/box/voice-command",
+                    data=data,
+                    headers=self._auth_headers(),
+                    timeout=self._timeout,
+                )
+        except requests.RequestException as e:
+            logger.warning("upload_voice_command transport error: %s", e)
+            return False
+        if not resp.ok:
+            logger.debug("upload_voice_command: HTTP %s", resp.status_code)
+        return resp.ok
+
     def report_storage(self, total_mb: int, free_mb: int) -> bool:
         if not self.is_connected:
             return False
