@@ -411,3 +411,38 @@ def test_jump_skips_unavailable_track_without_wrapping_to_first(cache):
     pl.on_track_end()                  # Track 2 fehlt → weiter auf Track 3
     assert player.played[-1] == cache.path_for(3)
     assert pl.current_index == 2
+
+
+def test_ensure_local_downloads_only_once_under_concurrent_access(cache):
+    """Regression für den P0-Fix vom 2026-07-07: Sync-Loop und Prefetch-Thread
+    riefen früher beide _download_fn für dieselbe content_id auf, wenn sie
+    gleichzeitig feststellten "noch nicht gecacht" — das korrumpierte den
+    gemeinsamen .part-Tempfile. Der download_guard-Lock in AudioCache stellt
+    sicher, dass nur einer tatsächlich lädt; der zweite findet die Datei
+    danach schon vor."""
+    backend = FakeBackend()
+    backend.set_content(1, b"alpha")
+    player = FakePlayer()
+    content = _make_content(1, b"alpha")
+
+    pl = Playlist(
+        contents=[content],
+        cache=cache,
+        download_fn=backend.download,
+        play_fn=player.play,
+        stop_fn=player.stop,
+    )
+
+    results: list[Path | None] = []
+
+    def call_ensure_local():
+        results.append(pl._ensure_local(content, blocking=True))
+
+    threads = [threading.Thread(target=call_ensure_local) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=2)
+
+    assert backend.calls == [1]  # genau EIN tatsächlicher Download-Versuch
+    assert all(r == cache.path_for(1) for r in results)

@@ -12,7 +12,20 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Sequence
+
+# Optionale Matching-Verstärker (ASR-Plan 2026-07-07, Stufe 1.7). Beide sind
+# pure-Python-freundlich installierbar; fehlen sie, fällt das Matching still
+# auf das bewährte difflib-Verhalten zurück — die Box bricht nie deswegen.
+try:
+    from rapidfuzz import fuzz as _rf_fuzz  # type: ignore
+except ImportError:  # pragma: no cover - Umgebung ohne rapidfuzz
+    _rf_fuzz = None
+try:
+    import cologne_phonetics as _cologne  # type: ignore
+except ImportError:  # pragma: no cover - Umgebung ohne cologne-phonetics
+    _cologne = None
 
 # Verben, die Wiedergabe anstoßen. Stamm-Match ("spiel*") deckt Konjugationen ab.
 _PLAY_VERB_STEMS = ("spiel", "abspiel", "play")
@@ -71,6 +84,10 @@ class PlayCommand:
     score: float       # 0.0–1.0, höher = besser passend
     raw_text: str      # Original-Transkript
     query: str         # extrahiertes Entity-Fragment
+    # Abstand zum zweitbesten Kandidaten (1.0 = konkurrenzlos). Kleine Margin
+    # = mehrdeutiger Treffer — Grundlage für den späteren Rückfrage-Flow
+    # ("Meinst du X?"). Wird vorerst nur geloggt, nicht gegatet.
+    margin: float = 1.0
 
 
 def _tokenize(text: str) -> list[str]:
@@ -212,22 +229,94 @@ def extract_query(text: str) -> str:
     return " ".join(keep).strip()
 
 
+# Ab welcher Query-Länge der Substring-Floor / die Fuzzy-/Phonetik-Verfahren
+# greifen. 2-Zeichen-Fragmente ("ja", "es", "da") matchen sonst als Wort-
+# Teilmenge unzähliger Titel — der live reproduzierte False-Positive
+# ("Ja." → "DIKKA – Na ja hier"). 3 Zeichen erlaubt kurze echte Titel ("Zug",
+# "Bus"), schließt die typischen Füllwörter aber aus.
+_MIN_MATCH_LEN = 3
+# Obergrenze für Fuzzy-/Phonetik-Treffer im Bare-Title-Modus (kein "spiele"
+# davor). Ein reiner Klang-/Token-Treffer soll den lockeren "spiele …"-
+# Threshold (0.55) schaffen, aber NICHT allein den strengen Bare-Title-
+# Threshold (0.70) — dort muss die Orthographie (_ratio) mitziehen. Ohne
+# diese Kappe startete "gegen" (Token in "Mädchen gegen Jungs") ein Lied.
+_BARE_TITLE_BOOST_CAP = 0.69
+
+
 def _ratio(query: str, name: str) -> float:
     """Ähnlichkeit zwischen ``query`` und ``name`` (0..1).
 
     SequenceMatcher.ratio() bestraft kurze Queries gegen lange Namen unfair
     ("bibi" vs "Bibi Blocksberg" → 0.42, obwohl die Query exakt enthalten
-    ist). Deshalb: bei Substring-Treffer liefern wir mindestens 0.85 zurück
-    (höher wenn die Query fast den ganzen Namen abdeckt). Sonst fallback auf
-    difflib für richtige Fuzzy-Logik (Buchstabendreher etc.).
+    ist). Deshalb: bei Substring-Treffer mindestens 0.85 — aber NUR wenn die
+    Query ≥ _MIN_MATCH_LEN Zeichen hat UND an einer Wortgrenze im Namen steht.
+    "bibi" → "Bibi & Tina - …" bleibt Volltreffer, "ja" (2 Zeichen) nicht.
+    Sonst fallback auf difflib für richtige Fuzzy-Logik (Buchstabendreher).
     """
     q = query.lower().strip()
     n = name.lower().strip()
     if not q or not n:
         return 0.0
-    if q in n:
+    if len(q) >= _MIN_MATCH_LEN and re.search(
+        rf"(?<![\wäöüß]){re.escape(q)}(?![\wäöüß])", n
+    ):
         return max(0.85, len(q) / len(n))
     return SequenceMatcher(None, q, n).ratio()
+
+
+@lru_cache(maxsize=2048)
+def _phonetic_codes(text: str) -> tuple[str, ...]:
+    """Kölner-Phonetik-Codes der Wörter in ``text`` (leere Codes gefiltert).
+
+    Gecacht (ASR-Plan 1.7): die ~160 Katalog-Namen+Aliase werden bei JEDEM
+    Voice-Befehl gescort — ohne Cache kostet das ~14 ms/Befehl reine
+    Neukodierung auf dem Pi 5 (gemessen). Die Codes sind statisch, der Cache
+    deckt Katalog- UND Query-Seite ab.
+    """
+    if _cologne is None:
+        return ()
+    try:
+        return tuple(code for _, code in _cologne.encode(text) if code)
+    except Exception:  # pragma: no cover - defensiv gegen Sonderzeichen-Edgecases
+        return ()
+
+
+def _score_pair(query: str, name: str, q_codes: tuple[str, ...], allow_boost: bool) -> float:
+    """Bester Score über drei Verfahren (ASR-Plan Stufe 1.7).
+
+    1. ``_ratio``: difflib + Wortgrenzen-Substring (Basis, immer aktiv).
+    2. rapidfuzz ``token_set_ratio``: robust gegen Wortreihenfolge/Zusatzwörter
+       ("blocksberg bibi" ↔ "Bibi Blocksberg").
+    3. Kölner Phonetik: fängt orthographisch ferne, klanggleiche Kinder-Fehler
+       ("Diga" ↔ "DIKKA", beide Code 24).
+
+    ``q_codes`` sind die vorab EINMAL berechneten Query-Phonetik-Codes (nicht
+    pro Kandidat neu — der Aufrufer reicht sie durch). ``allow_boost`` schaltet
+    Verfahren 2+3 nur im verb-bestätigten "spiele …"-Pfad voll frei; im Bare-
+    Title-Modus (kein Verb) werden sie auf ``_BARE_TITLE_BOOST_CAP`` gedeckelt,
+    damit ein reiner Klang-/Token-Treffer nicht ohne Orthographie ein Lied
+    startet. Verfahren 2+3 greifen erst ab ``_MIN_MATCH_LEN`` Zeichen.
+    """
+    score = _ratio(query, name)
+    if len(query) < _MIN_MATCH_LEN:
+        return score
+
+    cap = 1.0 if allow_boost else _BARE_TITLE_BOOST_CAP
+    if _rf_fuzz is not None:
+        boost = _rf_fuzz.token_set_ratio(query, name) / 100.0 * 0.97
+        score = max(score, min(boost, cap))
+    if q_codes:
+        n_codes = _phonetic_codes(name)
+        if n_codes:
+            if set(q_codes) <= set(n_codes):
+                # Alle Query-Wörter phonetisch im Namen enthalten.
+                boost = 0.90
+            else:
+                boost = SequenceMatcher(
+                    None, " ".join(q_codes), " ".join(n_codes)
+                ).ratio() * 0.90
+            score = max(score, min(boost, cap))
+    return score
 
 
 def parse_play_command(
@@ -259,15 +348,30 @@ def parse_play_command(
     if not query:
         return None
 
+    # Query-Phonetik EINMAL berechnen (nicht pro Kandidat × Alias neu — das
+    # kostete sonst messbar CPU pro Befehl). allow_boost=False im Bare-Title-
+    # Modus (kein Verb): dort deckelt _score_pair Fuzzy/Phonetik, damit ein
+    # reiner Klang-Treffer nicht ohne Orthographie ein Lied startet.
+    q_codes = _phonetic_codes(query) if len(query) >= _MIN_MATCH_LEN else ()
+    allow_boost = require_play_verb
+
     best: tuple[float, Candidate] | None = None
+    second_score = 0.0
     for cand in catalog:
         # Bester Score über Haupt-Name + alle Aliase. Aliase sind gleichwertig
         # zum Namen — wer "eiskönigin" sagt, soll genauso treffen wie "frozen".
-        score = _ratio(query, cand.name)
+        score = _score_pair(query, cand.name, q_codes, allow_boost)
         for alias in cand.aliases:
-            score = max(score, _ratio(query, alias))
+            score = max(score, _score_pair(query, alias, q_codes, allow_boost))
         if best is None or score > best[0]:
+            if best is not None:
+                second_score = max(second_score, best[0])
             best = (score, cand)
+        else:
+            second_score = max(second_score, score)
     if best is None or best[0] < threshold:
         return None
-    return PlayCommand(target=best[1], score=best[0], raw_text=text, query=query)
+    return PlayCommand(
+        target=best[1], score=best[0], raw_text=text, query=query,
+        margin=best[0] - second_score,
+    )

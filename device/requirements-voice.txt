@@ -14,6 +14,14 @@ vosk==0.3.45
 #   ~3–5 Min Build, danach läuft das Modell auf CPU mit 4 Threads.
 pywhispercpp==1.4.1
 #
+# --- Matching-Verstärker (ASR-Plan 2026-07-07, Stufe 1.7) ---
+#   rapidfuzz: token_set_ratio — robust gegen Wortreihenfolge/Zusatzwörter.
+#   cologne-phonetics: Kölner Phonetik — fängt phonetisch identische
+#   Kinder-Aussprachefehler ("Diga" ↔ "DIKKA"). Beide optional: intent.py
+#   importiert mit Fallback auf difflib-only, die Box bricht nie deswegen.
+rapidfuzz==3.14.5
+cologne-phonetics==2.0.0
+#
 # --- Piper-TTS (Sprachausgabe: "Wie heißt dieses Lied?") ---
 #   Fertiges aarch64-Wheel (kein Build), zieht onnxruntime mit (~16 MB).
 #   Modell de_DE-thorsten-medium.onnx(.json) nach /usr/share/kakabox/tts/.

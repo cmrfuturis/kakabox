@@ -38,3 +38,6 @@ device/voice_catalog.json
 
 # pytest cache
 .pytest_cache/
+
+# Voice-Samples (Kinder-Stimmdaten, Stufe-0-Testset — bleiben IMMER lokal)
+device/voice_samples/

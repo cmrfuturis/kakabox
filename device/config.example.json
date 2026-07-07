@@ -14,10 +14,17 @@
     "whisper": {
       "model_path": "/usr/share/kakabox/voice/ggml-tiny.bin",
       "language": "de",
-      "n_threads": 4
+      "n_threads": 4,
+      "beam_size": 5,
+      "dynamic_audio_ctx": true,
+      "single_segment": true,
+      "min_segment_probability": 0.4
     },
     "vosk": {
       "model_dir": "/usr/share/kakabox/voice/vosk-model-small-de-0.15"
-    }
+    },
+    "governor_boost": true,
+    "keep_samples": false,
+    "samples_keep_days": 14
   }
 }

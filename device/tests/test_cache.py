@@ -1,5 +1,7 @@
 """Tests für audio.cache.AudioCache."""
 import hashlib
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -62,3 +64,53 @@ def test_storage_stats_returns_positive(cache):
     total, free = cache.storage_stats_mb()
     assert total > 0
     assert 0 <= free <= total
+
+
+def test_download_guard_serializes_same_content_id(cache):
+    """Regression für den P0-Fix vom 2026-07-07: der Audio-Sync-Loop und die
+    Playlist-Prefetch-Threads dürfen denselben Content nie parallel
+    herunterladen (Race auf denselben .part-Tempfile)."""
+    order: list[str] = []
+    started = threading.Event()
+
+    def first():
+        with cache.download_guard(42):
+            order.append("first-enter")
+            started.set()
+            time.sleep(0.1)
+            order.append("first-exit")
+
+    def second():
+        started.wait()
+        with cache.download_guard(42):
+            order.append("second-enter")
+
+    t1 = threading.Thread(target=first)
+    t2 = threading.Thread(target=second)
+    t1.start()
+    t2.start()
+    t1.join(timeout=2)
+    t2.join(timeout=2)
+
+    assert order == ["first-enter", "first-exit", "second-enter"]
+
+
+def test_download_guard_does_not_serialize_different_content_ids(cache):
+    """Downloads verschiedener content_ids dürfen sich nicht gegenseitig blockieren."""
+    entered: list[int] = []
+    barrier = threading.Barrier(2, timeout=2)
+
+    def worker(content_id):
+        with cache.download_guard(content_id):
+            entered.append(content_id)
+            barrier.wait()  # blockiert nur, wenn BEIDE den Lock gleichzeitig halten
+
+    t1 = threading.Thread(target=worker, args=(1,))
+    t2 = threading.Thread(target=worker, args=(2,))
+    t1.start()
+    t2.start()
+    t1.join(timeout=2)
+    t2.join(timeout=2)
+
+    assert not t1.is_alive() and not t2.is_alive()
+    assert sorted(entered) == [1, 2]

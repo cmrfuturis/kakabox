@@ -9,8 +9,10 @@ import hashlib
 import logging
 import os
 import shutil
+import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 logger = logging.getLogger("kakabox.cache")
 
@@ -21,6 +23,28 @@ class AudioCache:
     def __init__(self, cache_dir: Path | None = None) -> None:
         self.dir = Path(cache_dir or DEFAULT_CACHE_DIR)
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._download_locks_guard = threading.Lock()
+        self._download_locks: dict[int, threading.Lock] = {}
+
+    @contextmanager
+    def download_guard(self, content_id: int) -> Iterator[None]:
+        """Serialisiert Downloads für dieselbe content_id.
+
+        Der Audio-Sync-Loop (main.py) und die Playlist-Prefetch-Threads können
+        denselben Content unabhängig voneinander als "fehlt lokal" erkennen und
+        beide einen Download starten. Ohne Koordination schreiben beide auf
+        denselben deterministischen ``.part``-Tempfile (siehe
+        ``Backend.download_audio``) — die Datei wird dadurch korrupt, der
+        SHA-256-Check danach schlägt fehl und der Song landet in der Backoff-
+        Sperre. Dieser Context-Manager stellt sicher, dass pro content_id
+        immer nur ein Download gleichzeitig läuft; Aufrufer sollten nach dem
+        Erwerb erneut ``is_cached()`` prüfen, da der wartende zweite Aufrufer
+        die Datei oft schon fertig geladen vorfindet.
+        """
+        with self._download_locks_guard:
+            lock = self._download_locks.setdefault(content_id, threading.Lock())
+        with lock:
+            yield
 
     def path_for(self, content_id: int) -> Path:
         return self.dir / f"{content_id}.mp3"

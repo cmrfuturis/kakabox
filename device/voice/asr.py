@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import wave
 from pathlib import Path
 from typing import Sequence
@@ -58,6 +59,10 @@ class VoskRecognizer:
         self._model_dir = Path(model_dir)
         self._sample_rate = sample_rate
         self._model = None  # type: ignore
+        # Schützt den Lazy-Load: Boot-Warmup-Thread und erster Push-to-Talk
+        # könnten sonst beide gleichzeitig ein volles Modell laden (siehe
+        # tts.py TitleSpeaker._load_lock für dasselbe Muster).
+        self._load_lock = threading.Lock()
 
     def warmup(self) -> None:
         """Lädt das Vosk-Modell in den RAM ohne KaldiRecognizer zu bauen.
@@ -66,20 +71,25 @@ class VoskRecognizer:
         Wirft VoiceUnavailable wie ``transcribe_wav``, wenn Paket oder Modell
         fehlen — der Aufrufer muss das fangen.
         """
-        try:
-            from vosk import Model  # type: ignore
-        except ImportError as e:
-            raise VoiceUnavailable(
-                "vosk-Paket fehlt. Installation: "
-                ".venv/bin/pip install -r device/requirements-voice.txt"
-            ) from e
+        # Double-checked: erst lockfrei (häufiger Fall: Modell schon geladen).
+        if self._model is not None:
+            return
+        with self._load_lock:
+            if self._model is not None:
+                return
+            try:
+                from vosk import Model  # type: ignore
+            except ImportError as e:
+                raise VoiceUnavailable(
+                    "vosk-Paket fehlt. Installation: "
+                    ".venv/bin/pip install -r device/requirements-voice.txt"
+                ) from e
 
-        if not self._model_dir.is_dir():
-            raise VoiceUnavailable(
-                f"Vosk-Modell nicht gefunden unter {self._model_dir}. "
-                "Siehe device/voice/README.md für Download-Anleitung."
-            )
-        if self._model is None:
+            if not self._model_dir.is_dir():
+                raise VoiceUnavailable(
+                    f"Vosk-Modell nicht gefunden unter {self._model_dir}. "
+                    "Siehe device/voice/README.md für Download-Anleitung."
+                )
             logger.info("Lade Vosk-Modell aus %s …", self._model_dir)
             self._model = Model(str(self._model_dir))
 
@@ -128,9 +138,34 @@ class WhisperRecognizer:
     Catalog-Namen, ohne hartes Vokabular zu erzwingen (Whisper-Grammar ist
     experimentell und fummelig). Bei zu langem Catalog wird der Prompt
     abgeschnitten (Whisper-Token-Limit für initial_prompt: ~224 Tokens).
+
+    Decoding-Tuning (ASR-Plan 2026-07-07, Stufe 1.1): whisper.cpp rechnet
+    per Default IMMER das volle 30-s-Encoder-Fenster — auch für ein 2-s-
+    Kommando. ``dynamic_audio_ctx`` begrenzt den Encoder-Kontext auf die
+    tatsächliche Audiodauer (~50 Frames/s + Puffer): live gemessen 6,7×
+    schneller (tiny, 3,1-s-Kommando: 5,2 s → 0,78 s). Der Gewinn macht
+    Beam-Search (``beam_size``, robuster bei schwierigen Sprechern —
+    Kinderstimmen!) überhaupt erst bezahlbar. ``single_segment`` verhindert
+    Segment-Splitting bei kurzen Kommandos.
+
+    Verifizierte pywhispercpp-1.4.1-Gotchas:
+    - ``beam_search`` wirkt NUR mit ``params_sampling_strategy=1`` im
+      Konstruktor (sonst stillschweigend ignoriert, Output = greedy).
+    - Das beam_search-Dict muss vollständig sein (``patience`` mitgeben).
+    - Transcribe-Parameter persistieren zwischen Aufrufen auf dem geteilten
+      Params-Struct → ``audio_ctx`` muss bei JEDEM Aufruf gesetzt werden.
+    - ``suppress_non_speech_tokens`` fehlt im gebündelten Binding
+      (AttributeError) — nicht setzen.
     """
 
     _INITIAL_PROMPT_MAX_CHARS = 600  # grobe Daumenregel für ~200 Tokens DE
+    # Whisper-Encoder: 1500 Frames = 30 s → 50 Frames/s. +32 Puffer fürs
+    # Fenster-Ende; min 256 (unterhalb wird der Decoder instabil, empirisch
+    # aus der whisper.cpp-Community), max 1500 (volles Fenster).
+    _AUDIO_CTX_FRAMES_PER_S = 50
+    _AUDIO_CTX_MARGIN = 32
+    _AUDIO_CTX_MIN = 256
+    _AUDIO_CTX_MAX = 1500
 
     def __init__(
         self,
@@ -138,40 +173,76 @@ class WhisperRecognizer:
         language: str = "de",
         n_threads: int = 4,
         sample_rate: int = DEFAULT_SAMPLE_RATE,
+        beam_size: int = 5,
+        dynamic_audio_ctx: bool = True,
+        single_segment: bool = True,
+        min_segment_probability: float = 0.4,
     ) -> None:
         self._model_path = Path(model_path)
         self._language = language
         self._n_threads = n_threads
         self._sample_rate = sample_rate
+        # beam_size=0 → Greedy wie früher (Kill-Switch via config.json:
+        # voice.whisper.beam_size). dynamic_audio_ctx=False → volles Fenster.
+        self._beam_size = int(beam_size)
+        self._dynamic_audio_ctx = bool(dynamic_audio_ctx)
+        self._single_segment = bool(single_segment)
+        # Segmente unterhalb dieser Konfidenz (geometrisches Mittel der
+        # Token-Wahrscheinlichkeiten) werden verworfen — Whisper halluziniert
+        # auf Rauschen/Stille gern plausible Sätze mit niedriger Konfidenz.
+        # 0.0 = Filter aus.
+        self._min_segment_probability = float(min_segment_probability)
         self._model = None  # type: ignore
+        # Schützt den Lazy-Load: Boot-Warmup-Thread und erster Push-to-Talk
+        # könnten sonst beide gleichzeitig ein volles Modell laden (siehe
+        # tts.py TitleSpeaker._load_lock für dasselbe Muster).
+        self._load_lock = threading.Lock()
+
+    def _audio_ctx_for(self, wav_path: Path) -> int:
+        """Encoder-Kontext passend zur tatsächlichen WAV-Dauer."""
+        try:
+            with wave.open(str(wav_path), "rb") as wf:
+                duration = wf.getnframes() / float(wf.getframerate() or 1)
+        except Exception:
+            return self._AUDIO_CTX_MAX  # im Zweifel volles Fenster
+        frames = int(duration * self._AUDIO_CTX_FRAMES_PER_S) + self._AUDIO_CTX_MARGIN
+        return max(self._AUDIO_CTX_MIN, min(frames, self._AUDIO_CTX_MAX))
 
     def warmup(self) -> None:
         """Lädt das Whisper-Modell in den RAM. Idempotent."""
         self._load_model()
 
     def _load_model(self):
-        try:
-            from pywhispercpp.model import Model  # type: ignore
-        except ImportError as e:
-            raise VoiceUnavailable(
-                "pywhispercpp-Paket fehlt. Installation: "
-                ".venv/bin/pip install -r device/requirements-voice.txt"
-            ) from e
+        # Double-checked: erst lockfrei (häufiger Fall: Modell schon geladen).
+        if self._model is not None:
+            return self._model
+        with self._load_lock:
+            if self._model is not None:
+                return self._model
+            try:
+                from pywhispercpp.model import Model  # type: ignore
+            except ImportError as e:
+                raise VoiceUnavailable(
+                    "pywhispercpp-Paket fehlt. Installation: "
+                    ".venv/bin/pip install -r device/requirements-voice.txt"
+                ) from e
 
-        if not self._model_path.is_file():
-            raise VoiceUnavailable(
-                f"Whisper-Modell nicht gefunden unter {self._model_path}. "
-                "Siehe device/voice/README.md für Download-Anleitung."
-            )
-        if self._model is None:
+            if not self._model_path.is_file():
+                raise VoiceUnavailable(
+                    f"Whisper-Modell nicht gefunden unter {self._model_path}. "
+                    "Siehe device/voice/README.md für Download-Anleitung."
+                )
             logger.info("Lade Whisper-Modell aus %s …", self._model_path)
             self._model = Model(
                 str(self._model_path),
                 n_threads=self._n_threads,
+                # 1 = BEAM_SEARCH-Strategie. Ohne das wird ein spaeteres
+                # beam_search-Dict stillschweigend ignoriert (verifiziert).
+                params_sampling_strategy=1 if self._beam_size > 0 else 0,
                 print_realtime=False,
                 print_progress=False,
             )
-        return self._model
+            return self._model
 
     def _grammar_to_prompt(self, grammar: Sequence[str]) -> str:
         joined = ", ".join(grammar)
@@ -185,12 +256,66 @@ class WhisperRecognizer:
         grammar: Sequence[str] | None = None,
     ) -> str:
         model = self._load_model()
-        _check_wav_format(Path(wav_path), self._sample_rate)
-        kwargs = {"language": self._language, "translate": False}
+        wav_path = Path(wav_path)
+        _check_wav_format(wav_path, self._sample_rate)
+        kwargs = {
+            "language": self._language,
+            "translate": False,
+            "single_segment": self._single_segment,
+            # Params persistieren zwischen Aufrufen → audio_ctx bei JEDEM
+            # Aufruf explizit setzen (1500 = volles Fenster als Reset).
+            "audio_ctx": (
+                self._audio_ctx_for(wav_path)
+                if self._dynamic_audio_ctx else self._AUDIO_CTX_MAX
+            ),
+            # Konfidenz pro Segment mitrechnen (geometrisches Mittel der
+            # Token-Wahrscheinlichkeiten) — Basis fuer den Halluzinations-Filter.
+            "extract_probability": self._min_segment_probability > 0.0,
+        }
+        if self._beam_size > 0:
+            # Dict muss vollstaendig sein — patience weglassen = KeyError.
+            kwargs["beam_search"] = {"beam_size": self._beam_size, "patience": -1.0}
         if grammar:
             kwargs["initial_prompt"] = self._grammar_to_prompt(grammar)
         segments = model.transcribe(str(wav_path), **kwargs)
-        return " ".join(seg.text.strip() for seg in segments if seg.text).strip()
+
+        all_text: list[str] = []
+        kept: list[str] = []
+        dropped_low_conf = False
+        for seg in segments:
+            if not seg.text:
+                continue
+            all_text.append(seg.text.strip())
+            prob = getattr(seg, "probability", None)
+            # NaN/None = Konfidenz nicht berechnet → Segment behalten.
+            if (
+                self._min_segment_probability > 0.0
+                and prob is not None
+                and prob == prob  # not NaN
+                and prob < self._min_segment_probability
+            ):
+                logger.info(
+                    "Whisper-Segment niedrig-konfident (%.2f < %.2f): «%s»",
+                    prob, self._min_segment_probability, seg.text.strip(),
+                )
+                dropped_low_conf = True
+                continue
+            kept.append(seg.text.strip())
+
+        result = " ".join(kept).strip()
+        if result:
+            return result
+        # Alle Segmente rausgefiltert, aber es GAB welche: die VAD hat vorher
+        # Sprache gesehen (der Aufrufer gatet auf speech_seen), also lieber die
+        # niedrig-konfidente Transkription zurückgeben als NICHTS — sonst würde
+        # genau die leise/undeutliche Kinderstimme, die der Umbau erfassen soll,
+        # stummgeschaltet. Der Fuzzy-Match-Threshold (intent.py) ist die zweite
+        # Verteidigungslinie gegen Müll; die reine Halluzination auf Stille wird
+        # bereits vom speech_seen-Gate abgefangen.
+        if dropped_low_conf and all_text:
+            logger.info("Alle Segmente niedrig-konfident — nutze Rohtranskript als Fallback.")
+            return " ".join(all_text).strip()
+        return result
 
 
 class Recognizer:

@@ -4,6 +4,7 @@
 # Box-User ersetzt, bevor die Datei nach /etc/sudoers.d/kakabox installiert wird.
 __RUN_USER__ ALL=(root) NOPASSWD: /usr/local/bin/kakabox-poweroff
 __RUN_USER__ ALL=(root) NOPASSWD: /usr/local/bin/kakabox-wifi-clear
-# CPU-Governor fürs Standby-Energiesparen — nur die zwei festen Argumente.
+# CPU-Governor fürs Standby-Energiesparen + Voice-Boost — nur die drei festen Argumente.
 __RUN_USER__ ALL=(root) NOPASSWD: /usr/local/bin/kakabox-cpu-governor powersave
 __RUN_USER__ ALL=(root) NOPASSWD: /usr/local/bin/kakabox-cpu-governor ondemand
+__RUN_USER__ ALL=(root) NOPASSWD: /usr/local/bin/kakabox-cpu-governor performance

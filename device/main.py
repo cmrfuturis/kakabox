@@ -32,12 +32,15 @@ import logging
 import os
 import random
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
+from datetime import time as dt_time
 from pathlib import Path
 from typing import Optional
 
@@ -56,14 +59,9 @@ from network import Backend, BackendError
 from network.play_sessions import PlaySessionReporter
 from voice.asr import Recognizer, VoiceUnavailable, build_recognizer
 from voice.catalog import build_catalog_from_file, build_title_map_from_file
-from voice.intent import (
-    Candidate,
-    has_magic_word,
-    is_random_request,
-    is_song_name_question,
-    parse_play_command,
-)
+from voice.intent import Candidate, has_magic_word
 from voice.recorder import MicRecorder, RecorderError
+from voice.router import route_transcript
 from voice.tts import TitleSpeaker
 
 # Optional: REST-API (von Max) — startet eine FastAPI parallel zum main-Loop.
@@ -123,22 +121,27 @@ SPEED_MIN = 0.5
 SPEED_MAX = 2.0
 
 # Voice-Push-to-Talk: Blau gedrückt → Padamm → Aufnehmen → Match.
-# VAD-light bricht die Aufnahme automatisch ab, sobald 2s am Stück Stille
-# (nach erster erkannter Sprache) erreicht ist — sonst hartes Cap bei 7s,
-# damit längere Sätze möglich sind aber die Box nicht endlos wartet, wenn
-# jemand nichts sagt.
+# VAD-light bricht die Aufnahme automatisch ab, sobald VOICE_SILENCE_SECONDS
+# am Stück Stille (nach erster erkannter Sprache) erreicht ist — sonst hartes
+# Cap bei VOICE_MAX_SECONDS, damit längere Sätze möglich sind aber die Box
+# nicht endlos wartet, wenn jemand nichts sagt.
 VOICE_MAX_SECONDS = 7.0
-VOICE_SILENCE_SECONDS = 1.0  # Nachlauf-Stille nach dem Sprechen, bis die
-                             # Aufnahme abbricht. 1s statt früher 2s → jeder
-                             # Befehl ~1s schneller. Schneidet nur Stille weg,
-                             # keine Wörter (Sprache setzt den Stille-Zähler
-                             # zurück, siehe recorder.py Hold-Zone).
-VOICE_INITIAL_SILENCE_SECONDS = 3.0  # nichts gesagt nach 3s → Abbruch
+VOICE_SILENCE_SECONDS = 1.4  # Nachlauf-Stille nach dem Sprechen, bis die
+                             # Aufnahme abbricht. 1,4s statt 1,0s (ASR-Plan
+                             # 1.8): 4–8-Jährige machen >1s Denkpausen MITTEN
+                             # im Kommando ("spiele … ähm … den Zug") — mit
+                             # 1,0s endete die Aufnahme nach "spiele". Die
+                             # +0,4s pro Befehl sind durch die audio_ctx-
+                             # Beschleunigung (asr.py) mehr als kompensiert.
+VOICE_INITIAL_SILENCE_SECONDS = 4.5  # nichts gesagt nach 4,5s → Abbruch
+                                     # (3,0s war für zögerliche Kinder zu
+                                     # knapp — sie überlegen erst, WAS sie
+                                     # sich wünschen).
 # Follow-up-Aufnahme für die Zauberwort-Rückfrage ("Wie heißt das Zauberwort?"):
-# kurze Nachlauf-Stille, damit nach erkanntem "bitte" praktisch sofort gestartet
-# wird (nicht erst nach 2s wie bei einem normalen Befehl). Max- und
-# Initial-Silence bleiben gleich (7s hart / mind. 3s lauschen).
-VOICE_ZAUBERWORT_SILENCE_SECONDS = 0.4
+# kürzere Nachlauf-Stille als beim Hauptbefehl, damit es nach erkanntem
+# "bitte" schnell weitergeht. 0,9s statt 0,4s (ASR-Plan 1.8): ein zögerliches
+# "bii…tte" eines 4-Jährigen hat >0,4s Binnenpause und wurde abgeschnitten.
+VOICE_ZAUBERWORT_SILENCE_SECONDS = 0.9
 # Bare-Title-Fallback: Kinder sagen oft nur den Titel ("Der Zug hat keine
 # Bremsen") OHNE "spiele" davor — dann lehnt der reguläre Parser mangels
 # Play-Verb ab. Wir versuchen dann einen verb-freien Match, aber mit deutlich
@@ -277,7 +280,25 @@ DEFAULT_SYSTEM_VOLUME = 25  # Lautstärke für Boot-/WLAN-/Bye-Prompts (gedämpf
 
 def load_config() -> dict:
     if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text())
+        try:
+            return json.loads(CONFIG_PATH.read_text())
+        except json.JSONDecodeError:
+            # Kann durch einen Spannungseinbruch mitten in save_config()
+            # entstehen. Kaputte Datei aus dem Weg räumen statt beim Boot zu
+            # crashen — die Box läuft mit Defaults weiter statt in eine
+            # Restart-Loop zu geraten (tags/NFC-Zuordnungen sind dann zwar
+            # weg, aber das Gerät bleibt benutzbar).
+            broken_path = CONFIG_PATH.with_name(
+                CONFIG_PATH.name + f".broken-{int(time.time())}"
+            )
+            try:
+                CONFIG_PATH.rename(broken_path)
+                logger.error(
+                    "config.json war beschädigt — nach %s verschoben, starte mit Defaults.",
+                    broken_path,
+                )
+            except OSError:
+                logger.exception("Konnte kaputte config.json nicht umbenennen.")
     return {
         "volume": 70,
         "system_volume": DEFAULT_SYSTEM_VOLUME,
@@ -287,7 +308,58 @@ def load_config() -> dict:
 
 
 def save_config(config: dict) -> None:
-    CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+    # Atomar: tmp-Datei + os.replace, damit ein Spannungseinbruch mitten im
+    # Schreiben nie eine halbe/kaputte config.json hinterlässt (siehe
+    # load_config()).
+    tmp_path = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+    tmp_path.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+    tmp_path.replace(CONFIG_PATH)
+
+
+_WEEKDAY_ABBREVS = ["mo", "di", "mi", "do", "fr", "sa", "so"]
+
+
+def _parse_hhmm(value) -> Optional[dt_time]:
+    """Parst ein "HH:MM"-String in ein datetime.time. None bei Unparsbarem
+    (defensiv — eine kaputte/fehlende Ruhezeit darf die Box nicht crashen,
+    nur diese eine Regel wird dann ignoriert)."""
+    try:
+        hh, mm = str(value).split(":")[:2]
+        return dt_time(int(hh), int(mm))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def quiet_hours_active(quiet_hours: list[dict], now: datetime) -> bool:
+    """True, wenn ``now`` in einem der konfigurierten Ruhezeit-Fenster liegt.
+
+    Fenster können über Mitternacht laufen (start_time > end_time, z.B.
+    20:00–07:00 für "jede Nacht"). In dem Fall gilt ein Fenster als aktiv,
+    wenn entweder heute nach start_time ODER heute vor end_time liegt — wobei
+    "vor end_time" zum GESTRIGEN Wochentag in ``days`` gehört (das Fenster hat
+    gestern Abend begonnen und reicht in den heutigen Morgen hinein).
+    """
+    if not quiet_hours:
+        return False
+    today = _WEEKDAY_ABBREVS[now.weekday()]
+    yesterday = _WEEKDAY_ABBREVS[(now.weekday() - 1) % 7]
+    current = now.time()
+
+    for window in quiet_hours:
+        start = _parse_hhmm(window.get("start_time"))
+        end = _parse_hhmm(window.get("end_time"))
+        if start is None or end is None:
+            continue
+        days = window.get("days") or []
+        if start <= end:
+            if today in days and start <= current <= end:
+                return True
+        else:
+            if today in days and current >= start:
+                return True
+            if yesterday in days and current <= end:
+                return True
+    return False
 
 
 def kaka_fingerprint(kaka: dict) -> str:
@@ -335,7 +407,11 @@ class Kakabox:
         self.audio_cache = AudioCache()
         self.player = Player()
 
-        self.nfc = PN532()
+        # _safe_init statt direktem Konstruktor-Aufruf: ein I2C-Glitch beim
+        # Boot (z.B. durch einen Spannungseinbruch) soll nur NFC deaktivieren,
+        # nicht die ganze Box crashen — Voice/Buttons/Random-Mode funktionieren
+        # auch ohne Tag-Leser weiter.
+        self.nfc = self._safe_init("nfc", PN532)
         self.buttons = self._safe_init("buttons", Buttons)
         self.encoder = self._safe_init("rotary encoder", RotaryEncoder)
         # LEDs: optional — wenn Adafruit-Lib oder Pi-5-Backend fehlt, läuft die
@@ -1066,20 +1142,27 @@ class Kakabox:
 
                 logger.debug("Sync: lade '%s' (id=%d)", entry.get("title"), content_id)
                 target = self.audio_cache.path_for(content_id)
-                if self.backend.download_audio(content_id, target):
-                    actual_hash = self.audio_cache.compute_hash(target)
-                    if actual_hash != file_hash:
-                        logger.error("Sync: Hash-Mismatch für content=%d — verworfen", content_id)
-                        target.unlink(missing_ok=True)
+                with self.audio_cache.download_guard(content_id):
+                    # Erneut prüfen: eine laufende Playlist kann denselben
+                    # Content parallel per Prefetch geladen haben, während wir
+                    # hier auf den Lock gewartet haben.
+                    if self.audio_cache.is_cached(content_id, file_hash):
+                        cached_already += 1
+                        continue
+                    if self.backend.download_audio(content_id, target):
+                        actual_hash = self.audio_cache.compute_hash(target)
+                        if actual_hash != file_hash:
+                            logger.error("Sync: Hash-Mismatch für content=%d — verworfen", content_id)
+                            target.unlink(missing_ok=True)
+                            self._sync_failures[content_id] = now
+                            failed_new += 1
+                        else:
+                            self.backend.report_audio_cached(content_id, file_hash)
+                            self._sync_failures.pop(content_id, None)
+                            downloaded += 1
+                    else:
                         self._sync_failures[content_id] = now
                         failed_new += 1
-                    else:
-                        self.backend.report_audio_cached(content_id, file_hash)
-                        self._sync_failures.pop(content_id, None)
-                        downloaded += 1
-                else:
-                    self._sync_failures[content_id] = now
-                    failed_new += 1
         finally:
             # Optik freigeben, sobald die Downloads durch sind (oder bei
             # Shutdown-Return mittendrin). Nur wenn wir sie selbst geholt haben.
@@ -1165,10 +1248,15 @@ class Kakabox:
             "songs": songs,
         }
         try:
-            VOICE_CATALOG_PATH.write_text(
+            # Atomar: tmp-Datei + os.replace, damit ein gleichzeitiger Lesevorgang
+            # (Push-to-Talk-Befehl, main.py build_catalog_from_file) nie eine
+            # leere/abgeschnittene Datei sieht.
+            tmp_path = VOICE_CATALOG_PATH.with_name(VOICE_CATALOG_PATH.name + ".tmp")
+            tmp_path.write_text(
                 json.dumps(payload, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
+            tmp_path.replace(VOICE_CATALOG_PATH)
         except OSError as e:
             logger.warning("Voice-Catalog konnte nicht geschrieben werden: %s", e)
 
@@ -1255,11 +1343,62 @@ class Kakabox:
                 self.config["zauberwort_mode_enabled"] = zw
                 save_config(self.config)
 
+        # --- quiet_hours + blocked_category_ids (H5-Fix, QS-Audit 2026-07-07) ---
+        # Vorher wurden diese Felder vom Gerät nie ausgelesen — die Kindersicherung
+        # war reine Placebo-UI ("gespeichert ✅", die Box wusste nie davon). Beide
+        # werden — wie max_volume/enable_zauberwort — unabhängig voneinander und
+        # nur bei tatsächlicher Übermittlung angewandt (kein Feld im Payload =
+        # lokaler Stand bleibt, z.B. wenn ein älteres Backend das Feld noch nicht
+        # kennt). Durchsetzung selbst passiert in _start_kaka_playlist &co.
+        if "quiet_hours" in rule:
+            qh = rule.get("quiet_hours") or []
+            if qh != self.config.get("quiet_hours"):
+                logger.info("quiet_hours vom Backend aktualisiert (%d Fenster).", len(qh))
+                self.config["quiet_hours"] = qh
+                save_config(self.config)
+
+        if "blocked_category_ids" in rule:
+            blocked = rule.get("blocked_category_ids") or []
+            if blocked != self.config.get("blocked_category_ids"):
+                logger.info("blocked_category_ids vom Backend aktualisiert: %s", blocked)
+                self.config["blocked_category_ids"] = blocked
+                save_config(self.config)
+
+    def _quiet_hours_now(self) -> bool:
+        return quiet_hours_active(self.config.get("quiet_hours") or [], datetime.now())
+
+    def _is_category_blocked(self, category_id) -> bool:
+        if category_id is None:
+            return False
+        return category_id in (self.config.get("blocked_category_ids") or [])
+
+    def _flash_playback_denied(self, chip_present: bool = True) -> None:
+        """Kurzer roter LED-Blitz OHNE Ton — Feedback bei Ruhezeit/Kategorie-
+        sperre (H5-Fix). Bewusst kein Sound/Prompt: eine Ruhezeit greift
+        typischerweise abends/nachts, ein Erklär-Prompt würde genau dann
+        wecken/stören, wenn er es am wenigsten soll.
+
+        ``chip_present=True`` (Default, NFC-Pfad): danach zurück auf 'Chip
+        erkannt' — der Tag liegt beim Aufruf aus _start_kaka_playlist ja noch
+        auf dem Leser. ``False`` (Voice-Knopf ohne Chip): LED aus statt
+        fälschlich grün zu pulsieren."""
+        if self.leds is None:
+            return
+        self.leds.nfc_flash_error()
+        time.sleep(1.2)
+        if self.leds is not None:
+            if chip_present:
+                self.leds.nfc_chip_present()
+            else:
+                self.leds.nfc_chip_absent()
+
     # ------------------------------------------------------------------
     # NFC-Loop (mit Multi-Chip-Tracking)
     # ------------------------------------------------------------------
 
     def _nfc_loop(self) -> None:
+        if self.nfc is None:
+            return
         seen_at: dict[str, float] = {}
         misses: dict[str, int] = {}
         active_uid: Optional[str] = None
@@ -1474,9 +1613,13 @@ class Kakabox:
                 download_url=c.get("download_url"),
                 cached_locally=bool(c.get("cached_locally")),
                 sort_order=int(c.get("sort_order", 0)),
+                category_id=c.get("category_id"),
             )
             for c in (kaka.get("contents") or [])
             if c.get("id") and c.get("playable", True)
+            # Kategoriesperre (H5-Fix): ein neu verknüpftes, gesperrtes Lied darf
+            # nicht in die laufende Playlist rutschen.
+            and not self._is_category_blocked(c.get("category_id"))
         ]
         # Leere Liste nicht anwenden — sonst würde eine laufende Wiedergabe
         # ihre Track-Liste verlieren. (Status-Wechsel auf "keine Lieder" wird
@@ -1543,6 +1686,13 @@ class Kakabox:
             self._start_kaka_playlist(uid, kaka, trigger_sync=False)
 
     def _start_kaka_playlist(self, uid: str, kaka: dict, trigger_sync: bool = True) -> None:
+        # Ruhezeit aktiv? Stumm ablehnen — kein Ton/Prompt, nur kurzer roter
+        # LED-Blitz (H5-Fix). Gilt für die ganze Box, unabhängig von der Kaka.
+        if self._quiet_hours_now():
+            logger.info("Ruhezeit aktiv — Wiedergabe von '%s' unterdrückt (still).", kaka.get("name"))
+            self._flash_playback_denied()
+            return
+
         # Nur tatsächlich auslieferbare Lieder (veröffentlicht + Audiodatei) in
         # die Playlist nehmen. 'playable' kommt vom Backend (formatKaka); fehlt
         # das Feld (älteres Backend), gilt der Track als spielbar (Kompat).
@@ -1553,8 +1703,22 @@ class Kakabox:
         contents_data = [
             c for c in kaka.get("contents", []) if c.get("playable", True)
         ]
+        # Kategoriesperre (H5-Fix): einzelne gesperrte Lieder rausfiltern, statt
+        # die ganze Kaka zu blockieren — eine Kaka kann Lieder aus mehreren
+        # Kategorien enthalten.
+        had_contents = bool(contents_data)
+        contents_data = [
+            c for c in contents_data if not self._is_category_blocked(c.get("category_id"))
+        ]
         if not contents_data:
-            logger.info("Kaka '%s' hat noch keine abspielbaren Lieder.", kaka.get("name"))
+            if had_contents:
+                logger.info(
+                    "Alle Lieder von '%s' sind kategoriegesperrt — Wiedergabe unterdrückt (still).",
+                    kaka.get("name"),
+                )
+                self._flash_playback_denied()
+            else:
+                logger.info("Kaka '%s' hat noch keine abspielbaren Lieder.", kaka.get("name"))
             return
 
         contents = [
@@ -1565,6 +1729,7 @@ class Kakabox:
                 download_url=c.get("download_url"),
                 cached_locally=bool(c.get("cached_locally")),
                 sort_order=int(c.get("sort_order", 0)),
+                category_id=c.get("category_id"),
             )
             for c in contents_data
         ]
@@ -1643,6 +1808,11 @@ class Kakabox:
                     continue
                 if not self.audio_cache.is_cached(cid, c.get("file_hash")):
                     continue
+                # Kategoriesperre (H5-Fix): gesperrte Lieder landen nicht im
+                # Random-Pool — sonst würde eine Sperre nur beim direkten
+                # Auflegen greifen, aber der Random-Modus sie unterlaufen.
+                if self._is_category_blocked(c.get("category_id")):
+                    continue
                 seen.add(cid)
                 out.append(KakaContent(
                     content_id=cid,
@@ -1651,6 +1821,7 @@ class Kakabox:
                     download_url=c.get("download_url"),
                     cached_locally=True,
                     sort_order=0,  # für Random egal — wird eh geshuffled
+                    category_id=c.get("category_id"),
                 ))
         return out
 
@@ -1662,6 +1833,11 @@ class Kakabox:
         Reihenfolge generieren und von vorne anfangen (User-Wunsch: "wie
         eine session, die neu losgeht").
         """
+        # Ruhezeit aktiv? Stumm ablehnen (H5-Fix) — kein Chip beteiligt, daher
+        # kein LED-Flash hier (der ist an den "Chip liegt auf"-Kontext geknüpft).
+        if self._quiet_hours_now():
+            logger.info("Ruhezeit aktiv — Random-Modus-Start unterdrückt (still).")
+            return
         contents = self._all_cached_contents()
         if not contents:
             logger.warning("🎲 Random-Modus: keine gecachten Tracks gefunden.")
@@ -2449,14 +2625,42 @@ class Kakabox:
             # Voice zu triggern — Voice + Speed-Mode parallel ist unintuitiv.
             self._exit_speed_mode()
             return
+        # Ruhezeiten-Gate VOR der Aufnahme (ASR-Plan 1.11): Während der
+        # Ruhezeit wäre jede Wiedergabe ohnehin unterdrückt (H5) — statt das
+        # Kind erst aufzunehmen, zu transkribieren und dann abzulehnen, wird
+        # der Flow hier still abgekürzt (roter LED-Blitz, kein Ton). Auch die
+        # Titel-Frage ist gegenstandslos: während der Ruhezeit spielt nichts.
+        # Datensparsam obendrein — es entsteht gar keine Aufnahme.
+        if self._quiet_hours_now():
+            logger.info("Ruhezeit aktiv — Voice-Aufnahme unterdrückt (still).")
+            threading.Thread(
+                target=self._flash_playback_denied,
+                kwargs={"chip_present": self._active_tag_uid is not None},
+                daemon=True, name="voice-quiet-denied",
+            ).start()
+            return
         if not self._voice_lock.acquire(blocking=False):
             logger.info("Voice bereits aktiv — Trigger ignoriert.")
             return
         threading.Thread(
-            target=self._run_voice_activation,
+            target=self._voice_activation_guarded,
             daemon=True,
             name="voice-ptt",
         ).start()
+
+    def _voice_activation_guarded(self) -> None:
+        """Wrapper um _run_voice_activation, der den _voice_lock GARANTIERT
+        freigibt — auch bei einer Exception im Snapshot-/LED-Code, der vor dem
+        inneren try/finally von _run_voice_activation läuft. Ohne diesen Wrapper
+        würde ein solcher Fehler den Lock dauerhaft halten und Voice bis zum
+        nächsten Reboot lahmlegen.
+        """
+        try:
+            self._run_voice_activation()
+        except Exception:
+            logger.exception("Voice-Aktivierung mit unerwartetem Fehler abgebrochen.")
+        finally:
+            self._voice_lock.release()
 
     def _run_voice_activation(self) -> None:
         """Padamm → Aufnehmen → ASR → Match → Wiedergabe. Lock-protected.
@@ -2555,6 +2759,13 @@ class Kakabox:
         if self.leds is not None:
             self.leds.nfc_voice_active()
 
+        # Governor-Boost für die latenzkritische Voice-Phase (ASR-Plan 1.2,
+        # Variante A): best-effort — der sudo-Helper akzeptiert "performance"
+        # erst nach dem Setup-Update (setup/kakabox-cpu-governor); bis dahin
+        # lehnt er das Argument ab und es bleibt beim ondemand des Wake-Pfads.
+        governor_boost = bool((self.config.get("voice") or {}).get("governor_boost", True))
+        if governor_boost:
+            self._set_cpu_governor("performance")
         try:
             # Vor dem Prompt sauber stoppen — wir können nicht pausieren weil
             # der Prompt selbst mpv.stop()+play() macht (defensive in play_file),
@@ -2562,10 +2773,13 @@ class Kakabox:
             self._stop_for_voice()
             self._play_prompt("listening.wav")
             # Padamm zu Ende abspielen, sonst mischt's sich in die Aufnahme.
+            # Das Prompt-Echo im Raum klingt danach noch kurz nach — die
+            # Settle-Phase des Recorders (erste ~0,3s ohne Speech-Detection)
+            # fängt das mit ab (ASR-Plan 1.10).
             self.player.wait_until_idle(timeout=2.0)
 
             try:
-                wav = self._mic_recorder.record_until_silence(
+                rec = self._mic_recorder.record_until_silence(
                     max_seconds=VOICE_MAX_SECONDS,
                     silence_seconds=VOICE_SILENCE_SECONDS,
                     initial_silence_seconds=VOICE_INITIAL_SILENCE_SECONDS,
@@ -2574,26 +2788,49 @@ class Kakabox:
                 logger.warning("Voice-Aufnahme fehlgeschlagen: %s", e)
                 return
 
+            # Halluzinations-Gate Teil 1 (ASR-Plan 1.5a): Ohne erkannte
+            # Sprache gar nicht erst transkribieren — Whisper macht aus
+            # Stille/Rauschen sonst plausible Sätze, die falsche Lieder
+            # starten. Dieses Gate sitzt bewusst VOR der ASR, damit es in
+            # einer späteren Hybrid-Stufe auch den Server-Upload verhindert.
+            if not rec.speech_seen:
+                logger.info("Voice: VAD sah keine Sprache — überspringe ASR (Error-Ton).")
+                self._save_voice_sample(rec, transcript=None, route=None)
+                return
+
             try:
-                # Grammar bewusst NICHT setzen — das kleine DE-Vosk-Modell
-                # kennt viele Eigennamen (DIKKA, Bibi, Captain) nicht und
-                # würde sie im Grammar-Modus komplett ignorieren. Der freie
-                # Decoder transkribiert phonetisch, der Fuzzy-Match findet
-                # den Song.
-                text = self._recognizer.transcribe_wav(wav)
+                # initial_prompt/Grammar bewusst NICHT gesetzt: Für Deutsch
+                # zeigt die Literatur ineffektives bis schädliches Prompt-
+                # Biasing bei Whisper — erst nach positivem A/B gegen das
+                # Stufe-0-Testset aktivieren (ASR-Plan 1.9). Der freie
+                # Decoder transkribiert phonetisch, der Fuzzy-/Phonetik-
+                # Match (intent.py) findet den Song.
+                text = self._recognizer.transcribe_wav(rec.path)
             except VoiceUnavailable as e:
                 logger.warning("ASR nicht verfügbar: %s", e)
                 return
 
             logger.info("Voice transkribiert: «%s»", text)
 
-            # Titel-Frage ("Wie heißt dieses Lied?") — MUSS als ERSTE Verzweigung
-            # laufen: "was spielt gerade" enthält das Play-Verb "spielt" und
-            # reduziert sich auf "was" (∈ Random-Wörter) — ein späterer Check
-            # würde die Frage fälschlich in den Random-Modus routen. Kein
-            # Zauberwort-Gate (eine Frage ist kein Play). Antwort = der vorm
-            # _stop_for_voice gemerkte Titel; danach läuft die Musik weiter.
-            if is_song_name_question(text):
+            # Routing-Entscheidung als pure Funktion (voice/router.py) —
+            # geteilt mit dem Eval-Harness (tools/eval_voice.py), damit der
+            # Harness exakt das misst, was die Box tut (ASR-Plan Stufe 0).
+            catalog = build_catalog_from_file(VOICE_CATALOG_PATH)
+            route = route_transcript(
+                text, catalog,
+                zauberwort_enabled=bool(self.config.get("zauberwort_mode_enabled")),
+                bare_title_threshold=VOICE_BARE_TITLE_THRESHOLD,
+            )
+            self._save_voice_sample(rec, transcript=text, route=route)
+
+            if route.action == "hallucination":
+                logger.info("Voice: Transkript leer/bekannte Halluzination — Error-Ton.")
+                return
+
+            # Titel-Frage ("Wie heißt dieses Lied?"). Kein Zauberwort-Gate
+            # (eine Frage ist kein Play). Antwort = der vorm _stop_for_voice
+            # gemerkte Titel; danach läuft die Musik weiter.
+            if route.action == "title_question":
                 logger.info("Voice: Titel-Frage erkannt → Titel: %s", saved_title)
                 if saved_title:
                     self._speak_current_title(saved_title)
@@ -2608,16 +2845,20 @@ class Kakabox:
                 recovered = True
                 return
 
-            # Random-Wunsch ("spiele irgendwas") — VOR dem Catalog-Match, weil
-            # er kein Entity matcht, sondern den Random-Modus startet. Gleiche
-            # Erfolgs-Choreo wie ein Treffer (Flash-Grün + success-Sound), das
-            # Zauberwort-Gate gilt auch hier.
-            if is_random_request(text):
-                if self.config.get("zauberwort_mode_enabled") and not has_magic_word(text):
-                    logger.info("Random-Wunsch ohne Zauberwort in «%s» — frage nach.", text)
-                    if not self._await_zauberwort():
-                        logger.info("Zauberwort nicht gesagt — kein Playback.")
-                        return
+            # Zauberwort-Gate für Random UND Play: Aktion erkannt, aber
+            # "bitte" fehlt → "Wie heißt das Zauberwort?" und ein zweites Mal
+            # lauschen; ohne "bitte" kein Playback (finally → Error-Ton).
+            # Läuft bewusst NACH dem Matching (Z2): der Prompt kommt nur,
+            # wenn wirklich etwas gefunden wurde.
+            if route.action in ("random", "play") and route.needs_magic_word:
+                logger.info("Zauberwort fehlt in «%s» — frage nach.", text)
+                if not self._await_zauberwort():
+                    logger.info("Zauberwort nicht gesagt — kein Playback.")
+                    return
+
+            # Random-Wunsch ("spiele irgendwas") — gleiche Erfolgs-Choreo wie
+            # ein Treffer (Flash-Grün + success-Sound).
+            if route.action == "random":
                 logger.info("Voice: Random-Wunsch erkannt → Random-Modus.")
                 if self.leds is not None:
                     self.leds.nfc_flash_success()
@@ -2630,48 +2871,15 @@ class Kakabox:
                     recovered = True
                 return
 
-            # Erst MATCHEN, dann erst das Zauberwort-Gate (Z2). So kommt der
-            # "Wie heißt das Zauberwort?"-Prompt nur, wenn das Lied wirklich
-            # gefunden wurde — bei Nicht-Treffer der normale Error-Ton (finally).
-            catalog = build_catalog_from_file(VOICE_CATALOG_PATH)
-            if not catalog:
-                logger.warning("Voice-Catalog leer — kein Match möglich.")
-                return
-
-            cmd = parse_play_command(text, catalog)
-            if cmd is None:
-                # Bare-Title-Fallback: Titel ohne "spiele" davor (s.
-                # VOICE_BARE_TITLE_THRESHOLD). Läuft NACH Frage- und Random-
-                # Gate, ist hier also weder Frage noch Random — ein reiner
-                # Titel-Versuch. Strenger Threshold gegen Fehltreffer.
-                cmd = parse_play_command(
-                    text, catalog,
-                    threshold=VOICE_BARE_TITLE_THRESHOLD,
-                    require_play_verb=False,
-                )
-                if cmd is not None:
-                    logger.info(
-                        "Voice: Bare-Title-Treffer «%s» → %s (Score %.2f)",
-                        text, cmd.target.name, cmd.score,
-                    )
-            if cmd is None:
+            if route.action != "play" or route.command is None:
                 logger.info("Voice: kein Match für «%s» → Error-Ton.", text)
                 return
 
+            cmd = route.command
             logger.info(
-                "Voice match: kind=%s name='%s' score=%.2f query='%s'",
-                cmd.target.kind, cmd.target.name, cmd.score, cmd.query,
+                "Voice match: kind=%s name='%s' score=%.2f margin=%.2f query='%s'",
+                cmd.target.kind, cmd.target.name, cmd.score, cmd.margin, cmd.query,
             )
-
-            # Zauberwort-Gate: Lied gefunden, aber im aktiven Modus fehlt "bitte"
-            # → "Wie heißt das Zauberwort?" abspielen und ein zweites Mal
-            # lauschen. Sagt das Kind dann "bitte" (vorne/mitte/hinten), spielen
-            # wir; sonst kein Playback (finally → Error-Ton).
-            if self.config.get("zauberwort_mode_enabled") and not has_magic_word(text):
-                logger.info("Zauberwort fehlt in «%s» — frage nach.", text)
-                if not self._await_zauberwort():
-                    logger.info("Zauberwort nicht gesagt — kein Playback.")
-                    return
 
             # Match (+ ggf. Zauberwort bestätigt) → Erfolgs-Feedback: NFC-LED static sattes Grün während
             # der success-Sound spielt. Danach Voice-Track. Der finally-Block
@@ -2717,15 +2925,75 @@ class Kakabox:
                     self.leds.nfc_random_active()
                 else:
                     self.leds.nfc_chip_absent()
-            self._voice_lock.release()
+            # Governor-Boost zurücknehmen (Gegenstück zum Start des Flows).
+            # Immer ondemand — das ist der reguläre Wach-Zustand; der Standby-
+            # Pfad übernimmt powersave weiterhin selbst.
+            if governor_boost:
+                self._set_cpu_governor("ondemand")
+            # Lock-Freigabe NICHT hier — sie passiert garantiert im
+            # _voice_activation_guarded-Wrapper, auch wenn oben (Snapshot, LED)
+            # VOR diesem try eine Exception fliegt (sonst leakt der Lock und
+            # Voice wäre bis zum Reboot tot).
+
+    def _save_voice_sample(self, rec, transcript, route) -> None:
+        """Stufe-0-Testset-Aufbau (ASR-Plan): Voice-Aufnahme + Metadaten behalten.
+
+        Nur aktiv mit ``voice.keep_samples: true`` in config.json — Default AUS
+        (Kinder-Stimmdaten!). Samples bleiben lokal unter device/voice_samples/
+        (per .gitignore ausgeschlossen, landet nie in Git oder Backups) und
+        werden nach ``voice.samples_keep_days`` (Default 14) automatisch
+        gelöscht. Pro Sample eine Sidecar-JSON mit Live-Transkript und
+        Routing-Ergebnis — beim Labeln wird dann nur korrigiert statt neu
+        getippt. Best-effort: Fehler hier dürfen den Voice-Flow nie brechen.
+        """
+        cfg = self.config.get("voice") or {}
+        if not cfg.get("keep_samples", False):
+            return
+        try:
+            samples_dir = Path(__file__).parent / "voice_samples"
+            samples_dir.mkdir(exist_ok=True)
+            # Retention: Alt-Samples beim nächsten Schreiben wegräumen.
+            keep_days = float(cfg.get("samples_keep_days", 14))
+            cutoff = time.time() - keep_days * 86400
+            for old in samples_dir.iterdir():
+                try:
+                    if old.is_file() and old.stat().st_mtime < cutoff:
+                        old.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            stem = samples_dir / f"sample-{ts}"
+            shutil.copyfile(rec.path, stem.with_suffix(".wav"))
+            cmd = route.command if route is not None else None
+            meta = {
+                "recorded_at": ts,
+                "duration_seconds": round(rec.duration_seconds, 2),
+                "speech_seen": rec.speech_seen,
+                "transcript": transcript,
+                "action": route.action if route is not None else "no_speech",
+                "matched": {
+                    "name": cmd.target.name,
+                    "kind": cmd.target.kind,
+                    "id": cmd.target.id,
+                    "score": round(cmd.score, 3),
+                    "margin": round(cmd.margin, 3),
+                } if cmd is not None else None,
+                # Zum Labeln ergänzen: ground_truth_text, expected_intent,
+                # expected_song_id, alter, distanz (siehe tools/eval_voice.py).
+            }
+            stem.with_suffix(".json").write_text(
+                json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning("Voice-Sample nicht gespeichert: %s", e)
 
     def _await_zauberwort(self) -> bool:
         """Spielt "Wie heißt das Zauberwort?" und lauscht ein zweites Mal.
 
         Gibt True zurück, wenn das Kind "bitte" sagt (positionsunabhängig, via
-        has_magic_word). Follow-up-Timing (Z4): max 7s, mind. 3s lauschen bevor
-        bei Stille abgebrochen wird, nur ~0.4s Nachlauf-Stille → nach "bitte"
-        startet es praktisch sofort. Die NFC-LED bleibt blau ("lauscht"); das
+        has_magic_word). Follow-up-Timing (Z4): max 7s lauschen bevor bei
+        Stille abgebrochen wird, kurze Nachlauf-Stille (s. Konstante) → nach
+        "bitte" startet es zügig. Die NFC-LED bleibt blau ("lauscht"); das
         grüne Erfolgs-Feedback setzt der aufrufende Erfolgs-Pfad.
         """
         if self.leds is not None:
@@ -2734,7 +3002,7 @@ class Kakabox:
         # Prompt fertig abspielen, sonst mischt er sich in die Aufnahme.
         self.player.wait_until_idle(timeout=2.0)
         try:
-            wav = self._mic_recorder.record_until_silence(
+            rec = self._mic_recorder.record_until_silence(
                 max_seconds=VOICE_MAX_SECONDS,
                 silence_seconds=VOICE_ZAUBERWORT_SILENCE_SECONDS,
                 initial_silence_seconds=VOICE_INITIAL_SILENCE_SECONDS,
@@ -2742,7 +3010,12 @@ class Kakabox:
         except RecorderError as e:
             logger.warning("Zauberwort-Aufnahme fehlgeschlagen: %s", e)
             return False
-        return self._detect_magic_word(wav)
+        # Kein Speech laut VAD → "bitte" kann nicht drin sein; spart den
+        # ASR-Lauf und verhindert Halluzinations-Treffer auf Stille.
+        if not rec.speech_seen:
+            logger.info("Zauberwort-Aufnahme ohne Sprache (VAD) — werte als Nein.")
+            return False
+        return self._detect_magic_word(rec.path)
 
     def _detect_magic_word(self, wav) -> bool:
         """Prüft schnell, ob "bitte" in der Aufnahme steckt.
@@ -2854,6 +3127,13 @@ class Kakabox:
         """
         if not target.content_ids:
             logger.warning("Voice-Target ohne content_ids: %s", target.name)
+            return
+
+        # Ruhezeit aktiv? Stumm ablehnen (H5-Fix). Kategoriesperre ist hier
+        # NICHT möglich — voice_catalog.json trägt aktuell keine category_id
+        # (bekannte Lücke, siehe QS-Audit 2026-07-07 Folgearbeiten).
+        if self._quiet_hours_now():
+            logger.info("Ruhezeit aktiv — Voice-Wiedergabe von '%s' unterdrückt (still).", target.name)
             return
 
         # Genre fühlt sich wie Random innerhalb der Kategorie an → mischen. Track
@@ -2995,7 +3275,13 @@ class Kakabox:
         with self._playlist_lock:
             if self._current_playlist:
                 self._current_playlist.stop()
-        self.player.stop()
+        try:
+            self.player.stop()
+        except Exception as e:
+            # Ein mpv-IPC-Fehler hier (z.B. SIGTERM/poweroff-Race) darf nicht
+            # die restlichen Shutdown-Schritte (Peripherie-Cleanup, Config-
+            # Save) verhindern — siehe die anderen try/except unten.
+            logger.warning("player.stop() beim Shutdown fehlgeschlagen: %s", e)
         # Reporter-Worker bekommt noch eine kurze Chance, die Queue zu
         # flushen, bevor das Process-Exit den Daemon-Thread killt. Disk-
         # Persistenz ist die Backup-Garantie, aber wir sparen damit eine
@@ -3004,7 +3290,8 @@ class Kakabox:
             self.play_session_reporter.stop_worker(timeout=2.0)
         except Exception as e:
             logger.warning("PlaySessionReporter Stop fehlgeschlagen: %s", e)
-        self.nfc.close()
+        if self.nfc is not None:
+            self.nfc.close()
         if self.buttons is not None:
             self.buttons.close()
         if self.encoder is not None:

@@ -6,9 +6,29 @@ und nutzen das ALSA-Cli-Tool, das auf jedem Pi schon installiert ist.
 
 VAD-light: ``record_until_silence`` streamt vom Mic und bricht ab, sobald
 nach erster erkannter Sprache eine zusammenhängende Stille-Phase erreicht
-ist — natürlicher als hartes 3-Sekunden-Cap und schneller, wenn jemand
+ist — natürlicher als hartes Sekunden-Cap und schneller, wenn jemand
 nur "spiele Bambi" sagt. Hartes ``max_seconds``-Cap verhindert Endlosläufe,
 wenn der User gar nicht spricht (oder weiter ins Mic murmelt).
+
+Kinderstimmen-Fixes (ASR-Plan 2026-07-07, Stufe 1.3):
+
+- **DC-Abzug pro Chunk:** Das INMP441 liefert einen DC-Offset, der die
+  RMS-Werte künstlich hebt (Idle-Floor gemessen 10–7800 statt ~5–40).
+  RMS wird deshalb über mean-zentrierte Samples berechnet.
+- **Einschalt-Transient:** Die ersten ~300 ms nach arecord-Start enthalten
+  einen DC-Einschwing-Knall (Chunk 0: RMS bis 7800 live gemessen), der
+  früher bei JEDER Aufnahme ``speech_seen`` setzte — reines Rauschen ging
+  als "Sprache" an die ASR. Diese Settle-Phase wird jetzt weder für die
+  Speech-Detection genutzt noch in den Puffer übernommen (echte Sprache
+  ist dort nicht drin — das Mic schwingt erst ein).
+- **Adaptive Schwellen:** Die alten Fixwerte (speech≥180 / silence<80)
+  stammen von der Logitech C920 mit eingebautem AGC. Am gain-losen INMP441
+  liegt normale Sprechlautstärke rechnerisch UNTER der alten Silence-
+  Schwelle — leise Kinderstimmen trafen nie die Speech-Schwelle. Jetzt
+  wird der Noise-Floor in der Settle-Phase geschätzt und die Schwellen
+  daraus abgeleitet (speech = floor×4, silence = floor×2, geklemmt so,
+  dass sie nie ÜBER den alten C920-Werten liegen — die alten Werte sind
+  das konservative Maximum, nicht mehr das Minimum).
 
 Threading: ``record_until_silence`` blockt im Aufrufer-Thread. Die Voice-
 Aktivierung im Main-Loop läuft sowieso in einem Hintergrund-Thread (Knopf-
@@ -21,29 +41,87 @@ import math
 import struct
 import subprocess
 import wave
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Logitech-C920-Webcam hat ein brauchbares Stereo-Mic eingebaut; via ``plughw``
-# konvertiert ALSA automatisch auf das von Vosk gewünschte Format (mono 16 kHz).
-# CARD-Name statt Karten-Nummer macht's stabil gegen USB-Reordering bei Reboot.
 # INMP441 MEMS-Mic über Google Voice HAT Overlay. Selbe Karte wie der
 # MAX98357A-Speaker (sndrpigooglevoi) — Capture-Side liefert mono I²S-Daten.
+# CARD-Name statt Karten-Nummer macht's stabil gegen USB-Reordering bei Reboot.
 DEFAULT_DEVICE = "plughw:CARD=sndrpigooglevoi,DEV=0"
 DEFAULT_SAMPLE_RATE = 16000
 
-# VAD-Schwellen (16-bit RMS, max 32767). Empirisch bestimmt mit der C920 bei
-# Tisch-Distanz: Idle-Noise-Floor ~50-100, normale Stimme RMS 200-1000.
-# Zwischen ``silence`` und ``speech`` liegt eine breite "Hold"-Zone (80..180):
-# Konsonanten und Pausen zwischen Wörtern fallen oft da rein und brechen
-# weder die Aufnahme ab noch zählen sie als Speech — exakt was wir wollen.
-DEFAULT_SPEECH_RMS = 180.0
-DEFAULT_SILENCE_RMS = 80.0
+# Obergrenzen für die adaptiven Schwellen (16-bit RMS, max 32767): die alten,
+# mit der C920 kalibrierten Fixwerte. Adaptiv darf nur EMPFINDLICHER werden
+# (Schwellen senken), nie tauber — so bleibt das Verhalten bei lautem
+# Umgebungsrauschen höchstens so streng wie bisher.
+LEGACY_SPEECH_RMS = 180.0
+LEGACY_SILENCE_RMS = 80.0
+# Untergrenzen: unterhalb davon wäre die Detection reines Rauschen-Raten.
+# BEWUSST niedrig gehalten — eine leise Kinderstimme liegt DC-bereinigt oft
+# bei RMS ~30–40; eine zu hohe Untergrenze würde genau die verpassen, die der
+# Umbau erfassen soll. Provisorische Werte: mit dem Stufe-0-Testset (echte
+# Kinderaufnahmen) final kalibrieren.
+MIN_SPEECH_RMS = 28.0
+MIN_SILENCE_RMS = 12.0
+# Faktoren über dem gemessenen Noise-Floor (ASR-Plan: speech = floor×3–4,
+# silence = floor×1,5–2).
+SPEECH_FLOOR_FACTOR = 4.0
+SILENCE_FLOOR_FACTOR = 2.0
+# Einschwing-/Kalibrierphase am Aufnahmebeginn (Transient + Floor-Schätzung).
+DEFAULT_SETTLE_SECONDS = 0.3
+
+# Rückwärtskompatible Aliase (Tests/ältere Aufrufer referenzieren die Namen).
+DEFAULT_SPEECH_RMS = LEGACY_SPEECH_RMS
+DEFAULT_SILENCE_RMS = LEGACY_SILENCE_RMS
 
 
 class RecorderError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class RecordingResult:
+    """Ergebnis einer Push-to-Talk-Aufnahme.
+
+    ``path`` verhält sich wie bisher (WAV-Datei); ``speech_seen`` sagt, ob
+    die VAD überhaupt Sprache erkannt hat — Aufrufer sollen bei False gar
+    nicht erst transkribieren (Whisper halluziniert auf Stille/Rauschen
+    gern plausible deutsche Sätze, die dann fälschlich ein Lied starten).
+    ``__fspath__`` macht das Objekt path-like, damit bestehende Aufrufer
+    (``transcribe_wav(result)``) ohne Umbau funktionieren.
+    """
+    path: Path
+    speech_seen: bool
+    duration_seconds: float
+
+    def __fspath__(self) -> str:
+        return str(self.path)
+
+
+def chunk_rms(data: bytes, frames: int) -> float:
+    """RMS eines S16_LE-Chunks über mean-zentrierte Samples (DC-Abzug).
+
+    Pure Funktion — vom Eval-Harness und den Tests direkt nutzbar.
+    """
+    samples = struct.unpack(f"<{frames}h", data)
+    mean = sum(samples) / frames
+    return math.sqrt(sum((s - mean) ** 2 for s in samples) / frames)
+
+
+def adaptive_thresholds(noise_floor: float) -> tuple[float, float]:
+    """Leitet (speech_rms, silence_rms) aus dem gemessenen Noise-Floor ab.
+
+    Geklemmt zwischen MIN_* (nie empfindlicher als sinnvoll) und den alten
+    C920-Fixwerten (nie tauber als bisher). Garantiert silence < speech.
+    """
+    speech = min(max(noise_floor * SPEECH_FLOOR_FACTOR, MIN_SPEECH_RMS), LEGACY_SPEECH_RMS)
+    silence = min(max(noise_floor * SILENCE_FLOOR_FACTOR, MIN_SILENCE_RMS), LEGACY_SILENCE_RMS)
+    if silence >= speech:
+        silence = speech / 2.0
+    return speech, silence
 
 
 class MicRecorder:
@@ -60,10 +138,11 @@ class MicRecorder:
         max_seconds: float = 5.0,
         silence_seconds: float = 1.0,
         initial_silence_seconds: float = 3.0,
-        speech_rms: float = DEFAULT_SPEECH_RMS,
-        silence_rms: float = DEFAULT_SILENCE_RMS,
+        speech_rms: Optional[float] = None,
+        silence_rms: Optional[float] = None,
+        settle_seconds: float = DEFAULT_SETTLE_SECONDS,
         output_path: Path | str = "/tmp/kakabox_ptt.wav",
-    ) -> Path:
+    ) -> RecordingResult:
         """Nimmt auf, bis ``silence_seconds`` zusammenhängende Stille NACH erster
         Sprache erreicht ist — spätestens nach ``max_seconds`` hart abgebrochen.
 
@@ -71,13 +150,20 @@ class MicRecorder:
         Sprache erkannt wurde, wird abgebrochen (verhindert lange Wartezeit
         bei versehentlichem Knopfdruck).
 
-        Schreibt eine 16 kHz mono S16_LE-WAV. Wirft ``RecorderError`` wenn
-        arecord nicht startet oder keine Frames liefert.
+        ``speech_rms``/``silence_rms``: explizite Schwellen-Overrides (Tests,
+        Sonderfälle). Default ``None`` → adaptive Schwellen aus dem in der
+        Settle-Phase gemessenen Noise-Floor (siehe Modul-Doku).
+
+        Schreibt eine 16 kHz mono S16_LE-WAV (ohne die Settle-Phase). Wirft
+        ``RecorderError`` wenn arecord nicht startet oder keine Frames liefert.
         """
         chunk_ms = 100
         chunk_frames = int(self.sample_rate * chunk_ms / 1000)
         chunk_bytes = chunk_frames * 2  # S16_LE = 2 byte pro Sample
-        max_chunks = max(1, int(max_seconds * 1000 / chunk_ms))
+        settle_chunks = max(1, int(settle_seconds * 1000 / chunk_ms))
+        # Die Zeit-Budgets zählen AB Ende der Settle-Phase, damit sich das
+        # nutzbare Aufnahmefenster durch den Fix nicht verkürzt.
+        max_chunks = settle_chunks + max(1, int(max_seconds * 1000 / chunk_ms))
         silence_chunks_target = max(1, int(silence_seconds * 1000 / chunk_ms))
         initial_silence_chunks = max(1, int(initial_silence_seconds * 1000 / chunk_ms))
 
@@ -98,26 +184,52 @@ class MicRecorder:
         recorded = bytearray()
         speech_seen = False
         silence_streak = 0
+        # Noise-Floor-Schätzung über die Settle-Phase: MIN statt Mittelwert,
+        # damit weder der Chunk-0-Transient noch ein sofort lossprechendes
+        # Kind den Floor (und damit die Schwellen) nach oben zieht.
+        noise_floor: Optional[float] = None
+        thr_speech = speech_rms if speech_rms is not None else LEGACY_SPEECH_RMS
+        thr_silence = silence_rms if silence_rms is not None else LEGACY_SILENCE_RMS
+        adaptive = speech_rms is None and silence_rms is None
         try:
             for chunk_idx in range(max_chunks):
                 data = proc.stdout.read(chunk_bytes)
                 if not data or len(data) < chunk_bytes:
                     break
+                rms = chunk_rms(data, chunk_frames)
+
+                if chunk_idx < settle_chunks:
+                    # Einschwingphase: NICHT für die Speech-Detection nutzen
+                    # (Einschalt-Transient), aber SEHR WOHL in den Puffer —
+                    # sonst geht der Wortanfang verloren, wenn ein Kind sofort
+                    # nach dem Prompt lospricht (Sprachbeginn <0,3s). Der DC-
+                    # Transient im Puffer stört Whisper kaum (Log-Mel-Frontend);
+                    # der geplante 80-Hz-Hochpass (1.4) räumt ihn später ganz weg.
+                    # Floor-Schätzung per min über die Settle-Chunks (nimmt das
+                    # leiseste Sub-Fenster, robust gegen sofort lautes Sprechen).
+                    recorded += data
+                    noise_floor = rms if noise_floor is None else min(noise_floor, rms)
+                    continue
+                if chunk_idx == settle_chunks and adaptive:
+                    thr_speech, thr_silence = adaptive_thresholds(noise_floor or 0.0)
+                    logger.debug(
+                        "VAD adaptiv: floor=%.1f → speech≥%.1f, silence<%.1f",
+                        noise_floor or 0.0, thr_speech, thr_silence,
+                    )
+
                 recorded += data
-                samples = struct.unpack(f"<{chunk_frames}h", data)
-                rms = math.sqrt(sum(s * s for s in samples) / chunk_frames)
-                if rms >= speech_rms:
+                if rms >= thr_speech:
                     speech_seen = True
                     silence_streak = 0
-                elif rms < silence_rms:
+                elif rms < thr_silence:
                     silence_streak += 1
-                # In-between (silence_rms ≤ rms < speech_rms): keine Änderung —
+                # In-between (silence ≤ rms < speech): keine Änderung —
                 # so frisst leises Nachhallen den Silence-Counter nicht weg.
                 if speech_seen and silence_streak >= silence_chunks_target:
                     break
-                # Initial-Silence-Cap: wenn nach initial_silence_chunks noch
-                # gar nichts gesprochen wurde, raus (versehentlicher Knopfdruck).
-                if not speech_seen and chunk_idx + 1 >= initial_silence_chunks:
+                # Initial-Silence-Cap: wenn nach initial_silence_chunks (ab
+                # Settle-Ende) noch nichts gesprochen wurde, raus.
+                if not speech_seen and chunk_idx + 1 - settle_chunks >= initial_silence_chunks:
                     break
         finally:
             proc.terminate()
@@ -146,4 +258,4 @@ class MicRecorder:
             "speech detected" if speech_seen else "kein speech",
             f", {silence_streak * chunk_ms}ms silence am Ende" if speech_seen else "",
         )
-        return path
+        return RecordingResult(path=path, speech_seen=speech_seen, duration_seconds=duration)

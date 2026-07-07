@@ -31,6 +31,10 @@ class KakaContent:
     download_url: Optional[str]
     cached_locally: bool
     sort_order: int = 0
+    # Für die Kategoriesperre der Eltern (H5-Fix) — main.py filtert Contents
+    # mit gesperrter category_id vor dem Playlist-Start heraus. None = keiner
+    # Kategorie zugeordnet, wird nie gesperrt.
+    category_id: Optional[int] = None
 
 
 @dataclass
@@ -389,18 +393,24 @@ class Playlist:
         if not blocking:
             return None
 
-        logger.info("Lade '%s' (id=%d) ...", content.title, content.content_id)
-        ok = self._download_fn(content.content_id, path)
-        if not ok:
-            return None
-        if content.file_hash and self._cache.compute_hash(path) != content.file_hash:
-            logger.error(
-                "Hash-Mismatch nach Download für content=%d — Datei verworfen",
-                content.content_id,
-            )
-            path.unlink(missing_ok=True)
-            return None
-        return path
+        with self._cache.download_guard(content.content_id):
+            # Erneut prüfen: während wir auf den Lock gewartet haben, könnte
+            # der Audio-Sync-Loop denselben Content bereits geladen haben.
+            if self._cache.is_cached(content.content_id, content.file_hash):
+                return path
+
+            logger.info("Lade '%s' (id=%d) ...", content.title, content.content_id)
+            ok = self._download_fn(content.content_id, path)
+            if not ok:
+                return None
+            if content.file_hash and self._cache.compute_hash(path) != content.file_hash:
+                logger.error(
+                    "Hash-Mismatch nach Download für content=%d — Datei verworfen",
+                    content.content_id,
+                )
+                path.unlink(missing_ok=True)
+                return None
+            return path
 
     def _prefetch_rest(self) -> None:
         """Lädt die restlichen Tracks der Reihe nach im Hintergrund."""

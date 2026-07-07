@@ -214,3 +214,81 @@ def test_song_question_takes_priority_over_random():
     # damit die Reihenfolge in main.py nicht versehentlich gedreht wird.
     assert is_song_name_question("was spielt gerade")
     assert is_random_request("was spielt gerade")  # ← deshalb Frage zuerst!
+
+
+# --- Matching-Upgrades (ASR-Plan 2026-07-07, Stufe 1.6/1.7) -------------------
+
+def test_ratio_substring_floor_requires_min_length():
+    # Der live reproduzierte False-Positive: "ja" (2 Zeichen) bekam den
+    # 0.85-Substring-Floor gegen "DIKKA - Na ja hier". Jetzt: <4 Zeichen
+    # → kein Floor, nur ehrliches difflib-Ratio.
+    from voice.intent import _ratio
+    assert _ratio("ja", "DIKKA - Na ja hier") < 0.5
+
+
+def test_ratio_substring_floor_requires_word_boundary():
+    from voice.intent import _ratio
+    # "onst" steckt in "Monster", aber nicht an einer Wortgrenze → kein Floor.
+    assert _ratio("onst", "Monsterparty") < 0.85
+    # "bibi" steht an einer Wortgrenze → Floor bleibt (der dokumentierte
+    # Grund für die Substring-Regel).
+    assert _ratio("bibi", "Bibi Blocksberg") >= 0.85
+
+
+def test_phonetic_match_catches_kids_pronunciation():
+    # "Diga" und "DIKKA" sind orthographisch fern, phonetisch identisch
+    # (Kölner Code 24) — genau die Kinder-Fehlerklasse aus dem ASR-Plan.
+    cat = [Candidate(id="1", name="DIKKA", kind="artist", content_ids=(1,))]
+    cmd = parse_play_command("spiele diga", cat)
+    assert cmd is not None
+    assert cmd.target.id == "1"
+
+
+def test_token_order_does_not_matter():
+    cat = [Candidate(id="1", name="Bibi & Tina - Mädchen gegen Jungs",
+                     kind="track", content_ids=(1,))]
+    cmd = parse_play_command("spiele mädchen gegen jungs von bibi und tina", cat)
+    assert cmd is not None
+    assert cmd.target.id == "1"
+
+
+def test_margin_is_small_for_ambiguous_match():
+    cat = [
+        Candidate(id="1", name="DIKKA - Na ja hier", kind="track", content_ids=(1,)),
+        Candidate(id="2", name="DIKKA - Superkind", kind="track", content_ids=(2,)),
+    ]
+    cmd = parse_play_command("spiele dikka", cat)
+    assert cmd is not None
+    assert cmd.margin < 0.1  # beide Kandidaten treffen fast gleich gut
+
+
+def test_margin_is_large_for_unambiguous_match():
+    cat = [
+        Candidate(id="1", name="DIKKA - Superkind", kind="track",
+                  aliases=("Superkind",), content_ids=(1,)),
+        Candidate(id="2", name="Rolf Zuckowski - In der Weihnachtsbäckerei",
+                  kind="track", content_ids=(2,)),
+    ]
+    cmd = parse_play_command("spiele superkind", cat)
+    assert cmd is not None
+    assert cmd.target.id == "1"
+    assert cmd.margin > 0.3
+
+
+def test_short_title_recovered_in_bare_mode():
+    # Regression (Review 2026-07-07): 3-Zeichen-Titel wie "Zug" fielen mit
+    # der len>=4-Schwelle durch. Jetzt >=3 → Wortgrenzen-Substring trifft.
+    cat = [Candidate(id="7", name="Der Zug hat keine Bremsen", kind="track", content_ids=(7,))]
+    cmd = parse_play_command("zug", cat, threshold=0.70, require_play_verb=False)
+    assert cmd is not None
+    assert cmd.target.id == "7"
+
+
+def test_phonetic_alone_needs_verb_not_bare_title():
+    # Regression (Review 2026-07-07): ein reiner Klang-Treffer ohne "spiele"
+    # davor darf den strengen Bare-Title-Threshold NICHT allein reißen.
+    cat = [Candidate(id="1", name="DIKKA", kind="artist", content_ids=(1,))]
+    # Mit Verb: Phonetik trägt.
+    assert parse_play_command("spiele diga", cat) is not None
+    # Bare-Title (kein Verb): nur Phonetik reicht nicht.
+    assert parse_play_command("diga", cat, threshold=0.70, require_play_verb=False) is None

@@ -84,12 +84,32 @@ class Backend:
             raise FileNotFoundError(
                 f"box_identity.json missing at {self._identity_path}"
             )
-        return json.loads(self._identity_path.read_text())
+        try:
+            return json.loads(self._identity_path.read_text())
+        except json.JSONDecodeError:
+            # Kann durch einen Spannungseinbruch mitten in _save_identity()
+            # entstehen (vor dem Atomic-Write-Fix unten passiert, alte Backups
+            # können noch betroffen sein). Ohne Identität kann die Box sich
+            # nicht am Backend anmelden — .bak ist der einzige Recovery-Pfad,
+            # da es keine sinnvollen Default-Werte für Serial/Token gibt.
+            backup_path = Path(str(self._identity_path) + ".bak")
+            if backup_path.is_file():
+                logger.error(
+                    "box_identity.json ist beschädigt — falle auf %s zurück.",
+                    backup_path,
+                )
+                return json.loads(backup_path.read_text())
+            raise
 
     def _save_identity(self) -> None:
-        self._identity_path.write_text(
-            json.dumps(self._identity, indent=2, ensure_ascii=False)
-        )
+        data = json.dumps(self._identity, indent=2, ensure_ascii=False)
+        # Atomar: tmp-Datei + os.replace, damit ein Spannungseinbruch mitten im
+        # Schreiben nie eine halbe/kaputte box_identity.json hinterlässt.
+        tmp_path = Path(str(self._identity_path) + ".tmp")
+        tmp_path.write_text(data)
+        tmp_path.replace(self._identity_path)
+        # Zusätzliches .bak als zweite Verteidigungslinie (siehe _load_identity).
+        Path(str(self._identity_path) + ".bak").write_text(data)
 
     @property
     def token(self) -> str | None:
