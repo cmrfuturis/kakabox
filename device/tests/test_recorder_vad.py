@@ -18,8 +18,10 @@ from voice.recorder import (
     MIN_SILENCE_RMS,
     MIN_SPEECH_RMS,
     RecordingResult,
+    SPEECH_DETECT_MIN_CHUNKS,
     adaptive_thresholds,
     chunk_rms,
+    speech_present,
 )
 
 SAMPLE_RATE = 16000
@@ -113,21 +115,66 @@ def test_quiet_child_voice_is_detected(monkeypatch, tmp_path):
     assert result.speech_seen is True
 
 
-def test_quiet_child_voice_was_missed_with_legacy_thresholds(monkeypatch, tmp_path):
-    """Gegenprobe: dieselbe leise Stimme mit den alten Fixwerten → verpasst.
-    (Dokumentiert, WARUM der Fix nötig war — schlägt der Test fehl, hat
-    jemand die Legacy-Schwellen verändert und dieser Kontrast stimmt nicht
-    mehr.)"""
+def test_speech_seen_ignores_streaming_threshold_overrides(monkeypatch, tmp_path):
+    """``speech_seen`` kommt jetzt aus ``speech_present`` (rückwirkend über den
+    Puffer), NICHT mehr aus den Streaming-Schwellen. Selbst mit den tauben
+    Legacy-Fixwerten als Override wird die leise Stimme als Sprache erkannt —
+    die Overrides steuern nur noch den Stille-Abbruch."""
     chunks = (
         [_chunk(amplitude=14, dc_offset=200)] * 3
-        + [_chunk(amplitude=170, dc_offset=200)] * 5
+        + [_chunk(amplitude=170, dc_offset=200)] * 5   # RMS ~120
         + [_chunk(amplitude=5, dc_offset=200)] * 6
     )
     result = _record(
         monkeypatch, tmp_path, chunks,
         speech_rms=LEGACY_SPEECH_RMS, silence_rms=LEGACY_SILENCE_RMS,
     )
-    assert result.speech_seen is False
+    assert result.speech_seen is True
+
+
+def test_immediate_loud_speech_still_detected(monkeypatch, tmp_path):
+    """REGRESSION (der eigentliche Bug): Wer SOFORT laut lospricht, vergiftete
+    früher die Settle-Floor-Schätzung → Speech-Schwelle sprang auf den
+    180-Deckel, die restliche Ansage (100-ms-RMS ~110–180) fiel nie darüber →
+    ``speech_seen=False``, leeres Transkript. Live an INMP441-Aufnahmen
+    reproduziert. Der rückwirkende ``speech_present`` erkennt sie jetzt."""
+    chunks = (
+        [_chunk(amplitude=260, dc_offset=200)] * 3     # Settle — schon volle Sprache
+        + [_chunk(amplitude=230, dc_offset=200)] * 8   # weiter reden, RMS ~160
+        + [_chunk(amplitude=6, dc_offset=200)] * 4     # Stille
+    )
+    result = _record(monkeypatch, tmp_path, chunks)
+    assert result.speech_seen is True
+
+
+# --- Pure Funktion speech_present -----------------------------------------------
+
+def test_speech_present_detects_sustained_speech():
+    # Ruhepegel ~15, dann viele Chunks klar darüber → Sprache.
+    rms = [15.0] * 8 + [120.0] * 10
+    assert speech_present(rms) is True
+
+
+def test_speech_present_ignores_isolated_spikes():
+    """Ein Knopfklick/Einschalt-Transient sind 1–2 laute Chunks über sonst
+    ruhigem Pegel — darf NICHT als Sprache zählen (spike-robust)."""
+    rms = [14.0] * 20 + [900.0, 650.0]  # nur 2 Spikes
+    assert speech_present(rms) is False
+
+
+def test_speech_present_catches_quiet_child_over_low_floor():
+    # Leise Kinderstimme (~60 RMS) über sehr niedrigem Floor — knapp, aber da.
+    rms = [12.0] * 6 + [60.0, 66.0, 58.0, 62.0, 70.0]
+    assert speech_present(rms) is True
+
+
+def test_speech_present_rejects_flat_silence():
+    rms = [18.0, 20.0, 16.0, 15.0, 22.0, 17.0, 19.0, 21.0]
+    assert speech_present(rms) is False
+
+
+def test_speech_present_needs_minimum_chunks():
+    assert speech_present([500.0] * (SPEECH_DETECT_MIN_CHUNKS - 1)) is False
 
 
 def test_startup_transient_does_not_count_as_speech(monkeypatch, tmp_path):

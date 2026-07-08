@@ -345,6 +345,54 @@ class Backend:
             logger.debug("upload_voice_command: HTTP %s", resp.status_code)
         return resp.ok
 
+    def transcribe_audio(self, wav_path: Path, timeout: float | None = None) -> str | None:
+        """Phase 3 (Server-Hybrid): schickt das aufgenommene WAV zum
+        server-seitigen ASR-Dienst (faster-whisper) und gibt den Text zurück —
+        genauer als das lokale tiny-Modell.
+
+        Best-effort und BEWUSST nicht-blockierend für den Sprachfluss: bei
+        fehlendem Netz/Token, Timeout, Transportfehler oder wenn der Server-ASR
+        nicht scharfgeschaltet ist (HTTP 503), kommt ``None`` zurück — der
+        Aufrufer transkribiert dann lokal weiter. Wirft NIE.
+
+        Rückgabe: transkribierter Text (auch "" möglich, wenn der Server nichts
+        erkannt hat) oder ``None``, wenn Server-ASR nicht verfügbar war.
+        """
+        if not self.is_connected:
+            return None
+        wav_path = Path(wav_path)
+        if not wav_path.is_file():
+            return None
+        try:
+            with wav_path.open("rb") as fh:
+                resp = self._session.post(
+                    f"{self._base_url}/api/box/transcribe",
+                    files={"audio": ("command.wav", fh, "audio/wav")},
+                    headers=self._auth_headers(),
+                    timeout=timeout if timeout is not None else DEFAULT_DOWNLOAD_TIMEOUT,
+                )
+        except requests.RequestException as e:
+            logger.info("transcribe_audio: Server-ASR nicht erreichbar (%s) — lokal", e)
+            return None
+        if resp.status_code == 503:
+            # Server-ASR nicht scharf / Dienst down → lokal weiter.
+            logger.debug("transcribe_audio: Server-ASR nicht verfügbar (503)")
+            return None
+        if not resp.ok:
+            logger.info("transcribe_audio: HTTP %s — lokal", resp.status_code)
+            return None
+        try:
+            payload = resp.json()
+        except ValueError:
+            logger.info("transcribe_audio: unlesbare Antwort — lokal")
+            return None
+        # Auch wohlgeformtes, aber nicht-Objekt-JSON (z.B. [] von einem Proxy)
+        # abfangen — sonst würde payload.get() den "Wirft NIE"-Vertrag brechen.
+        if not isinstance(payload, dict) or payload.get("status") != "ok":
+            return None
+        text = payload.get("text")
+        return text if isinstance(text, str) else None
+
     def report_storage(self, total_mb: int, free_mb: int) -> bool:
         if not self.is_connected:
             return False

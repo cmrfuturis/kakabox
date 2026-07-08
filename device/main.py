@@ -152,6 +152,15 @@ VOICE_ZAUBERWORT_SILENCE_SECONDS = 0.9
 # daneben deutlich darunter — 0.70 trennt das sauber.
 VOICE_BARE_TITLE_THRESHOLD = 0.70
 
+# Phase 3 (Server-Hybrid): Timeout für den Server-ASR-Aufruf (Box = äußerste
+# Schicht). MUSS größer sein als das Laravel-Timeout (services.asr.timeout=12s),
+# damit die INNERE Schicht zuerst aufgibt und die Box eine saubere Antwort/503
+# bekommt — statt die Box mittendrin abbricht und das schon fertige (bessere)
+# Server-Transkript verwirft. Ordering: Inferenz < Laravel(12s) < Box(15s).
+# Schlägt der Server bis dahin nicht an, fällt die Box auf lokale Erkennung
+# zurück. Weiterhin kürzer als der HTTP-Download-Default (60s).
+SERVER_ASR_TIMEOUT = 15.0
+
 # Mindestdauer der Orange-Sync-Optik bei erkannter Dongel-Änderung — auch wenn
 # der Sync sofort fertig ist (nichts zu laden), bleibt das Feedback so lange
 # sichtbar, damit der User es wahrnimmt. Danach der Bestätigungssound.
@@ -2806,7 +2815,7 @@ class Kakabox:
                 # Stufe-0-Testset aktivieren (ASR-Plan 1.9). Der freie
                 # Decoder transkribiert phonetisch, der Fuzzy-/Phonetik-
                 # Match (intent.py) findet den Song.
-                text = self._recognizer.transcribe_wav(rec.path)
+                text = self._transcribe_command(rec.path)
             except VoiceUnavailable as e:
                 logger.warning("ASR nicht verfügbar: %s", e)
                 return
@@ -3069,6 +3078,37 @@ class Kakabox:
             logger.info("Zauberwort-Aufnahme ohne Sprache (VAD) — werte als Nein.")
             return False
         return self._detect_magic_word(rec.path)
+
+    def _transcribe_command(self, wav) -> str:
+        """Transkribiert einen Sprachbefehl — Phase 3 (Server-Hybrid).
+
+        Erst der server-seitige ASR-Dienst (faster-whisper, genauer als das
+        lokale tiny-Modell), bei jedem Fehlschlag/Timeout lokal. Server-ASR ist
+        opt-in (``voice.server_asr_enabled``, Default AUS — schickt Kinder-
+        Rohaudio an den Server) und wird nur versucht, wenn die Box online und
+        nicht im Standby ist. Ein leeres oder ausbleibendes Server-Ergebnis
+        fällt auf die lokale Erkennung zurück (nie ein harter Fehler).
+
+        Wirft nur ``VoiceUnavailable`` (aus dem lokalen Recognizer), damit der
+        Aufrufer den bestehenden Fehlerpfad behält.
+        """
+        voice_cfg = self.config.get("voice") or {}
+        if (
+            voice_cfg.get("server_asr_enabled")
+            and self.backend is not None
+            and self.backend.is_connected
+            and not self._standby
+        ):
+            try:
+                text = self.backend.transcribe_audio(wav, timeout=SERVER_ASR_TIMEOUT)
+            except Exception:  # defensiv — der Sprachfluss darf nie crashen
+                logger.exception("Server-ASR-Aufruf fehlgeschlagen → lokal.")
+                text = None
+            if text:
+                logger.info("Voice: Server-ASR genutzt (Phase 3).")
+                return text
+            logger.info("Voice: Server-ASR ohne Ergebnis/nicht verfügbar — lokale Erkennung.")
+        return self._recognizer.transcribe_wav(wav)
 
     def _detect_magic_word(self, wav) -> bool:
         """Prüft schnell, ob "bitte" in der Aufnahme steckt.

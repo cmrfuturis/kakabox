@@ -29,6 +29,11 @@ Kinderstimmen-Fixes (ASR-Plan 2026-07-07, Stufe 1.3):
   daraus abgeleitet (speech = floor×4, silence = floor×2, geklemmt so,
   dass sie nie ÜBER den alten C920-Werten liegen — die alten Werte sind
   das konservative Maximum, nicht mehr das Minimum).
+- **Rückwirkender ASR-Gate (``speech_present``):** Die Streaming-Schwellen
+  oben steuern nur noch den vorzeitigen Abbruch nach Stille. Ob überhaupt
+  Sprache da war (und damit ASR läuft), entscheidet ``speech_seen`` jetzt
+  RÜCKWIRKEND über den ganzen Puffer — robust gegen die Floor-Vergiftung, wenn
+  jemand sofort lospricht (Details + Kalibrierung s. ``speech_present`` unten).
 
 Threading: ``record_until_silence`` blockt im Aufrufer-Thread. Die Voice-
 Aktivierung im Main-Loop läuft sowieso in einem Hintergrund-Thread (Knopf-
@@ -77,6 +82,36 @@ DEFAULT_SETTLE_SECONDS = 0.3
 DEFAULT_SPEECH_RMS = LEGACY_SPEECH_RMS
 DEFAULT_SILENCE_RMS = LEGACY_SILENCE_RMS
 
+# Robuste, RÜCKWIRKENDE Sprach-Erkennung (``speech_present``, s.u.): der
+# eigentliche ASR-Gate. Entscheidet NACH der Aufnahme über den gesamten Puffer,
+# ob überhaupt Sprache drin war — unabhängig von den Streaming-Schwellen oben,
+# die nur noch den vorzeitigen Abbruch nach Stille steuern.
+#
+# WARUM: Die Streaming-Floor-Schätzung aus der 0,3s-Settle-Phase wird VERGIFTET,
+# sobald jemand sofort lospricht — der laute Wortanfang gilt dann als
+# "Grundrauschen", die Speech-Schwelle schnellt auf den 180-Deckel und echte
+# Sprache darunter wird NIE erkannt. Live an INMP441-Aufnahmen reproduziert:
+# klare Kommandos ("Der Zug hat keine Bremse") gingen reihenweise als "keine
+# Sprache" verloren, weil normale Sprechlautstärke am gain-losen Mic in
+# 100-ms-Fenstern nur ~110–180 RMS erreicht und die vergiftete Schwelle nie fiel.
+#
+# Der robuste Detektor schätzt den Floor als MINIMUM der GANZEN Aufnahme (der
+# leiseste Chunk = echter Ruhepegel, nicht das vergiftete Settle-Fenster) und
+# verlangt mind. ``SPEECH_DETECT_MIN_CHUNKS`` Chunks über
+# ``max(Floor×Faktor, Abs-Minimum)``. Min statt Perzentil, weil ein kurzes,
+# sprachdichtes Kommando kaum Stille-Chunks hat — ein Perzentil würde dann IN
+# der Sprache landen und den Floor hochtreiben. Die Chunk-ZAHL-Schwelle macht
+# die Erkennung spike-robust (ein Knopfklick/Einschalt-Transient sind 1–2 laute
+# Chunks, echte Sprache viele); das niedrige Abs-Minimum (55 statt 180) fängt
+# leise Kinderstimmen und deckelt zugleich einen zu niedrigen Floor (Dropout).
+# Rest-Fehlgeräusche (z.B. Motorbrummen) fängt die nachgelagerte Halluzinations-/
+# Routing-Schwelle (route_transcript → no_match). Provisorische Werte: an 35
+# echten Aufnahmen kalibriert (0 echte Kommandos verpasst, nur reines
+# [Motor]-Rauschen ließ der Gate durch → downstream no_match).
+SPEECH_DETECT_FLOOR_FACTOR = 2.5
+SPEECH_DETECT_ABS_MIN = 55.0
+SPEECH_DETECT_MIN_CHUNKS = 4
+
 
 class RecorderError(RuntimeError):
     pass
@@ -116,12 +151,35 @@ def adaptive_thresholds(noise_floor: float) -> tuple[float, float]:
 
     Geklemmt zwischen MIN_* (nie empfindlicher als sinnvoll) und den alten
     C920-Fixwerten (nie tauber als bisher). Garantiert silence < speech.
+
+    Nur noch für den Streaming-Abbruch nach Stille genutzt — der ASR-Gate
+    (``speech_seen``) kommt aus ``speech_present`` (s. Modul-Doku).
     """
     speech = min(max(noise_floor * SPEECH_FLOOR_FACTOR, MIN_SPEECH_RMS), LEGACY_SPEECH_RMS)
     silence = min(max(noise_floor * SILENCE_FLOOR_FACTOR, MIN_SILENCE_RMS), LEGACY_SILENCE_RMS)
     if silence >= speech:
         silence = speech / 2.0
     return speech, silence
+
+
+def speech_present(rms_values: list[float]) -> bool:
+    """True, wenn der fertige Aufnahme-Puffer echte Sprache enthält (ASR-Gate).
+
+    Rückwirkend über ALLE Chunk-RMS-Werte — robust gegen die Floor-Vergiftung
+    der Streaming-Erkennung (s. Modul-Doku): Floor = MINIMUM (leisester Chunk =
+    echter Ruhepegel, auch wenn sofort gesprochen wurde und selbst bei einem
+    sprachdichten Kurzkommando ohne Stille-Pause), Sprache = mind.
+    ``SPEECH_DETECT_MIN_CHUNKS`` Chunks über ``max(Floor×Faktor, Abs-Minimum)``.
+    Die Chunk-Zahl-Schwelle macht die Erkennung spike-robust: ein Einschalt-
+    Transient oder Knopfklick (1–2 laute Chunks) triggert nicht.
+
+    Pure Funktion — vom Eval-Harness und den Tests direkt nutzbar.
+    """
+    if len(rms_values) < SPEECH_DETECT_MIN_CHUNKS:
+        return False
+    floor = min(rms_values)
+    level = max(floor * SPEECH_DETECT_FLOOR_FACTOR, SPEECH_DETECT_ABS_MIN)
+    return sum(1 for r in rms_values if r >= level) >= SPEECH_DETECT_MIN_CHUNKS
 
 
 class MicRecorder:
@@ -182,7 +240,11 @@ class MicRecorder:
             raise RecorderError(f"arecord nicht installiert: {e}") from e
 
         recorded = bytearray()
-        speech_seen = False
+        # ``streaming_speech`` steuert NUR den vorzeitigen Abbruch nach Stille.
+        # Ob ASR läuft, entscheidet ``speech_present`` rückwirkend über
+        # ``rms_values`` (alle Chunks, inkl. Settle) — s. Modul-Doku.
+        rms_values: list[float] = []
+        streaming_speech = False
         silence_streak = 0
         # Noise-Floor-Schätzung über die Settle-Phase: MIN statt Mittelwert,
         # damit weder der Chunk-0-Transient noch ein sofort lossprechendes
@@ -197,6 +259,7 @@ class MicRecorder:
                 if not data or len(data) < chunk_bytes:
                     break
                 rms = chunk_rms(data, chunk_frames)
+                rms_values.append(rms)
 
                 if chunk_idx < settle_chunks:
                     # Einschwingphase: NICHT für die Speech-Detection nutzen
@@ -219,17 +282,17 @@ class MicRecorder:
 
                 recorded += data
                 if rms >= thr_speech:
-                    speech_seen = True
+                    streaming_speech = True
                     silence_streak = 0
                 elif rms < thr_silence:
                     silence_streak += 1
                 # In-between (silence ≤ rms < speech): keine Änderung —
                 # so frisst leises Nachhallen den Silence-Counter nicht weg.
-                if speech_seen and silence_streak >= silence_chunks_target:
+                if streaming_speech and silence_streak >= silence_chunks_target:
                     break
                 # Initial-Silence-Cap: wenn nach initial_silence_chunks (ab
                 # Settle-Ende) noch nichts gesprochen wurde, raus.
-                if not speech_seen and chunk_idx + 1 - settle_chunks >= initial_silence_chunks:
+                if not streaming_speech and chunk_idx + 1 - settle_chunks >= initial_silence_chunks:
                     break
         finally:
             proc.terminate()
@@ -251,11 +314,14 @@ class MicRecorder:
             w.setframerate(self.sample_rate)
             w.writeframes(bytes(recorded))
 
+        # Autoritativer ASR-Gate: robust über die ganze Aufnahme (s. Modul-Doku).
+        speech_seen = speech_present(rms_values)
         duration = len(recorded) / 2 / self.sample_rate
         logger.info(
-            "Voice-Aufnahme: %.2fs (%s%s)",
+            "Voice-Aufnahme: %.2fs (%s, %d Chunks%s)",
             duration,
             "speech detected" if speech_seen else "kein speech",
-            f", {silence_streak * chunk_ms}ms silence am Ende" if speech_seen else "",
+            len(rms_values),
+            f", {silence_streak * chunk_ms}ms silence am Ende" if streaming_speech else "",
         )
         return RecordingResult(path=path, speech_seen=speech_seen, duration_seconds=duration)

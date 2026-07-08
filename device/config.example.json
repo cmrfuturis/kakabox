@@ -26,6 +26,7 @@
     "governor_boost": true,
     "keep_samples": false,
     "samples_keep_days": 14,
-    "upload_commands": false
+    "upload_commands": false,
+    "server_asr_enabled": false
   }
 }
