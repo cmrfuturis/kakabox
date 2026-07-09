@@ -2804,8 +2804,20 @@ class Kakabox:
             finally:
                 if governor_boost:
                     self._set_cpu_governor("ondemand")
+                # LED zurück auf den passenden Status nach KI-Modus (gleiche
+                # Logik wie nach normalem Voice-Flow, siehe _run_voice_activation):
+                # Kakafigur aktiv → grün, Random-Modus → lila, sonst aus.
+                # KEIN self.leds.system_on() — die Methode existiert nicht auf
+                # Leds und crashte hier bisher jeden KI-Modus-Abbruch.
                 if self.leds is not None:
-                    self.leds.system_on()
+                    if self._active_tag_uid is not None or (
+                        self._voice_mode and self._voice_pending_tag_uid is not None
+                    ):
+                        self.leds.nfc_chip_present()
+                    elif self._random_mode:
+                        self.leds.nfc_random_active()
+                    else:
+                        self.leds.nfc_chip_absent()
         except Exception:
             logger.exception("KI-Konversation mit unerwartetem Fehler abgebrochen.")
         finally:
