@@ -1,5 +1,6 @@
 """Tests für voice.assistant — KI-Assistent für Kinder."""
 import json
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -204,6 +205,32 @@ def test_safety_filter_zauberwort_mode_only_music():
     assert not SafetyFilter.is_safe("Erzähl mir eine Geschichte", box_config)
 
 
+def test_safety_filter_uses_real_intent_not_text_heuristic():
+    """Regression (Live-Test 2026-07-09): die alte Text-Heuristik erriet den
+    Intent aus dem ANTWORTTEXT — ein Witz ohne Musik-Wörter wurde IMMER als
+    'answer' geblockt, unabhängig davon was Claude tatsächlich als intent
+    zurückgab, UND umgekehrt eine play_song-Antwort ohne das Wort 'spiel'
+    fälschlich geblockt. Mit dem echten intent-Parameter funktioniert beides
+    korrekt."""
+    from voice.assistant import SafetyFilter
+    box_config = {"zauberwort_mode_enabled": True}
+
+    joke_response = "Warum können Geister nicht lügen? Weil man durch sie hindurchsieht!"
+    assert not SafetyFilter.is_safe(joke_response, box_config, intent="joke")
+
+    play_response = "Hier kommt dein Lieblingslied!"  # kein "spiel" im Text
+    assert SafetyFilter.is_safe(play_response, box_config, intent="play_song")
+
+
+def test_safety_filter_falls_back_to_heuristic_without_intent():
+    """Ohne übergebenen intent (Legacy-Aufrufer) bleibt die alte Text-
+    Heuristik als Fallback aktiv."""
+    from voice.assistant import SafetyFilter
+    box_config = {"zauberwort_mode_enabled": True}
+    assert SafetyFilter.is_safe("Ich spiele jetzt dein Lied", box_config)
+    assert not SafetyFilter.is_safe("Warum können Geister nicht lügen?", box_config)
+
+
 def test_safety_filter_quiet_hours_blocks_scary_topics():
     from voice.assistant import SafetyFilter
     box_config = {"quiet_hours": [{"start": "20:00", "end": "07:00"}]}
@@ -224,14 +251,18 @@ class _FakeRecorder:
     (path + speech_seen), KEIN Transkript (das macht ein separates transcribe_fn,
     genau wie beim echten MicRecorder/Recognizer-Duo)."""
 
-    def __init__(self, speech_seen_sequence=None):
+    def __init__(self, speech_seen_sequence=None, cancelled_at=None):
         # Ein Bool pro Aufnahme-Runde. Läuft die Liste aus, liefert jede
         # weitere Runde "keine Sprache" (Stille) — beendet den Loop sicher.
         self.speech_seen_sequence = speech_seen_sequence if speech_seen_sequence is not None else [True]
+        # 0-basierter Call-Index, ab dem cancelled=True simuliert wird (harter
+        # Stopp, z.B. Blau-Knopf) — None = nie.
+        self.cancelled_at = cancelled_at
         self.call_count = 0
         self.recorded_kwargs = []
 
-    def record_until_silence(self, max_seconds=60.0, silence_seconds=5.0, initial_silence_seconds=5.0):
+    def record_until_silence(self, max_seconds=60.0, silence_seconds=5.0,
+                              initial_silence_seconds=5.0, cancel_event=None):
         self.recorded_kwargs.append({
             "max_seconds": max_seconds,
             "silence_seconds": silence_seconds,
@@ -240,7 +271,12 @@ class _FakeRecorder:
         idx = self.call_count
         self.call_count += 1
         result = MagicMock()
-        result.speech_seen = idx < len(self.speech_seen_sequence) and self.speech_seen_sequence[idx]
+        result.cancelled = self.cancelled_at is not None and idx >= self.cancelled_at
+        result.speech_seen = (
+            not result.cancelled
+            and idx < len(self.speech_seen_sequence)
+            and self.speech_seen_sequence[idx]
+        )
         result.path = f"/tmp/rec_{idx}.wav"
         return result
 
@@ -411,10 +447,11 @@ def test_speak_interruptible_no_barge_in_plays_normally():
 
     asst = VoiceAssistant(backend, player, recorder, speaker=speaker,
                            transcribe_fn=transcribe_fn, volume=50)
-    barged_in, transcript = asst._speak_interruptible("Hallo!")
+    barged_in, transcript, cancelled = asst._speak_interruptible("Hallo!")
 
     assert barged_in is False
     assert transcript is None
+    assert cancelled is False
     speaker.synth_to_wav.assert_called_with("Hallo!")
     player.play_prompt.assert_called_with("/tmp/answer.wav", 50)
     player.stop.assert_called_once()
@@ -434,10 +471,11 @@ def test_speak_interruptible_barge_in_stops_playback_and_returns_transcript():
 
     asst = VoiceAssistant(backend, player, recorder, speaker=speaker,
                            transcribe_fn=transcribe_fn, volume=50)
-    barged_in, transcript = asst._speak_interruptible("Es war einmal...")
+    barged_in, transcript, cancelled = asst._speak_interruptible("Es war einmal...")
 
     assert barged_in is True
     assert transcript == "Warte, ich hab noch was"
+    assert cancelled is False
     player.stop.assert_called_once()
 
 
@@ -451,10 +489,11 @@ def test_speak_interruptible_without_recorder_falls_back_to_blocking():
     speaker.synth_to_wav.return_value = "/tmp/answer.wav"
 
     asst = VoiceAssistant(backend, player, recorder=None, speaker=speaker, volume=50)
-    barged_in, transcript = asst._speak_interruptible("Hallo!")
+    barged_in, transcript, cancelled = asst._speak_interruptible("Hallo!")
 
     assert barged_in is False
     assert transcript is None
+    assert cancelled is False
     player.wait_until_idle.assert_called_once()
 
 
@@ -490,6 +529,96 @@ def test_conversation_loop_barge_in_skips_new_recording_for_next_turn():
     # der kam ja schon aus dem Barge-in.
     assert recorder.call_count == 2
     assert backend._session.post.call_count == 2
+
+
+def test_looks_like_self_echo_detects_matching_text():
+    """Regression (Live-Test 2026-07-09): ohne Echo-Unterdrückung hörte das
+    Mikro die eigene TTS-Stimme der Box und löste eine Rückkopplungsschleife
+    aus (Box sagt 'Davon kann ich dir nicht erzählen', hört sich selbst,
+    verarbeitet das erneut, blockiert erneut, hört sich wieder, ...)."""
+    from voice.assistant import _looks_like_self_echo
+    assert _looks_like_self_echo(
+        "Davon kann ich dir nicht erzählen.",
+        "Davon kann ich dir nicht erzählen.",
+    )
+    assert _looks_like_self_echo(
+        "Davon kann ich dir nicht erzählen.",
+        "davon kann ich dir nicht erzählen",  # leichte ASR-Variation
+    )
+
+
+def test_looks_like_self_echo_ignores_unrelated_text():
+    from voice.assistant import _looks_like_self_echo
+    assert not _looks_like_self_echo(
+        "Davon kann ich dir nicht erzählen.",
+        "Spiele mir 99 Luftballons",
+    )
+
+
+def test_speak_interruptible_filters_self_echo():
+    """Erkennt _speak_interruptible einen Text, der fast identisch mit der
+    gerade gesprochenen Antwort ist, wird das NICHT als Barge-in gewertet —
+    verhindert die live beobachtete Rückkopplungsschleife."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    recorder = _FakeRecorder(speech_seen_sequence=[True])
+    transcribe_fn = _fake_transcriber(["Davon kann ich dir nicht erzählen."])
+    speaker = MagicMock()
+    speaker.synth_to_wav.return_value = "/tmp/answer.wav"
+
+    asst = VoiceAssistant(backend, player, recorder, speaker=speaker,
+                           transcribe_fn=transcribe_fn, volume=50)
+    barged_in, transcript, cancelled = asst._speak_interruptible("Davon kann ich dir nicht erzählen.")
+
+    assert barged_in is False
+    assert transcript is None
+    assert cancelled is False
+
+
+# --------------------------------------------------------------------------
+# Harter Stopp — Blau-Knopf während KI-Modus bricht sofort ab
+# --------------------------------------------------------------------------
+
+
+def test_conversation_loop_hard_stop_via_cancel_event():
+    """Blau-Knopf während des KI-Modus (cancel_event) bricht die laufende
+    Aufnahme sofort ab und beendet die Konversation."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    recorder = _FakeRecorder(cancelled_at=0)  # sofort beim ersten Call
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    asst = VoiceAssistant(backend, player, recorder)
+    result = asst.conversation_loop({}, [], cancel_event=cancel_event)
+
+    assert result is None
+    assert recorder.call_count == 1
+
+
+def test_conversation_loop_hard_stop_during_speaking_stops_playback():
+    """Harter Stopp WÄHREND die KI gerade antwortet (Barge-in-Lauschphase)
+    bricht ebenfalls sofort ab und stoppt die laufende Wiedergabe."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    speaker = MagicMock()
+    speaker.synth_to_wav.return_value = "/tmp/answer.wav"
+    # [0] normale erste Aufnahme, [1] während der Antwort hart abgebrochen
+    recorder = _FakeRecorder(speech_seen_sequence=[True], cancelled_at=1)
+    transcribe_fn = _fake_transcriber(["Erzähl mir was"])
+    backend._session.post.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {"status": "ok", "intent": "story", "response": "Es war einmal...", "confidence": 0.9},
+    )
+
+    asst = VoiceAssistant(backend, player, recorder, speaker=speaker, transcribe_fn=transcribe_fn)
+    result = asst.conversation_loop({}, [], cancel_event=threading.Event())
+
+    assert result is None
+    player.stop.assert_called_once()
 
 
 def test_conversation_loop_speaks_response_via_tts():

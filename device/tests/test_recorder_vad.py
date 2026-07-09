@@ -228,3 +228,29 @@ def test_recording_stops_after_trailing_silence(monkeypatch, tmp_path):
     # 4 Sprach-Chunks + 3 Stille-Chunks (silence_seconds=0.3) ≈ 0,7s — weit
     # unter den verfügbaren 3,7s.
     assert result.duration_seconds <= 1.0
+
+
+class _CancelAfterN:
+    """Simuliert ein threading.Event, das erst nach N Abfragen 'gesetzt' ist —
+    testet den harten Abbruch MITTEN in der Aufnahme, nicht nur beim Start."""
+
+    def __init__(self, n):
+        self._count = 0
+        self._n = n
+
+    def is_set(self):
+        self._count += 1
+        return self._count > self._n
+
+
+def test_cancel_event_stops_recording_immediately(monkeypatch, tmp_path):
+    """Regression: harter KI-Modus-Stopp per Blau-Knopf (cancel_event) muss
+    die Aufnahme sofort beenden statt bis zum natürlichen Stille-/Timeout-Ende
+    weiterzulaufen."""
+    chunks = [_chunk(amplitude=2000.0, dc_offset=100)] * 20  # durchgehend "Sprache"
+    result = _record(monkeypatch, tmp_path, chunks, cancel_event=_CancelAfterN(2))
+
+    assert result.cancelled is True
+    assert result.speech_seen is False  # cancelled → nicht mehr transkribieren
+    # Deutlich weniger als die verfügbaren 20 Chunks (2s) verarbeitet.
+    assert result.duration_seconds < 1.0

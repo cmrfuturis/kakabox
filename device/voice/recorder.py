@@ -45,6 +45,7 @@ import logging
 import math
 import struct
 import subprocess
+import threading
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -127,10 +128,15 @@ class RecordingResult:
     gern plausible deutsche Sätze, die dann fälschlich ein Lied starten).
     ``__fspath__`` macht das Objekt path-like, damit bestehende Aufrufer
     (``transcribe_wav(result)``) ohne Umbau funktionieren.
+
+    ``cancelled`` ist True, wenn die Aufnahme per ``cancel_event`` von außen
+    hart abgebrochen wurde (z.B. Blau-Knopf während des KI-Modus) statt durch
+    normale Stille-/Timeout-Erkennung zu enden.
     """
     path: Path
     speech_seen: bool
     duration_seconds: float
+    cancelled: bool = False
 
     def __fspath__(self) -> str:
         return str(self.path)
@@ -200,6 +206,7 @@ class MicRecorder:
         silence_rms: Optional[float] = None,
         settle_seconds: float = DEFAULT_SETTLE_SECONDS,
         output_path: Path | str = "/tmp/kakabox_ptt.wav",
+        cancel_event: Optional[threading.Event] = None,
     ) -> RecordingResult:
         """Nimmt auf, bis ``silence_seconds`` zusammenhängende Stille NACH erster
         Sprache erreicht ist — spätestens nach ``max_seconds`` hart abgebrochen.
@@ -211,6 +218,12 @@ class MicRecorder:
         ``speech_rms``/``silence_rms``: explizite Schwellen-Overrides (Tests,
         Sonderfälle). Default ``None`` → adaptive Schwellen aus dem in der
         Settle-Phase gemessenen Noise-Floor (siehe Modul-Doku).
+
+        ``cancel_event``: wird zwischen den ~100ms-Chunks geprüft — ist es
+        gesetzt, bricht die Aufnahme SOFORT ab (arecord wird terminiert wie
+        beim normalen Ende auch). Für den harten KI-Modus-Stopp per Blau-
+        Knopf: ``RecordingResult.cancelled`` zeigt dem Aufrufer, dass dies
+        kein normales Stille-Ende war.
 
         Schreibt eine 16 kHz mono S16_LE-WAV (ohne die Settle-Phase). Wirft
         ``RecorderError`` wenn arecord nicht startet oder keine Frames liefert.
@@ -253,8 +266,12 @@ class MicRecorder:
         thr_speech = speech_rms if speech_rms is not None else LEGACY_SPEECH_RMS
         thr_silence = silence_rms if silence_rms is not None else LEGACY_SILENCE_RMS
         adaptive = speech_rms is None and silence_rms is None
+        was_cancelled = False
         try:
             for chunk_idx in range(max_chunks):
+                if cancel_event is not None and cancel_event.is_set():
+                    was_cancelled = True
+                    break
                 data = proc.stdout.read(chunk_bytes)
                 if not data or len(data) < chunk_bytes:
                     break
@@ -315,13 +332,17 @@ class MicRecorder:
             w.writeframes(bytes(recorded))
 
         # Autoritativer ASR-Gate: robust über die ganze Aufnahme (s. Modul-Doku).
-        speech_seen = speech_present(rms_values)
+        # Bei hartem Abbruch (cancel_event) gilt speech_seen als False — der
+        # Aufrufer soll nicht mehr transkribieren, nur den cancelled-Flag sehen.
+        speech_seen = speech_present(rms_values) and not was_cancelled
         duration = len(recorded) / 2 / self.sample_rate
         logger.info(
             "Voice-Aufnahme: %.2fs (%s, %d Chunks%s)",
             duration,
-            "speech detected" if speech_seen else "kein speech",
+            "abgebrochen" if was_cancelled else ("speech detected" if speech_seen else "kein speech"),
             len(rms_values),
             f", {silence_streak * chunk_ms}ms silence am Ende" if streaming_speech else "",
         )
-        return RecordingResult(path=path, speech_seen=speech_seen, duration_seconds=duration)
+        return RecordingResult(
+            path=path, speech_seen=speech_seen, duration_seconds=duration, cancelled=was_cancelled,
+        )

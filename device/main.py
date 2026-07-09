@@ -589,6 +589,12 @@ class Kakabox:
         self._mic_recorder = MicRecorder()
         self._voice_lock = threading.Lock()  # nur eine Voice-Session gleichzeitig
 
+        # KI-Modus-Status für den harten Stopp per Blau-Kurzdruck: True während
+        # _run_assistant_conversation läuft; _ki_cancel_event bricht die
+        # laufende Aufnahme/Wiedergabe sofort ab (siehe _on_blue_pressed).
+        self._ki_mode_active = False
+        self._ki_cancel_event = threading.Event()
+
         # KI-Assistent (Claude-basiert, Server-API). Nutzt denselben Speaker wie
         # die Titel-Ansage — gleiche Stimme (männlich/weiblich), gleicher Cache.
         self._assistant = VoiceAssistant(
@@ -2648,7 +2654,18 @@ class Kakabox:
         Läuft in einem Hintergrund-Thread, weil die Aufnahme + ASR mehrere
         Sekunden blocken kann — der Button-Handler darf nicht stehenbleiben,
         sonst kommt kein zweites Event durch.
+
+        User-Wunsch: läuft der KI-Modus gerade (hört zu ODER spricht), ist
+        ein kurzer Blau-Druck der HARTE STOPP — sofortiger Abbruch statt des
+        sonstigen "Voice bereits aktiv, ignoriert"-Verhaltens. Setzt nur das
+        cancel_event und kehrt sofort zurück; das eigentliche Abbrechen der
+        laufenden Aufnahme/Wiedergabe passiert im KI-Modus-Thread selbst
+        (siehe conversation_loop()/_speak_interruptible() in voice/assistant.py).
         """
+        if self._ki_mode_active:
+            logger.info("KI-Modus: harter Stopp angefordert (Blau gedrückt).")
+            self._ki_cancel_event.set()
+            return
         if self._abort_prompt_if_playing():
             return
         if self._speed_mode:
@@ -2714,7 +2731,13 @@ class Kakabox:
 
         Snapshoten → listening.wav → Gold LED pulsierend → conversation_loop()
         → bei play_song: positivton.wav + Start Track → Restore sonst.
+
+        _ki_mode_active/_ki_cancel_event so früh wie möglich setzen (vor dem
+        Snapshot), damit ein harter Stopp per Blau-Kurzdruck (_on_blue_pressed)
+        ab dem frühestmöglichen Zeitpunkt greift.
         """
+        self._ki_mode_active = True
+        self._ki_cancel_event.clear()
         try:
             # Snapshot wie bei Voice
             saved_tag_uid = self._active_tag_uid
@@ -2763,8 +2786,11 @@ class Kakabox:
                 # aktuellen Wert für die TTS-Antworten übernehmen.
                 self._assistant.volume = self._volume
 
-                # KI-Konversation (endlosschleife, 5s Stille-Abbruch)
-                result = self._assistant.conversation_loop(box_config, catalog)
+                # KI-Konversation (endlosschleife, 5s Stille-Abbruch, harter
+                # Stopp per Blau-Kurzdruck via _ki_cancel_event)
+                result = self._assistant.conversation_loop(
+                    box_config, catalog, cancel_event=self._ki_cancel_event,
+                )
 
                 if result and result.get("intent") == "play_song":
                     # play_song Intent → direkt abspielen, kein Bestätigungston nötig
@@ -2821,6 +2847,7 @@ class Kakabox:
         except Exception:
             logger.exception("KI-Konversation mit unerwartetem Fehler abgebrochen.")
         finally:
+            self._ki_mode_active = False
             self._voice_lock.release()
 
     def _load_raw_voice_catalog(self) -> list[dict]:

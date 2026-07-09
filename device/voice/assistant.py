@@ -12,7 +12,9 @@ Modus-Integration:
 """
 import json
 import logging
+import threading
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -40,8 +42,20 @@ class SafetyFilter:
     """Blockiert unsichere Inhalte für Kinder."""
 
     @staticmethod
-    def is_safe(text: str, box_config: dict) -> bool:
-        """Prüft ob Text für Kinder sicher ist."""
+    def is_safe(text: str, box_config: dict, intent: Optional[str] = None) -> bool:
+        """Prüft ob Text für Kinder sicher ist.
+
+        ``intent``: Claudes EIGENER, bereits bekannter Intent (aus der
+        strukturierten Antwort) — wird für den Zauberwort-Mode-Check genutzt,
+        statt ihn per Keyword-Heuristik aus dem Antworttext zu erraten. Ein
+        Witz/eine Geschichte enthält so gut wie nie Wörter wie "spiel" oder
+        "pause" — die alte Text-Heuristik hätte JEDE nicht-Musik-Antwort im
+        Zauberwort-Mode blockiert, unabhängig davon ob das Kind eigentlich
+        (auch) nach einem Lied gefragt hatte, und umgekehrt jede zufällige
+        Erwähnung von "aus"/"nächst" in einer Geschichte fälschlich als
+        erlaubten Musik-Intent durchgewunken. ``_detect_intent()`` bleibt nur
+        als Fallback, wenn kein Intent übergeben wird (Legacy-Aufrufer).
+        """
         text_lower = text.lower()
 
         # Vulgär / Rassistisch / Feindselig
@@ -53,9 +67,9 @@ class SafetyFilter:
         # Zauberwort-Mode: nur Musik-Befehle
         if box_config.get("zauberwort_mode_enabled"):
             allowed_intents = {"play_song", "pause", "next", "volume", "goodbye"}
-            intent = SafetyFilter._detect_intent(text_lower)
-            if intent not in allowed_intents:
-                logger.warning(f"SafetyFilter: zauberwort mode, intent '{intent}' not allowed")
+            effective_intent = intent if intent is not None else SafetyFilter._detect_intent(text_lower)
+            if effective_intent not in allowed_intents:
+                logger.warning(f"SafetyFilter: zauberwort mode, intent '{effective_intent}' not allowed")
                 return False
 
         # Nachtmodus: keine gruselig/Action-Inhalte
@@ -81,6 +95,32 @@ class SafetyFilter:
         elif any(word in text_lower for word in ["aus", "goodbye", "bye", "schlaf", "nacht"]):
             return "goodbye"
         return "answer"
+
+
+def _looks_like_self_echo(spoken_text: str, heard_text: str) -> bool:
+    """Grobe Heuristik gegen Mikro-Feedback während Barge-in-Lauschen: ohne
+    Hardware-Echo-Unterdrückung hört das Mikro manchmal die eigene TTS-Stimme
+    der Box mit. Ist der als "Kind hat geredet" erkannte Text fast identisch
+    mit dem, was die Box GERADE SELBST gesagt hat, ist das mit hoher
+    Wahrscheinlichkeit die eigene Stimme und kein echter Barge-in — Whisper
+    transkribiert synthetische TTS-Sprache meist sehr sauber (kein Hintergrund-
+    rauschen), daher reicht ein einfacher Ähnlichkeits-/Containment-Check.
+
+    Live beobachtet: ohne diesen Check konnte sich die Box in einer
+    Rückkopplungsschleife selbst "zuhören" — eine geblockte Antwort
+    ("Davon kann ich dir nicht erzählen.") wurde vom eigenen Mikro
+    aufgenommen, erneut als Kind-Eingabe verarbeitet, wieder geblockt,
+    wieder gehört, usw.
+    """
+    def norm(s: str) -> str:
+        return " ".join(s.lower().split())
+
+    a, b = norm(spoken_text), norm(heard_text)
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    return SequenceMatcher(None, a, b).ratio() > 0.7
 
 
 class VoiceAssistant:
@@ -132,6 +172,10 @@ class VoiceAssistant:
         self.speaker = speaker
         self.volume = volume
         self.transcribe_fn = transcribe_fn
+        # Wird von conversation_loop() pro Aufruf gesetzt — harter Stopp
+        # (z.B. Blau-Knopf während KI-Modus) bricht laufende Aufnahmen sofort
+        # ab, siehe record_until_silence()'s cancel_event-Parameter.
+        self._cancel_event: Optional[threading.Event] = None
 
         # Konversations-Memory (max 10 Turns, älteste werden gelöscht)
         self.history: list[dict[str, str]] = []
@@ -297,7 +341,7 @@ class VoiceAssistant:
         except Exception as e:
             logger.warning(f"KI-Modus: TTS/Wiedergabe-Fehler: {e}")
 
-    def _speak_interruptible(self, text: str) -> tuple[bool, Optional[str]]:
+    def _speak_interruptible(self, text: str) -> tuple[bool, Optional[str], bool]:
         """Wie ``_speak()``, aber lauscht GLEICHZEITIG aufs Mikrofon — redet
         das Kind während der Antwort rein (Barge-in, wie ChatGPT Voice Mode),
         wird die Wiedergabe SOFORT gestoppt statt zu Ende zu laufen.
@@ -305,10 +349,14 @@ class VoiceAssistant:
         Mikro-Aufnahme (arecord) und Wiedergabe (mpv) laufen auf getrennten
         ALSA-Geräten — kein Ressourcen-Konflikt. Das Restrisiko ist rein
         akustisch: ohne Echo-Unterdrückung in der Hardware hört das Mikro auch
-        die eigene Stimme der Box mit. Nutzt bewusst dieselbe adaptive VAD-
-        Schwelle wie normales Zuhören (kein blind geratener Sonder-Threshold) —
-        falls sich die Box dadurch live zu oft selbst unterbricht, muss das
-        empirisch nachjustiert werden (Mikro-/Lautsprecher-Abstand variiert).
+        die eigene Stimme der Box mit — dagegen filtert ``_looks_like_self_echo``
+        Treffer heraus, die fast wortgleich mit der gerade gesprochenen
+        Antwort sind (live beobachtet: ohne diesen Filter konnte sich die Box
+        in einer Rückkopplungsschleife selbst zuhören). Nutzt ansonsten
+        bewusst dieselbe adaptive VAD-Schwelle wie normales Zuhören (kein
+        blind geratener Sonder-Threshold) — falls sich die Box dadurch live zu
+        oft selbst unterbricht, muss das empirisch nachjustiert werden
+        (Mikro-/Lautsprecher-Abstand variiert).
 
         Die Aufnahme läuft mit den GLEICHEN Timeouts wie ein normaler Turn
         (SILENCE_TIMEOUT/TURN_SILENCE_SECONDS) — läuft die Antwort ungestört
@@ -317,20 +365,21 @@ class VoiceAssistant:
         Aufnahme mehr zu starten.
 
         Returns:
-            (barged_in, transcript) — barged_in=True wenn währenddessen oder
-            direkt danach Sprache erkannt wurde; transcript deren Text (None
-            bei Stille, ASR-Fehler oder wenn kein Recorder/ASR verfügbar ist).
+            (barged_in, transcript, cancelled) — cancelled=True wenn der
+            harte Stopp (self._cancel_event, z.B. Blau-Knopf) ausgelöst wurde;
+            barged_in=True wenn währenddessen/danach ECHTE Sprache erkannt
+            wurde (Selbst-Echo wird herausgefiltert, siehe oben).
         """
         if not self.speaker or not self.player or not text:
-            return False, None
+            return False, None, False
         try:
             wav = self.speaker.synth_to_wav(text)
         except Exception as e:
             logger.warning(f"KI-Modus: TTS-Synthese fehlgeschlagen: {e}")
-            return False, None
+            return False, None, False
         if wav is None:
             logger.info("KI-Modus: TTS lieferte keine WAV für Antwort.")
-            return False, None
+            return False, None, False
 
         if not self.recorder or not self.transcribe_fn:
             # Kein Barge-in möglich → normale, nicht unterbrechbare Wiedergabe.
@@ -339,41 +388,51 @@ class VoiceAssistant:
                 self.player.wait_until_idle(timeout=15.0)
             except Exception as e:
                 logger.warning(f"KI-Modus: TTS-Wiedergabe fehlgeschlagen: {e}")
-            return False, None
+            return False, None, False
 
         try:
             self.player.play_prompt(str(wav), self.volume)
         except Exception as e:
             logger.warning(f"KI-Modus: TTS-Wiedergabe fehlgeschlagen: {e}")
-            return False, None
+            return False, None, False
 
         try:
             rec = self.recorder.record_until_silence(
                 max_seconds=self.MAX_TURN_SECONDS,
                 silence_seconds=self.TURN_SILENCE_SECONDS,
                 initial_silence_seconds=self.SILENCE_TIMEOUT,
+                cancel_event=self._cancel_event,
             )
         except Exception as e:
             logger.warning(f"KI-Modus: Barge-in-Aufnahme fehlgeschlagen: {e}")
             rec = None
 
-        # Falls die Antwort noch läuft (Barge-in): SOFORT stoppen. Ist sie
-        # schon fertig (kein Barge-in, normales Zuhören auf den nächsten
-        # Turn), ist stop() ein günstiges No-op.
+        # Falls die Antwort noch läuft (Barge-in/harter Stopp): SOFORT
+        # stoppen. Ist sie schon fertig (kein Barge-in, normales Zuhören auf
+        # den nächsten Turn), ist stop() ein günstiges No-op.
         try:
             self.player.stop()
         except Exception as e:
             logger.warning(f"KI-Modus: Stop nach Antwort fehlgeschlagen: {e}")
 
+        if rec is not None and rec.cancelled:
+            logger.info("KI-Modus: hart abgebrochen (Blau-Knopf während Antwort).")
+            return False, None, True
+
         if not rec or not rec.speech_seen:
-            return False, None
+            return False, None, False
 
         try:
             transcript = self.transcribe_fn(rec.path) or ""
         except Exception as e:
             logger.warning(f"KI-Modus: Barge-in ASR-Fehler: {e}")
-            return True, None
-        return True, (transcript or None)
+            return True, None, False
+
+        if transcript and _looks_like_self_echo(text, transcript):
+            logger.info(f"KI-Modus: Barge-in ignoriert (vermutlich eigene Stimme gehört): «{transcript}»")
+            return False, None, False
+
+        return True, (transcript or None), False
 
     def _add_to_history(self, user_text: str, bot_response: str) -> None:
         """Speichert einen Konversations-Turn im Memory."""
@@ -391,7 +450,10 @@ class VoiceAssistant:
         self.history.clear()
         self.now_playing = None
 
-    def conversation_loop(self, box_config: dict, catalog: list[dict]) -> Optional[dict]:
+    def conversation_loop(
+        self, box_config: dict, catalog: list[dict],
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Optional[dict]:
         """Konversations-Modus: Endlosschleife bis Abbruch oder Play-Intent.
 
         Args:
@@ -399,12 +461,17 @@ class VoiceAssistant:
             catalog: Verfügbare Lieder (für Claude-Kontext) — Liste von
                 {"content_id": int, "title": str, ...} (roh aus voice_catalog.json,
                 NICHT die Candidate-Objekte des Fuzzy-Matchers).
+            cancel_event: wird während jeder Aufnahme geprüft — gesetzt (z.B.
+                Blau-Knopf während des KI-Modus), bricht die Aufnahme SOFORT
+                ab und der Loop beendet sich als harter Stopp (kein Error-Ton-
+                Abbruch-Unterschied für den Aufrufer, main.py behandelt beides
+                gleich als "Abbruch").
 
         Returns:
             {"intent": "play_song", "song_id": ..., "song_title": ...} bei Play-Wunsch,
             {"intent": "offline"} wenn der Server nicht erreichbar ist (Aufrufer
             spielt dann einen eigenen Offline-Hinweis statt des generischen
-            Fehlertons), oder None bei Abbruch (Stille/Goodbye/Fehler).
+            Fehlertons), oder None bei Abbruch (Stille/Goodbye/Fehler/harter Stopp).
         """
         # Offline-Gate VOR jeder Aufnahme: ohne Server keine Antwort möglich —
         # das Kind soll nicht erst sprechen und dann nur Stille/Error-Ton hören.
@@ -413,6 +480,7 @@ class VoiceAssistant:
             return {"intent": "offline"}
 
         logger.info("KI-Modus gestartet (5s Stille-Timeout)")
+        self._cancel_event = cancel_event
 
         # Von _speak_interruptible() erkannter Barge-in: das Kind hat schon
         # während/direkt nach der letzten Antwort weitergeredet — dieser Text
@@ -435,7 +503,11 @@ class VoiceAssistant:
                         max_seconds=self.MAX_TURN_SECONDS,
                         silence_seconds=self.TURN_SILENCE_SECONDS,
                         initial_silence_seconds=self.SILENCE_TIMEOUT,
+                        cancel_event=cancel_event,
                     )
+                    if rec is not None and rec.cancelled:
+                        logger.info("KI-Modus: hart abgebrochen (Blau-Knopf).")
+                        return None
                     if not rec or not rec.speech_seen:
                         # Stille ohne Sprache → Abbruch
                         logger.info("KI-Modus: Stille erkannt, beende")
@@ -471,16 +543,19 @@ class VoiceAssistant:
                     logger.warning("KI-Modus: ask() gab None zurück (Server-Fehler, Verbindung besteht) — Abbruch.")
                     return None
 
-                # 4. Safety-Check
+                # 4. Intent zuerst auslesen — Safety-Check nutzt Claudes ECHTEN
+                # Intent für den Zauberwort-Mode-Check (siehe SafetyFilter.is_safe-
+                # Doku: die alte Text-Heuristik hätte Witze/Geschichten fast
+                # immer fälschlich blockiert).
+                intent = result.get("intent", "answer")
                 response_text = result.get("response", "")
-                if not self.safety.is_safe(response_text, box_config):
+                if not self.safety.is_safe(response_text, box_config, intent=intent):
                     logger.warning("KI-Modus: Response blockiert (SafetyFilter)")
                     response_text = "Davon kann ich dir nicht erzählen."
 
-                # 5. Memory + Intent-Check (VOR dem Sprechen: play_song braucht
-                # keine gesprochene Antwort — main.py spielt direkt den Song).
+                # 5. Memory (play_song braucht keine gesprochene Antwort —
+                # main.py spielt direkt den Song).
                 self._add_to_history(transcript, response_text)
-                intent = result.get("intent", "answer")
 
                 if intent == "play_song":
                     action = result.get("action") or {}
@@ -500,7 +575,10 @@ class VoiceAssistant:
                 # 6. Antwort abspielen UND gleichzeitig auf Barge-in bzw. den
                 # nächsten Turn lauschen (wie ChatGPT Voice Mode) — redet das
                 # Kind rein, wird die Wiedergabe sofort gestoppt.
-                barged_in, next_transcript = self._speak_interruptible(response_text)
+                barged_in, next_transcript, cancelled = self._speak_interruptible(response_text)
+                if cancelled:
+                    logger.info("KI-Modus: hart abgebrochen (Blau-Knopf während Antwort).")
+                    return None
                 if barged_in:
                     if not next_transcript:
                         logger.info("KI-Modus: nach Antwort Sprache erkannt, ASR leer — beende")
