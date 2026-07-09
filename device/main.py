@@ -59,6 +59,7 @@ from hardware.rotary_encoder import Encoder as RotaryEncoder
 from network import Backend, BackendError
 from network.play_sessions import PlaySessionReporter
 from voice.asr import Recognizer, VoiceUnavailable, build_recognizer
+from voice.assistant import VoiceAssistant
 from voice.catalog import build_catalog_from_file, build_title_map_from_file
 from voice.intent import Candidate, has_magic_word
 from voice.recorder import MicRecorder, RecorderError
@@ -587,6 +588,16 @@ class Kakabox:
         ).start()
         self._mic_recorder = MicRecorder()
         self._voice_lock = threading.Lock()  # nur eine Voice-Session gleichzeitig
+
+        # KI-Assistent (Claude-basiert, Server-API)
+        self._assistant = VoiceAssistant(
+            backend=self.backend,
+            player=self.player,
+            recorder=self._mic_recorder,
+            tts_path=TTS_DIR / f"de_DE-{_voice_name}-low.onnx"  # TTS-Modell für Antworten
+        )
+        if self.config.get("child_age"):
+            self._assistant.child_age = self.config["child_age"]
 
         # Track-Ende-Callback an Player binden
         self.player.on_track_end(self._on_track_end)
