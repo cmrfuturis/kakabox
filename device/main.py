@@ -2660,7 +2660,7 @@ class Kakabox:
         sonstigen "Voice bereits aktiv, ignoriert"-Verhaltens. Setzt nur das
         cancel_event und kehrt sofort zurück; das eigentliche Abbrechen der
         laufenden Aufnahme/Wiedergabe passiert im KI-Modus-Thread selbst
-        (siehe conversation_loop()/_speak_interruptible() in voice/assistant.py).
+        (siehe conversation_loop()/_speak_sentences_interruptible() in voice/assistant.py).
         """
         if self._ki_mode_active:
             logger.info("KI-Modus: harter Stopp angefordert (Blau gedrückt).")

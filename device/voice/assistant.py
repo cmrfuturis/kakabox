@@ -17,14 +17,20 @@ import json
 import logging
 import re
 import threading
+import time
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
+from itertools import chain
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from voice.intent import has_magic_word
 
 logger = logging.getLogger(__name__)
+
+# Ersatztext, wenn der SafetyFilter eine Antwort (oder einen einzelnen Satz
+# im Streaming-Modus) blockiert.
+BLOCKED_TEXT = "Davon kann ich dir nicht erzählen."
 
 # Deutsche Blacklist: Wörter/Phrasen, die Kinder nicht hören sollen
 FORBIDDEN_WORDS = {
@@ -122,6 +128,94 @@ _EMOJI_RE = re.compile(
 def _strip_emoji(text: str) -> str:
     """Entfernt Emoji, damit die TTS nie deren Namen vorliest."""
     return _EMOJI_RE.sub("", text)
+
+
+# Satzgrenze fürs Streaming-TTS: nach [.!?…] + Whitespace, aber nur wenn danach
+# ein Großbuchstabe/Zahl/öffnendes Anführungszeichen folgt — verhindert Splits
+# mitten in Abkürzungen ("z.B. der Hund" bleibt zusammen, weil "der" klein
+# beginnt). Zeilenumbrüche sind IMMER eine Grenze (Claude nutzt sie zwischen
+# Absätzen).
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?…])\s+(?=[A-ZÄÖÜ0-9„»\"'])|\n+")
+# Latenz-/Speicher-Bound: kommt sehr lange kein Satzende, wird am letzten
+# Leerzeichen getrennt, damit die Wiedergabe nicht beliebig auf das Satzende
+# warten muss.
+_SENTENCE_MAX_BUFFER = 300
+
+
+def _iter_sentences(chunks: Iterator[str]) -> Iterator[str]:
+    """Schneidet einen Text-Chunk-Strom (beliebige Stückelung, z.B. LLM-Token)
+    an Satzgrenzen und liefert vollständige Sätze, sobald sie komplett sind —
+    Herzstück des Streaming-Sprechens: Satz 1 kann schon abgespielt werden,
+    während der Server Satz 2 noch generiert."""
+    buf = ""
+    for piece in chunks:
+        if not piece:
+            continue
+        buf += piece
+        while True:
+            m = _SENTENCE_BOUNDARY_RE.search(buf)
+            if m:
+                sent, buf = buf[: m.start()], buf[m.end():]
+                sent = sent.strip()
+                if sent:
+                    yield sent
+                continue
+            if len(buf) > _SENTENCE_MAX_BUFFER:
+                cut = buf.rfind(" ", 0, _SENTENCE_MAX_BUFFER)
+                if cut > 0:
+                    sent, buf = buf[:cut].strip(), buf[cut + 1:]
+                    if sent:
+                        yield sent
+                    continue
+            break
+    tail = buf.strip()
+    if tail:
+        yield tail
+
+
+def _split_meta_and_text(chunks: Iterator[str]) -> tuple[Optional[dict], Iterator[str]]:
+    """Trennt das Streaming-Antwortformat des Servers in (Meta, Text-Strom).
+
+    Format: erste nicht-leere Zeile = kompaktes JSON ({"intent": ..., "action":
+    ..., "confidence": ...}), danach der reine Sprechtext. Markdown-Fence-Zeilen
+    (```/```json) vor der Meta werden übersprungen — Claude wickelt Antworten
+    gelegentlich trotz Anweisung in Codeblocks (live beobachtet beim
+    Nicht-Streaming-Format).
+
+    Ist die erste inhaltliche Zeile KEIN JSON, gibt es keine Meta (None) und
+    die Zeile gehört zum Sprechtext — der Aufrufer behandelt die ganze Antwort
+    dann als intent="answer".
+    """
+    it = iter(chunks)
+    buf = ""
+    meta: Optional[dict] = None
+    while True:
+        nl = buf.find("\n")
+        if nl == -1:
+            piece = next(it, None)
+            if piece is None:
+                line, buf, exhausted = buf, "", True
+            else:
+                buf += piece
+                continue
+        else:
+            line, buf, exhausted = buf[:nl], buf[nl + 1:], False
+        candidate = line.strip()
+        if candidate == "" or candidate.startswith("```"):
+            if exhausted:
+                break
+            continue  # Leer-/Fence-Zeilen vor der Meta überspringen
+        try:
+            parsed = json.loads(candidate)
+            meta = parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            meta = None
+        if meta is None:
+            # Zeile ist kein Meta-JSON → sie ist Teil des Sprechtexts.
+            buf = line + ("\n" + buf if not exhausted else "")
+        break
+    text_chunks = chain([buf] if buf else [], it)
+    return meta, text_chunks
 
 
 class VoiceAssistant:
@@ -323,6 +417,90 @@ class VoiceAssistant:
             logger.warning(f"Assistant response parse error: {e}")
             return None
 
+    def _open_stream(self, transcript: str, box_config: dict, catalog: list[dict]):
+        """POST /api/box/assistant mit stream=true — bevorzugter Pfad: die
+        Antwort kommt als Text-Strom und kann satzweise gesprochen werden,
+        BEVOR sie komplett generiert ist (Siri-artige Reaktionszeit).
+
+        Abwärtskompatibel: ein alter Server ohne Streaming-Support ignoriert
+        das unbekannte stream-Feld in der Validierung und antwortet klassisch
+        mit dem vollen JSON — erkennbar am Content-Type application/json.
+
+        Returns:
+            ("stream", meta, text_chunks, response): Server streamt. ``meta``
+                ist das Intent-JSON der ersten Zeile, ``text_chunks`` der
+                Sprechtext-Strom, ``response`` das offene requests-Response
+                (zum Abbrechen per .close()).
+            ("legacy", result_dict, None, None): klassische Voll-JSON-Antwort.
+            None: Fehler (Netz/HTTP/Status) — Aufrufer entscheidet über
+                Offline-Meldung anhand backend.is_connected.
+        """
+        if not self.backend or not self.backend.is_connected:
+            return None
+
+        context = {
+            "child_age": self.child_age,
+            "conversation_history": self.history[-5:],
+            "box_config": box_config,
+            "catalog": catalog,
+            "stream": True,
+        }
+        if self.now_playing:
+            context["now_playing"] = self.now_playing
+
+        try:
+            # (connect, read): read = max. Lücke ZWISCHEN zwei Chunks, nicht
+            # Gesamtdauer — der Stream darf insgesamt länger laufen.
+            response = self.backend._session.post(
+                f"{self.backend._base_url}/api/box/assistant",
+                json={"transcript": transcript, **context},
+                headers=self.backend._auth_headers(),
+                timeout=(3.05, 30),
+                stream=True,
+            )
+        except Exception as e:
+            logger.warning(f"Assistant stream request failed: {e}")
+            return None
+
+        if response.status_code == 503:
+            logger.warning(f"Assistant disabled or unavailable (503): {response.text[:200]}")
+            response.close()
+            return None
+        if not response.ok:
+            logger.warning(f"Assistant HTTP {response.status_code}: {response.text[:200]}")
+            response.close()
+            return None
+
+        content_type = str(response.headers.get("Content-Type") or "").lower()
+        if "application/json" in content_type:
+            # Alter Server ohne Streaming — klassische Voll-JSON-Antwort.
+            try:
+                data = response.json()
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"Assistant response parse error: {e}")
+                return None
+            finally:
+                response.close()
+            if data.get("status") != "ok":
+                logger.warning(f"Assistant response status != ok: {data}")
+                return None
+            return ("legacy", data, None, None)
+
+        response.encoding = "utf-8"
+        try:
+            chunks = response.iter_content(chunk_size=None, decode_unicode=True)
+            meta, text_chunks = _split_meta_and_text(chunks)
+        except Exception as e:
+            logger.warning(f"Assistant stream read failed: {e}")
+            response.close()
+            return None
+        if meta is None:
+            # Keine Meta-Zeile — gesamte Antwort als einfachen Antworttext
+            # behandeln (defensiv gegen Format-Ausreißer von Claude).
+            logger.warning("Assistant stream ohne Meta-Zeile — behandle alles als Antworttext.")
+            meta = {"intent": "answer", "confidence": 0.0}
+        return ("stream", meta, text_chunks, response)
+
     def _speak(self, text: str) -> None:
         """Synthetisiert ``text`` per TTS und spielt ihn ab — best-effort.
 
@@ -345,110 +523,176 @@ class VoiceAssistant:
         except Exception as e:
             logger.warning(f"KI-Modus: TTS/Wiedergabe-Fehler: {e}")
 
-    def _speak_interruptible(self, text: str) -> tuple[bool, Optional[str], bool]:
-        """Wie ``_speak()``, aber lauscht GLEICHZEITIG aufs Mikrofon — redet
-        das Kind während der Antwort rein (Barge-in, wie ChatGPT Voice Mode),
-        wird die Wiedergabe SOFORT gestoppt statt zu Ende zu laufen.
+    def _speak_sentences_blocking(self, sentences: Iterator[str]) -> str:
+        """Spricht alle Sätze nacheinander, NICHT unterbrechbar (für goodbye).
+        Gibt den tatsächlich gesprochenen Gesamttext zurück."""
+        spoken: list[str] = []
+        for sent in sentences:
+            s = _strip_emoji(sent).strip().strip("`").strip()
+            if not s:
+                continue
+            spoken.append(s)
+            self._speak(s)
+        return " ".join(spoken)
 
-        Mikro-Aufnahme (arecord) und Wiedergabe (mpv) laufen auf getrennten
-        ALSA-Geräten — kein Ressourcen-Konflikt. Das Restrisiko ist rein
-        akustisch: ohne Echo-Unterdrückung in der Hardware hört das Mikro auch
-        die eigene Stimme der Box mit — dagegen filtert ``_looks_like_self_echo``
-        Treffer heraus, die fast wortgleich mit der gerade gesprochenen
-        Antwort sind (live beobachtet: ohne diesen Filter konnte sich die Box
-        in einer Rückkopplungsschleife selbst zuhören). Nutzt ansonsten
-        bewusst dieselbe adaptive VAD-Schwelle wie normales Zuhören (kein
-        blind geratener Sonder-Threshold) — falls sich die Box dadurch live zu
-        oft selbst unterbricht, muss das empirisch nachjustiert werden
-        (Mikro-/Lautsprecher-Abstand variiert).
+    def _speak_sentences_interruptible(
+        self, sentences: Iterator[str], box_config: dict,
+        close_stream: Optional[Callable[[], None]] = None,
+    ) -> dict:
+        """Spricht Sätze aus ``sentences`` (ggf. live vom Server-Stream) und
+        lauscht GLEICHZEITIG aufs Mikrofon — redet das Kind rein (Barge-in,
+        wie ChatGPT Voice Mode), stoppt die Wiedergabe SOFORT.
 
-        Die Aufnahme läuft mit den GLEICHEN Timeouts wie ein normaler Turn
-        (SILENCE_TIMEOUT/TURN_SILENCE_SECONDS) — läuft die Antwort ungestört
-        durch, geht das Lauschen nahtlos in die normale "warte auf nächsten
-        Turn"-Phase über. Der Aufrufer braucht danach KEINE zusätzliche
-        Aufnahme mehr zu starten.
+        Architektur: ein Speaker-Thread konsumiert die Sätze (blockiert dabei
+        ggf. auf dem Netzwerk-Stream), synthetisiert den NÄCHSTEN Satz, während
+        der vorige noch spielt (Pipeline: Netz ∥ TTS ∥ Wiedergabe), und prüft
+        jeden Satz einzeln gegen den SafetyFilter. Der aufrufende Thread
+        lauscht parallel in wiederholten Aufnahme-Fenstern: solange die
+        Wiedergabe läuft, beendet ein sprachloses Fenster NICHTS (behebt den
+        Vorgänger-Bug, bei dem eine Antwort > ~5s nach dem ersten stillen
+        Fenster per player.stop() abgeschnitten wurde, wenn das Mikro die
+        Box-Stimme nicht hörte). Erst ein volles Stille-Fenster, das NACH dem
+        Wiedergabe-Ende begann, beendet die Konversation.
 
-        Returns:
-            (barged_in, transcript, cancelled) — cancelled=True wenn der
-            harte Stopp (self._cancel_event, z.B. Blau-Knopf) ausgelöst wurde;
-            barged_in=True wenn währenddessen/danach ECHTE Sprache erkannt
-            wurde (Selbst-Echo wird herausgefiltert, siehe oben).
+        Selbst-Echo (Mikro hört die eigene TTS-Stimme, keine Hardware-AEC)
+        wird über _looks_like_self_echo gegen ALLES bisher Gesprochene
+        gefiltert und ignoriert — die Wiedergabe läuft dann weiter.
+
+        Returns dict:
+            outcome: "silence"          — Stille nach Antwortende → Konversation beenden
+                     "barge_in"         — echtes Reinreden; transcript = nächster Turn
+                     "cancelled"        — harter Stopp (Blau-Knopf)
+                     "done_no_listener" — gesprochen ohne Barge-in-Fähigkeit
+                                          (kein Recorder/ASR); Aufrufer nimmt
+                                          danach normal den nächsten Turn auf
+            transcript: bei barge_in der erkannte Text (None wenn ASR leer)
+            full_text: alles tatsächlich Gesprochene (für History/Echo-Check)
         """
-        if not self.speaker or not self.player or not text:
-            return False, None, False
-        text = _strip_emoji(text).strip()
-        if not text:
-            return False, None, False
-        try:
-            wav = self.speaker.synth_to_wav(text)
-        except Exception as e:
-            logger.warning(f"KI-Modus: TTS-Synthese fehlgeschlagen: {e}")
-            return False, None, False
-        if wav is None:
-            logger.info("KI-Modus: TTS lieferte keine WAV für Antwort.")
-            return False, None, False
+        spoken_parts: list[str] = []
+
+        def _close_stream_quiet() -> None:
+            if close_stream:
+                try:
+                    close_stream()
+                except Exception:
+                    pass
+
+        if not self.speaker or not self.player:
+            # Keine Sprachausgabe möglich — Stream nicht ewig offen halten.
+            _close_stream_quiet()
+            return {"outcome": "done_no_listener", "transcript": None, "full_text": ""}
 
         if not self.recorder or not self.transcribe_fn:
-            # Kein Barge-in möglich → normale, nicht unterbrechbare Wiedergabe.
+            # Kein Barge-in möglich → blockierend sprechen; der Aufrufer nimmt
+            # danach ganz normal den nächsten Turn auf.
+            full = self._speak_sentences_blocking(sentences)
+            _close_stream_quiet()
+            return {"outcome": "done_no_listener", "transcript": None, "full_text": full}
+
+        stop_event = threading.Event()
+        playback_done = threading.Event()
+
+        def _speaker_thread() -> None:
+            playing = False
             try:
-                self.player.play_prompt(str(wav), self.volume)
-                self.player.wait_until_idle(timeout=15.0)
+                for sent in sentences:
+                    if stop_event.is_set():
+                        break
+                    s = _strip_emoji(sent).strip().strip("`").strip()
+                    if not s:
+                        continue
+                    stop_after = False
+                    if not self.safety.is_safe(s, box_config):
+                        logger.warning("KI-Modus: Satz blockiert (SafetyFilter) — Rest der Antwort verworfen.")
+                        s = BLOCKED_TEXT
+                        stop_after = True
+                    try:
+                        # Synthese läuft, WÄHREND der vorige Satz noch spielt.
+                        wav = self.speaker.synth_to_wav(s)
+                    except Exception as e:
+                        logger.warning(f"KI-Modus: TTS-Synthese fehlgeschlagen: {e}")
+                        continue
+                    if wav is None:
+                        continue
+                    if playing:
+                        self.player.wait_until_idle(timeout=30.0)
+                    if stop_event.is_set():
+                        break
+                    spoken_parts.append(s)
+                    self.player.play_prompt(str(wav), self.volume)
+                    playing = True
+                    if stop_after:
+                        break
+                if playing and not stop_event.is_set():
+                    self.player.wait_until_idle(timeout=30.0)
             except Exception as e:
-                logger.warning(f"KI-Modus: TTS-Wiedergabe fehlgeschlagen: {e}")
-            return False, None, False
+                # Auch der Abbruch-Fall landet hier: close_stream() lässt das
+                # blockierende Netzwerk-Read im Satz-Iterator eine Exception
+                # werfen — gewollt, kein Fehler.
+                logger.info(f"KI-Modus: Streaming-Wiedergabe beendet: {e}")
+            finally:
+                playback_done.set()
 
-        try:
-            self.player.play_prompt(str(wav), self.volume)
-        except Exception as e:
-            logger.warning(f"KI-Modus: TTS-Wiedergabe fehlgeschlagen: {e}")
-            return False, None, False
+        speaker_thread = threading.Thread(
+            target=_speaker_thread, daemon=True, name="ki-tts-stream",
+        )
+        speaker_thread.start()
 
-        try:
-            rec = self.recorder.record_until_silence(
-                max_seconds=self.MAX_TURN_SECONDS,
-                silence_seconds=self.TURN_SILENCE_SECONDS,
-                initial_silence_seconds=self.SILENCE_TIMEOUT,
-                cancel_event=self._cancel_event,
-            )
-        except Exception as e:
-            logger.warning(f"KI-Modus: Barge-in-Aufnahme fehlgeschlagen: {e}")
-            rec = None
+        def _shutdown_playback() -> None:
+            stop_event.set()
+            _close_stream_quiet()
+            try:
+                self.player.stop()
+            except Exception as e:
+                logger.warning(f"KI-Modus: Stop nach Antwort fehlgeschlagen: {e}")
+            speaker_thread.join(timeout=5.0)
 
-        # Falls die Antwort noch läuft (Barge-in/harter Stopp): SOFORT
-        # stoppen. Ist sie schon fertig (kein Barge-in, normales Zuhören auf
-        # den nächsten Turn), ist stop() ein günstiges No-op.
-        try:
-            self.player.stop()
-        except Exception as e:
-            logger.warning(f"KI-Modus: Stop nach Antwort fehlgeschlagen: {e}")
+        while True:
+            # Merken, ob dieses Lauschfenster erst NACH dem Wiedergabe-Ende
+            # begann — nur dann darf ein sprachloses Fenster die Konversation
+            # beenden (sonst würde eine lange Antwort das 5s-Fenster sprengen).
+            window_after_playback = playback_done.is_set()
+            try:
+                rec = self.recorder.record_until_silence(
+                    max_seconds=self.MAX_TURN_SECONDS,
+                    silence_seconds=self.TURN_SILENCE_SECONDS,
+                    initial_silence_seconds=self.SILENCE_TIMEOUT,
+                    cancel_event=self._cancel_event,
+                )
+            except Exception as e:
+                logger.warning(f"KI-Modus: Barge-in-Aufnahme fehlgeschlagen: {e}")
+                rec = None
 
-        # Defense-in-depth: falls record_until_silence() TROTZ des Fixes in
-        # recorder.py mal mit einer Exception statt cancelled=True rausfällt
-        # (rec bleibt dann None), prüfen wir das cancel_event direkt — sonst
-        # geht ein harter Stopp als generischer Fehler verloren und der Loop
-        # versucht fälschlich normal weiterzumachen (live beobachtet: führte
-        # zu einer zweiten Aufnahme mit noch gesetztem cancel_event → erneuter
-        # Crash statt sauberem Abbruch).
-        if (rec is not None and rec.cancelled) or (
-            self._cancel_event is not None and self._cancel_event.is_set()
-        ):
-            logger.info("KI-Modus: hart abgebrochen (Blau-Knopf während Antwort).")
-            return False, None, True
+            if (rec is not None and rec.cancelled) or (
+                self._cancel_event is not None and self._cancel_event.is_set()
+            ):
+                _shutdown_playback()
+                return {"outcome": "cancelled", "transcript": None,
+                        "full_text": " ".join(spoken_parts)}
 
-        if not rec or not rec.speech_seen:
-            return False, None, False
+            if rec is not None and rec.speech_seen:
+                try:
+                    transcript = self.transcribe_fn(rec.path) or ""
+                except Exception as e:
+                    logger.warning(f"KI-Modus: Barge-in ASR-Fehler: {e}")
+                    transcript = ""
+                if transcript and _looks_like_self_echo(" ".join(spoken_parts), transcript):
+                    logger.info(f"KI-Modus: Barge-in ignoriert (vermutlich eigene Stimme): «{transcript}»")
+                    continue  # weiterlauschen, Wiedergabe läuft ungestört weiter
+                _shutdown_playback()
+                return {"outcome": "barge_in", "transcript": transcript or None,
+                        "full_text": " ".join(spoken_parts)}
 
-        try:
-            transcript = self.transcribe_fn(rec.path) or ""
-        except Exception as e:
-            logger.warning(f"KI-Modus: Barge-in ASR-Fehler: {e}")
-            return True, None, False
-
-        if transcript and _looks_like_self_echo(text, transcript):
-            logger.info(f"KI-Modus: Barge-in ignoriert (vermutlich eigene Stimme gehört): «{transcript}»")
-            return False, None, False
-
-        return True, (transcript or None), False
+            # Kein Speech in diesem Fenster:
+            if window_after_playback:
+                # Volles Stille-Fenster NACH Antwortende → Konversation zu Ende.
+                _shutdown_playback()  # nur Aufräumen, Wiedergabe ist längst durch
+                return {"outcome": "silence", "transcript": None,
+                        "full_text": " ".join(spoken_parts)}
+            if rec is None:
+                # Aufnahmefehler, Wiedergabe läuft noch — nicht heiß loopen.
+                time.sleep(0.5)
+            # sonst: Fenster überlappte die Wiedergabe → einfach weiterlauschen.
 
     def _add_to_history(self, user_text: str, bot_response: str) -> None:
         """Speichert einen Konversations-Turn im Memory."""
@@ -498,7 +742,7 @@ class VoiceAssistant:
         logger.info("KI-Modus gestartet (5s Stille-Timeout)")
         self._cancel_event = cancel_event
 
-        # Von _speak_interruptible() erkannter Barge-in: das Kind hat schon
+        # Von _speak_sentences_interruptible() erkannter Barge-in: das Kind hat schon
         # während/direkt nach der letzten Antwort weitergeredet — dieser Text
         # ist der nächste Turn, keine neue Aufnahme nötig (ist schon passiert).
         pending_transcript: Optional[str] = None
@@ -546,9 +790,12 @@ class VoiceAssistant:
 
                 logger.info(f"KI-Modus transkribiert: «{transcript}»")
 
-                # 3. Claude verstehen (inkl. box_config + catalog)
-                result = self.ask(transcript, box_config, catalog)
-                if not result:
+                # 3. Claude fragen — bevorzugt STREAMEND: die Antwort wird
+                # satzweise gesprochen, sobald der erste Satz generiert ist,
+                # statt auf das komplette Ergebnis zu warten. Ein alter Server
+                # ohne Streaming antwortet klassisch mit Voll-JSON ("legacy").
+                opened = self._open_stream(transcript, box_config, catalog)
+                if opened is None:
                     # "offline" nur, wenn WIRKLICH keine Verbindung mehr besteht
                     # (User-Wunsch) — ein serverseitiger Fehler (503/500/kaputtes
                     # JSON) bei bestehender Verbindung ist kein Offline-Zustand
@@ -556,18 +803,26 @@ class VoiceAssistant:
                     if not self.backend or not self.backend.is_connected:
                         logger.warning("KI-Modus: Verbindung während Konversation verloren.")
                         return {"intent": "offline"}
-                    logger.warning("KI-Modus: ask() gab None zurück (Server-Fehler, Verbindung besteht) — Abbruch.")
+                    logger.warning("KI-Modus: Server-Fehler (Verbindung besteht) — Abbruch.")
                     return None
 
-                # 4. Intent auslesen. Zauberwort-Modus betrifft NUR Song-
-                # Wünsche (User-Klarstellung 2026-07-09): ohne "bitte" im
+                kind, meta, text_chunks, stream_response = opened
+                close_stream: Optional[Callable[[], None]] = (
+                    stream_response.close if stream_response is not None else None
+                )
+                # Beim Legacy-Pfad liegt der komplette Antworttext schon vor;
+                # beim Stream-Pfad kommt er erst noch (text_chunks).
+                legacy_text: Optional[str] = (
+                    meta.get("response", "") if kind == "legacy" else None
+                )
+
+                # 4. Intent + Zauberwort-Gate. Zauberwort-Modus betrifft NUR
+                # Song-Wünsche (User-Klarstellung 2026-07-09): ohne "bitte" im
                 # TRANSKRIPT (nicht im Antworttext!) wird play_song zu answer
                 # umgewidmet + eine Erinnerung gesprochen — Witze/Geschichten/
-                # Fragen sind davon komplett unberührt, unabhängig ob "bitte"
-                # gesagt wurde. Deterministischer Backstop, falls Claude die
-                # Regel aus dem System-Prompt trotzdem mal ignoriert.
-                intent = result.get("intent", "answer")
-                response_text = result.get("response", "")
+                # Fragen sind davon komplett unberührt. Deterministischer
+                # Backstop, falls Claude die System-Prompt-Regel ignoriert.
+                intent = meta.get("intent", "answer")
                 if (
                     intent == "play_song"
                     and box_config.get("zauberwort_mode_enabled")
@@ -575,45 +830,83 @@ class VoiceAssistant:
                 ):
                     logger.info("KI-Modus: Zauberwort-Mode aktiv, 'bitte' fehlt — kein Playback.")
                     intent = "answer"
-                    response_text = "Du musst noch 'bitte' sagen, wenn du ein Lied hören möchtest!"
-
-                if not self.safety.is_safe(response_text, box_config):
-                    logger.warning("KI-Modus: Response blockiert (SafetyFilter)")
-                    response_text = "Davon kann ich dir nicht erzählen."
-
-                # 5. Memory (play_song braucht keine gesprochene Antwort —
-                # main.py spielt direkt den Song).
-                self._add_to_history(transcript, response_text)
+                    if close_stream is not None:
+                        # Rest der Stream-Antwort verwerfen — gesprochen wird
+                        # nur die Erinnerung.
+                        try:
+                            close_stream()
+                        except Exception:
+                            pass
+                        close_stream = None
+                        text_chunks = None
+                    legacy_text = "Du musst noch 'bitte' sagen, wenn du ein Lied hören möchtest!"
 
                 if intent == "play_song":
-                    action = result.get("action") or {}
+                    if close_stream is not None:
+                        # Die Bestätigung ("Ich spiele …") spricht main.py —
+                        # der restliche Stream-Text wird nicht gebraucht.
+                        try:
+                            close_stream()
+                        except Exception:
+                            pass
+                    action = meta.get("action") or {}
                     song_id = action.get("song_id")
                     song_title = action.get("song_title")
                     logger.info(f"KI-Modus: Play-Intent → {song_title}")
+                    self._add_to_history(
+                        transcript,
+                        legacy_text or (f"Ich spiele {song_title}." if song_title else ""),
+                    )
                     return {"intent": "play_song", "song_id": song_id, "song_title": song_title}
 
+                # 5. Sprech-Quelle vereinheitlichen: Legacy-/Ersatztexte werden
+                # über denselben Satz-Iterator gesprochen wie der Live-Stream.
+                if legacy_text is not None:
+                    if not self.safety.is_safe(legacy_text, box_config):
+                        logger.warning("KI-Modus: Response blockiert (SafetyFilter)")
+                        legacy_text = BLOCKED_TEXT
+                    sentences = _iter_sentences(iter([legacy_text]))
+                else:
+                    # Stream-Pfad: SafetyFilter läuft pro Satz im Speaker-Thread.
+                    sentences = _iter_sentences(text_chunks)
+
                 if intent == "goodbye":
-                    # Nicht unterbrechbar — Konversation endet hier ohnehin;
-                    # ein Barge-in während des Abschieds würde sonst verworfen
-                    # (bewusste Vereinfachung, siehe _speak_interruptible-Doku).
-                    self._speak(response_text)
+                    # Nicht unterbrechbar — Konversation endet hier ohnehin.
+                    full = self._speak_sentences_blocking(sentences)
+                    if close_stream is not None:
+                        try:
+                            close_stream()
+                        except Exception:
+                            pass
+                    self._add_to_history(transcript, full or (legacy_text or ""))
                     logger.info("KI-Modus: Goodbye-Intent, beende")
                     return None
 
                 # 6. Antwort abspielen UND gleichzeitig auf Barge-in bzw. den
                 # nächsten Turn lauschen (wie ChatGPT Voice Mode) — redet das
-                # Kind rein, wird die Wiedergabe sofort gestoppt.
-                barged_in, next_transcript, cancelled = self._speak_interruptible(response_text)
-                if cancelled:
+                # Kind rein, wird die Wiedergabe sofort gestoppt. Das Lauschen
+                # deckt auch die Nach-Antwort-Phase ab ("silence" = 5s Stille
+                # nach Antwortende → Konversation vorbei).
+                outcome = self._speak_sentences_interruptible(
+                    sentences, box_config, close_stream=close_stream,
+                )
+                self._add_to_history(
+                    transcript, outcome["full_text"] or (legacy_text or ""),
+                )
+
+                if outcome["outcome"] == "cancelled":
                     logger.info("KI-Modus: hart abgebrochen (Blau-Knopf während Antwort).")
                     return None
-                if barged_in:
-                    if not next_transcript:
+                if outcome["outcome"] == "silence":
+                    logger.info("KI-Modus: Stille nach Antwort, beende")
+                    return None
+                if outcome["outcome"] == "barge_in":
+                    if not outcome["transcript"]:
                         logger.info("KI-Modus: nach Antwort Sprache erkannt, ASR leer — beende")
                         return None
-                    pending_transcript = next_transcript
-                # sonst: pending_transcript bleibt None → nächste Iteration
-                # nimmt normal auf (Antwort lief ungestört durch).
+                    pending_transcript = outcome["transcript"]
+                # "done_no_listener": kein Barge-in-fähiges Setup — nächste
+                # Iteration nimmt ganz normal den nächsten Turn auf.
 
             except Exception as e:
                 logger.exception(f"KI-Modus: Fehler in Loop: {e}")
