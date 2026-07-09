@@ -589,12 +589,14 @@ class Kakabox:
         self._mic_recorder = MicRecorder()
         self._voice_lock = threading.Lock()  # nur eine Voice-Session gleichzeitig
 
-        # KI-Assistent (Claude-basiert, Server-API)
+        # KI-Assistent (Claude-basiert, Server-API). Nutzt denselben Speaker wie
+        # die Titel-Ansage — gleiche Stimme (männlich/weiblich), gleicher Cache.
         self._assistant = VoiceAssistant(
             backend=self.backend,
             player=self.player,
             recorder=self._mic_recorder,
-            tts_path=TTS_DIR / f"de_DE-{_voice_name}-low.onnx"  # TTS-Modell für Antworten
+            speaker=self._speaker,
+            volume=self._volume,
         )
         if self.config.get("child_age"):
             self._assistant.child_age = self.config["child_age"]
@@ -2752,7 +2754,13 @@ class Kakabox:
                     "zauberwort_mode_enabled": bool(self.config.get("zauberwort_mode_enabled")),
                     "quiet_hours": self.config.get("quiet_hours", []),
                 }
-                catalog = build_catalog_from_file(VOICE_CATALOG_PATH)
+                # Rohe Song-Liste (content_id + title) für den Server-Kontext —
+                # NICHT build_catalog_from_file() (liefert Candidate-Objekte für
+                # den Fuzzy-Matcher, die nicht JSON-serialisierbar sind).
+                catalog = self._load_raw_voice_catalog()
+                # Lautstärke kann sich seit dem Init geändert haben (Encoder-Dreh) —
+                # aktuellen Wert für die TTS-Antworten übernehmen.
+                self._assistant.volume = self._volume
 
                 # KI-Konversation (endlosschleife, 5s Stille-Abbruch)
                 result = self._assistant.conversation_loop(box_config, catalog)
@@ -2760,14 +2768,29 @@ class Kakabox:
                 if result and result.get("intent") == "play_song":
                     # play_song Intent → direkt abspielen, kein Bestätigungston nötig
                     song_id = result.get("song_id")
-                    song_title = result.get("song_title", "Lied")
+                    song_title = result.get("song_title") or "Lied"
                     logger.info("KI-Intent play_song: %s", song_title)
+                    if song_id is not None and self._play_song_by_id(song_id, song_title):
+                        pass  # _play_song_by_id übernimmt Erfolgs-Feedback + Wiedergabe
+                    else:
+                        logger.warning("KI-Modus: play_song ohne spielbare song_id (%r)", song_id)
+                        if self.leds is not None:
+                            self.leds.nfc_flash_error()
+                        self._play_prompt("voice_error.wav")
+                        self.player.wait_until_idle(timeout=2.0)
+                        if saved_session:
+                            self._resume_in_place(saved_session)
+                elif result and result.get("intent") == "offline":
+                    # Server nicht erreichbar — eigener Hinweis statt generischem
+                    # Error-Ton, damit klar ist WARUM die KI nicht antwortet.
+                    logger.info("KI-Modus: Server offline.")
                     if self.leds is not None:
-                        self.leds.nfc_flash_success()
-                    self._play_prompt("voice_success.wav")
-                    self.player.wait_until_idle(timeout=2.0)
-                    # TODO: Song nach song_id spielen
-                    #self._play_song_by_id(song_id)
+                        self.leds.nfc_flash_error()
+                    if not self._assistant_speak_offline_notice():
+                        self._play_prompt("voice_error.wav")
+                        self.player.wait_until_idle(timeout=2.0)
+                    if saved_session:
+                        self._resume_in_place(saved_session)
                 else:
                     # Abbruch (Stille/Goodbye) → Error-Ton, vorheriges Resume
                     logger.info("KI-Modus abgebrochen (timeout/goodbye)")
@@ -2786,6 +2809,76 @@ class Kakabox:
             logger.exception("KI-Konversation mit unerwartetem Fehler abgebrochen.")
         finally:
             self._voice_lock.release()
+
+    def _load_raw_voice_catalog(self) -> list[dict]:
+        """Rohe Song-Liste aus voice_catalog.json für den KI-Server-Kontext.
+
+        Anders als ``build_catalog_from_file()`` (Candidate-Objekte fürs Fuzzy-
+        Matching) liefert das JSON-serialisierbare dicts mit content_id+title,
+        die Claude als Katalog sieht und im play_song-Intent als song_id
+        zurückgeben kann.
+        """
+        try:
+            data = json.loads(VOICE_CATALOG_PATH.read_text())
+            return list(data.get("songs", []))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("KI-Modus: voice_catalog.json nicht lesbar: %s", e)
+            return []
+
+    def _play_song_by_id(self, song_id, song_title: str) -> bool:
+        """Spielt einen von der KI gewählten Song anhand seiner content_id ab.
+
+        Baut ein einzelnes Track-Candidate und nutzt denselben Wiedergabe-Pfad
+        wie normale Voice-Treffer (_play_voice_target) — inkl. Ruhezeit-Gate,
+        Session-Reporting, Erfolgs-Feedback.
+
+        Returns:
+            True wenn eine Wiedergabe gestartet wurde, False wenn song_id
+            ungültig war oder der Track nicht im lokalen Cache liegt.
+        """
+        try:
+            content_id = int(song_id)
+        except (TypeError, ValueError):
+            logger.warning("KI-Modus: song_id nicht numerisch: %r", song_id)
+            return False
+
+        target = Candidate(
+            id=f"ai-song-{content_id}",
+            name=song_title or "Lied",
+            kind="track",
+            content_ids=(content_id,),
+        )
+        if self.leds is not None:
+            self.leds.nfc_flash_success()
+        if not self._speak_now_playing(target.name):
+            self._play_prompt("voice_success.wav")
+            self.player.wait_until_idle(timeout=2.0)
+        self._play_voice_target(target)
+        return True
+
+    def _assistant_speak_offline_notice(self) -> bool:
+        """Sagt den Offline-Hinweis für den KI-Modus per TTS an.
+
+        User-Wunsch: Statt des generischen Error-Tons soll bei fehlender
+        Server-Verbindung klar gesagt werden, WARUM die KI nicht antwortet.
+        Fällt die TTS aus (Piper/espeak beide weg), spielt der Aufrufer den
+        festen Error-Ton als Fallback (Returnwert False).
+        """
+        text = "Ich bin momentan offline und kann dir nur antworten, wenn ich online bin."
+        try:
+            wav = self._speaker.synth_to_wav(text)
+        except Exception as e:
+            logger.warning("KI-Modus: Offline-Hinweis TTS fehlgeschlagen: %s", e)
+            return False
+        if wav is None:
+            return False
+        try:
+            self.player.play_prompt(str(wav), self._volume)
+            self.player.wait_until_idle(timeout=8.0)
+            return True
+        except Exception as e:
+            logger.warning("KI-Modus: Offline-Hinweis Wiedergabe fehlgeschlagen: %s", e)
+            return False
 
     def _voice_activation_guarded(self) -> None:
         """Wrapper um _run_voice_activation, der den _voice_lock GARANTIERT

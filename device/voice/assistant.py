@@ -88,18 +88,25 @@ class VoiceAssistant:
 
     SILENCE_TIMEOUT = 5.0  # Sekunden Stille bevor Abbruch
 
-    def __init__(self, backend: Any, player: Any, recorder: Any, tts_path: Optional[Path] = None):
+    def __init__(self, backend: Any, player: Any, recorder: Any = None, speaker: Any = None, volume: int = 70):
         """
         Args:
             backend: Network-Backend für Server-Kommunikation
             player: Audio-Player (für TTS-Ausgabe + Musik)
-            recorder: Voice-Recorder für conversation_loop (Aufnahme + Stille-Detect)
-            tts_path: Pfad zu TTS-Audio (optional)
+            recorder: Voice-Recorder für conversation_loop (Aufnahme + Stille-Detect).
+                Optional — nur ``understand()`` (Legacy-Einzelfrage-Pfad) braucht
+                keinen Recorder; ``conversation_loop()`` verlangt einen.
+            speaker: TTS-Engine mit ``synth_to_wav(text) -> Optional[Path]`` (z.B.
+                voice.tts.TitleSpeaker) — dieselbe Stimme wie die Titel-Ansage.
+                Optional: fehlt sie (Piper/espeak nicht verfügbar), bleibt die
+                Antwort stumm geloggt statt gesprochen.
+            volume: Lautstärke für TTS-Wiedergabe (0-100, wie Player.play_prompt)
         """
         self.backend = backend
         self.player = player
         self.recorder = recorder
-        self.tts_path = tts_path
+        self.speaker = speaker
+        self.volume = volume
 
         # Konversations-Memory (max 10 Turns, älteste werden gelöscht)
         self.history: list[dict[str, str]] = []
@@ -126,7 +133,7 @@ class VoiceAssistant:
         Returns:
             Sprach-Antwort vom Assistenten, oder None bei Fehler/offline.
         """
-        if not self.backend.is_connected:
+        if not self.backend or not self.backend.is_connected:
             logger.info("Assistant offline — fallback lokal")
             return None
 
@@ -178,6 +185,79 @@ class VoiceAssistant:
 
         return None
 
+    def ask(self, transcript: str, box_config: dict, catalog: list[dict]) -> Optional[dict]:
+        """Wie ``understand()``, aber für den Konversations-Modus: schickt
+        zusätzlich ``box_config`` (Zauberwort/Nachtmodus) und ``catalog``
+        (verfügbare Lieder) mit und gibt das VOLLE strukturierte Ergebnis
+        zurück (``intent``, ``response``, ``action``, ``confidence``) statt
+        nur den Antworttext — ``conversation_loop()`` braucht den Intent fürs
+        Routing (play_song/goodbye/...).
+
+        Speichert NICHT selbst in die History — der Aufrufer entscheidet das
+        (im Konversations-Modus erst NACH dem Safety-Check).
+
+        Returns:
+            Das rohe Server-Dict, oder None bei Offline/Fehler.
+        """
+        if not self.backend or not self.backend.is_connected:
+            logger.info("Assistant offline — kein Server erreichbar")
+            return None
+
+        context = {
+            "child_age": self.child_age,
+            "conversation_history": self.history[-5:],
+            "now_playing": self.now_playing,
+            "box_config": box_config,
+            "catalog": catalog,
+        }
+
+        try:
+            timeout = 8
+            response = self.backend._session.post(
+                f"{self.backend._base_url}/api/box/assistant",
+                json={"transcript": transcript, **context},
+                headers=self.backend._auth_headers(),
+                timeout=timeout,
+            )
+        except Exception as e:
+            logger.warning(f"Assistant request failed: {e}")
+            return None
+
+        if response.status_code == 503:
+            logger.debug("Assistant disabled or unavailable (503)")
+            return None
+        if not response.ok:
+            logger.warning(f"Assistant HTTP {response.status_code}")
+            return None
+
+        try:
+            data = response.json()
+            if data.get("status") != "ok":
+                return None
+            return data
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Assistant response parse error: {e}")
+            return None
+
+    def _speak(self, text: str) -> None:
+        """Synthetisiert ``text`` per TTS und spielt ihn ab — best-effort.
+
+        Ohne Speaker (Piper/espeak beide weg) oder ohne Player bleibt die
+        Antwort stumm; der Turn läuft trotzdem weiter (Memory + Intent-Routing
+        funktionieren auch ohne Sprachausgabe).
+        """
+        if not self.speaker or not self.player or not text:
+            return
+        try:
+            wav = self.speaker.synth_to_wav(text)
+            if wav is None:
+                logger.info("KI-Modus: TTS lieferte keine WAV für Antwort.")
+                return
+            self.player.play_prompt(str(wav), self.volume)
+            self.player.wait_until_idle(timeout=15.0)
+        except Exception as e:
+            logger.warning(f"KI-Modus: TTS/Wiedergabe-Fehler: {e}")
+
     def _add_to_history(self, user_text: str, bot_response: str) -> None:
         """Speichert einen Konversations-Turn im Memory."""
         self.history.append({
@@ -199,13 +279,22 @@ class VoiceAssistant:
 
         Args:
             box_config: Box-Konfiguration (zauberwort_mode, quiet_hours, etc.)
-            catalog: Verfügbare Lieder (für Claude-Kontext)
+            catalog: Verfügbare Lieder (für Claude-Kontext) — Liste von
+                {"content_id": int, "title": str, ...} (roh aus voice_catalog.json,
+                NICHT die Candidate-Objekte des Fuzzy-Matchers).
 
         Returns:
-            Optional[dict] bei Intent="play_song":
-                {"intent": "play_song", "song_id": ..., "song_title": ...}
-            oder None bei Abbruch (Stille/Goodbye)
+            {"intent": "play_song", "song_id": ..., "song_title": ...} bei Play-Wunsch,
+            {"intent": "offline"} wenn der Server nicht erreichbar ist (Aufrufer
+            spielt dann einen eigenen Offline-Hinweis statt des generischen
+            Fehlertons), oder None bei Abbruch (Stille/Goodbye/Fehler).
         """
+        # Offline-Gate VOR jeder Aufnahme: ohne Server keine Antwort möglich —
+        # das Kind soll nicht erst sprechen und dann nur Stille/Error-Ton hören.
+        if not self.backend or not self.backend.is_connected:
+            logger.info("KI-Modus: Server offline — Konversation nicht möglich.")
+            return {"intent": "offline"}
+
         logger.info("KI-Modus gestartet (5s Stille-Timeout)")
 
         while True:
@@ -226,18 +315,11 @@ class VoiceAssistant:
                     logger.warning("KI-Modus: ASR leer, beende")
                     return None
 
-                # 2. Claude verstehen
-                result = self.understand(
-                    transcript,
-                    context={
-                        "box_config": box_config,
-                        "catalog": catalog,
-                        "child_age": self.child_age,
-                    },
-                )
+                # 2. Claude verstehen (inkl. box_config + catalog)
+                result = self.ask(transcript, box_config, catalog)
                 if not result:
-                    logger.warning("KI-Modus: understand() gab None zurück")
-                    return None
+                    logger.warning("KI-Modus: ask() gab None zurück (offline/Fehler)")
+                    return {"intent": "offline"}
 
                 # 3. Safety-Check
                 response_text = result.get("response", "")
@@ -246,14 +328,7 @@ class VoiceAssistant:
                     response_text = "Davon kann ich dir nicht erzählen."
 
                 # 4. TTS sprechen
-                try:
-                    if self.tts_path and self.player:
-                        # TODO: TTS generieren + abspielen
-                        # Für jetzt: nur logg
-                        logger.info(f"KI: {response_text}")
-                except Exception as e:
-                    logger.warning(f"KI-Modus: TTS Fehler: {e}")
-                    # Trotzdem weiter
+                self._speak(response_text)
 
                 # 5. Memory + Intent-Check
                 self._add_to_history(transcript, response_text)
@@ -261,8 +336,9 @@ class VoiceAssistant:
 
                 if intent == "play_song":
                     # Lied spielen → beende Loop
-                    song_id = result.get("action", {}).get("song_id")
-                    song_title = result.get("action", {}).get("song_title")
+                    action = result.get("action") or {}
+                    song_id = action.get("song_id")
+                    song_title = action.get("song_title")
                     logger.info(f"KI-Modus: Play-Intent → {song_title}")
                     return {"intent": "play_song", "song_id": song_id, "song_title": song_title}
 
@@ -279,7 +355,7 @@ class VoiceAssistant:
     def get_debug_info(self) -> dict[str, Any]:
         """Gibt Debug-Infos (Memory, Status)."""
         return {
-            "enabled": self.backend.is_connected,
+            "enabled": bool(self.backend and self.backend.is_connected),
             "child_age": self.child_age,
             "history_turns": len(self.history),
             "now_playing": self.now_playing,

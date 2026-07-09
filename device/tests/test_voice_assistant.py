@@ -262,6 +262,81 @@ def test_conversation_loop_returns_play_song_intent():
     assert result.get("song_title") == "99 Luftballons"
 
 
+def test_conversation_loop_returns_offline_without_recording():
+    """Offline-Gate: Server nicht erreichbar → sofortiger Abbruch, KEINE
+    Aufnahme (Kind soll nicht ins Leere sprechen)."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend(connected=False)
+    player = MagicMock()
+    recorder = _FakeRecorder()
+
+    asst = VoiceAssistant(backend, player, recorder)
+    result = asst.conversation_loop({}, [])
+
+    assert result == {"intent": "offline"}
+    assert recorder.call_count == 0
+
+
+def test_conversation_loop_returns_offline_on_ask_failure():
+    """Server bricht MITTEN in der Konversation weg (z.B. Timeout) → 'offline'
+    statt generischem Abbruch, damit main.py den Offline-Hinweis spielt."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend(connected=True)
+    player = MagicMock()
+    recorder = _FakeRecorder(transcripts=["Hallo"])
+    backend._session.post.side_effect = Exception("connection reset")
+
+    asst = VoiceAssistant(backend, player, recorder)
+    result = asst.conversation_loop({}, [])
+
+    assert result == {"intent": "offline"}
+
+
+def test_conversation_loop_speaks_response_via_tts():
+    """Antwort wird per Speaker synthetisiert + über Player abgespielt."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    recorder = _FakeRecorder(transcripts=["Was ist ein Löwe?", ""])
+    speaker = MagicMock()
+    speaker.synth_to_wav.return_value = "/tmp/answer.wav"
+    backend._session.post.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {
+            "status": "ok", "intent": "answer",
+            "response": "Ein Löwe ist ein großes Tier.", "confidence": 0.9,
+        }
+    )
+
+    asst = VoiceAssistant(backend, player, recorder, speaker=speaker, volume=42)
+    asst.conversation_loop({}, [])
+
+    speaker.synth_to_wav.assert_called_with("Ein Löwe ist ein großes Tier.")
+    player.play_prompt.assert_called_with("/tmp/answer.wav", 42)
+
+
+def test_conversation_loop_sends_box_config_and_catalog():
+    """box_config + catalog müssen im Server-Request landen (für Zauberwort/
+    Nachtmodus-Regeln + Song-Auswahl im System-Prompt)."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    recorder = _FakeRecorder(transcripts=["Spiele was"])
+    backend._session.post.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {"status": "ok", "intent": "answer", "response": "ok", "confidence": 0.9}
+    )
+    box_config = {"zauberwort_mode_enabled": True, "quiet_hours": []}
+    catalog = [{"content_id": 1, "title": "Testlied"}]
+
+    asst = VoiceAssistant(backend, player, recorder)
+    asst.conversation_loop(box_config, catalog)
+
+    call_kwargs = backend._session.post.call_args[1]
+    assert call_kwargs["json"]["box_config"] == box_config
+    assert call_kwargs["json"]["catalog"] == catalog
+
+
 def test_conversation_loop_safety_filter_blocks_response():
     from voice.assistant import VoiceAssistant
     backend = _FakeBackend()
