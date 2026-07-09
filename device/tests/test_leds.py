@@ -10,10 +10,13 @@ import pytest
 from hardware.leds import (
     DEFAULT_SPEED_MAX,
     DEFAULT_SPEED_MIN,
+    Leds,
     MAX_BRIGHTNESS,
     NFC_PRESENT_COLOR_BASE,
     NFC_PRESENT_PULSE_MAX_INTENSITY,
     NFC_PRESENT_PULSE_MIN_INTENSITY,
+    NFC_VOICE_COLOR_BASE,
+    NFC_VOICE_SERVER_COLOR_BASE,
     RING_SIZE,
     SPEED_COLOR_BASE,
     STRIPS_TOTAL,
@@ -24,6 +27,42 @@ from hardware.leds import (
     spectrum_to_led_colors,
     volume_to_led_count,
 )
+
+
+# ---- nfc_voice_active Farbwahl (blau lokal / lila Server) --------------------
+
+class _CapturePulse:
+    """Fake-self: fängt die an _start_nfc_pulse übergebene Farbe ab, ohne
+    Hardware-Init (nfc_voice_active als ungebundene Methode aufgerufen)."""
+
+    def __init__(self):
+        self.color = None
+
+    def _start_nfc_pulse(self, color):
+        self.color = color
+
+
+def test_nfc_voice_active_local_is_blue():
+    cap = _CapturePulse()
+    Leds.nfc_voice_active(cap, server=False)
+    assert cap.color == NFC_VOICE_COLOR_BASE
+
+
+def test_nfc_voice_active_server_is_purple():
+    cap = _CapturePulse()
+    Leds.nfc_voice_active(cap, server=True)
+    assert cap.color == NFC_VOICE_SERVER_COLOR_BASE
+
+
+def test_nfc_voice_active_default_is_local():
+    # Ohne Argument = lokal (blau) — Rückwärtskompatibilität für Alt-Aufrufer.
+    cap = _CapturePulse()
+    Leds.nfc_voice_active(cap)
+    assert cap.color == NFC_VOICE_COLOR_BASE
+
+
+def test_voice_colors_are_distinct():
+    assert NFC_VOICE_COLOR_BASE != NFC_VOICE_SERVER_COLOR_BASE
 
 
 # ---- volume_to_led_count -----------------------------------------------------

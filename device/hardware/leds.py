@@ -77,9 +77,14 @@ NFC_PRESENT_COLOR_BASE: Tuple[int, int, int] = (0, 255, 0)
 # anders. So weiß der User auf einen Blick: Chip liegt drauf, aber wir
 # warten gerade (statt zu spielen).
 NFC_PAUSED_COLOR_BASE: Tuple[int, int, int] = (255, 200, 0)
-# Dunkles Blau für Voice-Aufnahme — sattes Königsblau, klar unterscheidbar
+# Dunkles Blau für Voice-Aufnahme LOKAL — sattes Königsblau, klar unterscheidbar
 # vom Random-Lila und vom Pause-Gelb.
 NFC_VOICE_COLOR_BASE: Tuple[int, int, int] = (0, 0, 200)
+# Lila für Voice-Aufnahme MIT Server-KI (Phase 3): zeigt "wir sind online und
+# fragen gerade das große Server-Modell", nicht nur lokal. Reines Blau-Violett
+# (G=0), damit es sich vom Aufnahme-Blau (0,0,200) UND vom pinkeren Random-Lila
+# (160,50,255) unterscheidet.
+NFC_VOICE_SERVER_COLOR_BASE: Tuple[int, int, int] = (150, 0, 255)
 # Lila für Random-Modus — visuelles Signal "kein Chip, aber Box spielt
 # zufällige Lieder". Anders als Speed-Mode-Lila (das nur am Ring leuchtet).
 NFC_RANDOM_COLOR_BASE: Tuple[int, int, int] = (160, 50, 255)
@@ -491,10 +496,16 @@ class Leds:
         nur Farbwechsel)."""
         self._start_nfc_pulse(NFC_PAUSED_COLOR_BASE)
 
-    def nfc_voice_active(self) -> None:
-        """Voice-Aufnahme läuft → dunkelblaues Pulse-Licht (zeigt: ich höre
-        dir gerade zu). Egal ob Chip drauf liegt oder nicht."""
-        self._start_nfc_pulse(NFC_VOICE_COLOR_BASE)
+    def nfc_voice_active(self, server: bool = False) -> None:
+        """Voice-Aufnahme läuft → Pulse-Licht (zeigt: ich höre dir gerade zu).
+        Egal ob Chip drauf liegt oder nicht.
+
+        ``server=True`` → lila (online, Aufnahme geht an die Server-KI);
+        Default blau (lokale Erkennung / offline).
+        """
+        self._start_nfc_pulse(
+            NFC_VOICE_SERVER_COLOR_BASE if server else NFC_VOICE_COLOR_BASE
+        )
 
     def nfc_random_active(self) -> None:
         """Random-Modus läuft → lila Pulse-Licht (kein Chip drauf, aber Box

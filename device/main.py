@@ -481,6 +481,10 @@ class Kakabox:
         # Energiesparen (Standby/Shutdown bei Inaktivität, siehe *_TIMEOUT_S).
         self._last_activity = time.monotonic()
         self._standby = False
+        # Server-Erreichbarkeit aus dem letzten Heartbeat (Phase 3): steuert die
+        # Aufnahme-LED (lila = online/Server-KI, blau = lokal). Startet False
+        # (offline annehmen, bis der erste Heartbeat Erfolg meldet).
+        self._server_online = False
         # Verhindert Log-Spam, wenn der Auto-Shutdown im Dev-Modus (Desktop
         # läuft) wiederholt ausgesetzt wird — wir loggen das nur einmal.
         self._shutdown_suppressed_logged = False
@@ -977,8 +981,10 @@ class Kakabox:
             # wandert recht zügig.
             payload["cpu_load_percent"] = cpu_load
         try:
-            self.backend.heartbeat(payload)
+            # Rückgabe = Server erreichbar? → speist die Aufnahme-LED (lila/blau).
+            self._server_online = bool(self.backend.heartbeat(payload))
         except Exception as e:
+            self._server_online = False
             logger.warning("heartbeat failed: %s", e)
 
     # ------------------------------------------------------------------
@@ -2764,10 +2770,12 @@ class Kakabox:
                 logger.info("Voice abgebrochen (%s) → Random-Modus wieder an", reason)
                 self._start_random_mode()
 
-        # Während Voice-Eingabe → NFC-LED blau pulsieren (egal ob Tag drauf
-        # war oder nicht — zeigt visuell "ich höre dir gerade zu").
+        # Während Voice-Eingabe → NFC-LED pulsieren (egal ob Tag drauf war oder
+        # nicht — zeigt visuell "ich höre dir gerade zu"). LILA wenn die Aufnahme
+        # an die Server-KI geht (online + Phase-3-Flag), sonst BLAU (lokal). So
+        # sieht man auf einen Blick, ob gerade das große Modell zuhört.
         if self.leds is not None:
-            self.leds.nfc_voice_active()
+            self.leds.nfc_voice_active(server=self._voice_uses_server())
 
         # Governor-Boost für die latenzkritische Voice-Phase (ASR-Plan 1.2,
         # Variante A): best-effort — der sudo-Helper akzeptiert "performance"
@@ -3078,6 +3086,20 @@ class Kakabox:
             logger.info("Zauberwort-Aufnahme ohne Sprache (VAD) — werte als Nein.")
             return False
         return self._detect_magic_word(rec.path)
+
+    def _voice_uses_server(self) -> bool:
+        """True, wenn eine Aufnahme voraussichtlich über die Server-KI läuft —
+        steuert die Aufnahme-LED (lila statt blau). Wie ``_transcribe_command``,
+        aber zusätzlich mit echtem Online-Status (letzter Heartbeat), damit Lila
+        wirklich "mit Server verbunden" bedeutet und nicht nur "Feature an"."""
+        voice_cfg = self.config.get("voice") or {}
+        return bool(
+            voice_cfg.get("server_asr_enabled")
+            and self._server_online
+            and self.backend is not None
+            and self.backend.is_connected
+            and not self._standby
+        )
 
     def _transcribe_command(self, wav) -> str:
         """Transkribiert einen Sprachbefehl — Phase 3 (Server-Hybrid).

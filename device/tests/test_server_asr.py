@@ -198,3 +198,38 @@ def test_standby_uses_local():
     box = _box(True, be, rec, standby=True)
     assert box._transcribe_command("cmd.wav") == "local-text"
     assert be.calls == 0
+
+
+# --------------------------------------------------------------------------
+# _voice_uses_server (Aufnahme-LED: lila = Server, blau = lokal)
+# --------------------------------------------------------------------------
+
+def _led_box(server_enabled, *, online, connected=True, standby=False):
+    box = object.__new__(main.Kakabox)
+    box.config = {"voice": {"server_asr_enabled": server_enabled}}
+    box.backend = _FakeBackend(connected=connected)
+    box._server_online = online
+    box._standby = standby
+    return box
+
+
+def test_voice_uses_server_when_enabled_and_online():
+    assert _led_box(True, online=True)._voice_uses_server() is True
+
+
+def test_voice_uses_local_when_flag_off():
+    # Feature aus → blau, auch wenn online (Server wird eh nicht genutzt).
+    assert _led_box(False, online=True)._voice_uses_server() is False
+
+
+def test_voice_uses_local_when_offline():
+    # Der eigentliche Sinn: offline → blau, nicht lila.
+    assert _led_box(True, online=False)._voice_uses_server() is False
+
+
+def test_voice_uses_local_when_standby():
+    assert _led_box(True, online=True, standby=True)._voice_uses_server() is False
+
+
+def test_voice_uses_local_when_no_token():
+    assert _led_box(True, online=True, connected=False)._voice_uses_server() is False
