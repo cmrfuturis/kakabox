@@ -108,6 +108,24 @@ def test_assistant_now_playing_in_context():
     }
 
 
+def test_assistant_omits_now_playing_when_nothing_plays():
+    """Regression: Laravels 'sometimes|array'-Validierung prüft nur, ob der
+    Key existiert — ein explizites "now_playing": null zählt als vorhanden
+    und scheitert an der array-Regel (422 bei JEDER Anfrage ohne laufendes
+    Lied, live beobachtet). Der Key muss bei fehlendem now_playing GANZ
+    fehlen, nicht mit null gesendet werden."""
+    backend = _FakeBackend()
+    response = _FakeLResponse(_FakeBackend()._result)
+    backend._session.post.return_value = response
+    player = MagicMock()
+
+    asst = VoiceAssistant(backend, player)
+    asst.understand("Was ist ein Löwe?")  # kein set_now_playing() aufgerufen
+
+    call_args = backend._session.post.call_args
+    assert "now_playing" not in call_args[1]["json"]
+
+
 def test_assistant_clear_history():
     backend = _FakeBackend()
     response = _FakeLResponse(_FakeBackend()._result)
@@ -409,6 +427,26 @@ def test_conversation_loop_sends_box_config_and_catalog():
     call_kwargs = backend._session.post.call_args[1]
     assert call_kwargs["json"]["box_config"] == box_config
     assert call_kwargs["json"]["catalog"] == catalog
+
+
+def test_conversation_loop_omits_now_playing_when_nothing_plays():
+    """Gleiche Regression wie test_assistant_omits_now_playing_when_nothing_plays,
+    aber für ask()/conversation_loop() statt understand()."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    recorder = _FakeRecorder(speech_seen_sequence=[True, False])
+    transcribe_fn = _fake_transcriber(["Hallo"])
+    backend._session.post.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {"status": "ok", "intent": "answer", "response": "ok", "confidence": 0.9}
+    )
+
+    asst = VoiceAssistant(backend, player, recorder, transcribe_fn=transcribe_fn)
+    asst.conversation_loop({}, [])
+
+    call_kwargs = backend._session.post.call_args[1]
+    assert "now_playing" not in call_kwargs["json"]
 
 
 def test_conversation_loop_safety_filter_blocks_response():

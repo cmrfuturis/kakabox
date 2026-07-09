@@ -150,12 +150,16 @@ class VoiceAssistant:
             logger.info("Assistant offline — fallback lokal")
             return None
 
-        # Baue Kontext für den Server
+        # Baue Kontext für den Server. now_playing nur bei tatsächlich laufendem
+        # Lied mitschicken (siehe ask() für die Begründung — sonst 422 an
+        # Laravels "sometimes|array"-Validierung, weil ein explizites
+        # "now_playing": null als vorhanden, aber ungültig gilt).
         context = {
             "child_age": self.child_age,
             "conversation_history": self.history[-5:],  # letzte 5 Turns
-            "now_playing": self.now_playing,
         }
+        if self.now_playing:
+            context["now_playing"] = self.now_playing
 
         # Frage den Server
         try:
@@ -219,10 +223,15 @@ class VoiceAssistant:
         context = {
             "child_age": self.child_age,
             "conversation_history": self.history[-5:],
-            "now_playing": self.now_playing,
             "box_config": box_config,
             "catalog": catalog,
         }
+        # now_playing nur mitschicken, wenn tatsächlich etwas läuft — Laravels
+        # "sometimes"-Validierung prüft nur, ob der Key im Payload EXISTIERT,
+        # nicht ob sein Wert null ist. Ein explizites "now_playing": null hätte
+        # bei JEDER Anfrage ohne laufendes Lied die array-Regel verletzt (422).
+        if self.now_playing:
+            context["now_playing"] = self.now_playing
 
         try:
             timeout = 8
