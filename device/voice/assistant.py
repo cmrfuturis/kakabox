@@ -14,7 +14,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +86,17 @@ class SafetyFilter:
 class VoiceAssistant:
     """Konversations-Assistent für Kinder (mit Memory + Server-LLM + Safety)."""
 
-    SILENCE_TIMEOUT = 5.0  # Sekunden Stille bevor Abbruch
+    SILENCE_TIMEOUT = 5.0  # Sekunden Stille (Start ODER Nachlauf) bevor Abbruch
+    # Harte Obergrenze pro Aufnahme-Turn — User-Wunsch ist "kein Zeitlimit",
+    # aber MicRecorder.record_until_silence() verlangt ein max_seconds als
+    # Sicherheitsnetz (falls VAD dauerhaft Sprache erkennt, z.B. Radio im
+    # Hintergrund). 60s ist für ein Kind-Satz-Turn faktisch unbegrenzt.
+    MAX_TURN_SECONDS = 60.0
 
-    def __init__(self, backend: Any, player: Any, recorder: Any = None, speaker: Any = None, volume: int = 70):
+    def __init__(
+        self, backend: Any, player: Any, recorder: Any = None, speaker: Any = None,
+        volume: int = 70, transcribe_fn: Optional[Callable[[Any], str]] = None,
+    ):
         """
         Args:
             backend: Network-Backend für Server-Kommunikation
@@ -101,12 +109,17 @@ class VoiceAssistant:
                 Optional: fehlt sie (Piper/espeak nicht verfügbar), bleibt die
                 Antwort stumm geloggt statt gesprochen.
             volume: Lautstärke für TTS-Wiedergabe (0-100, wie Player.play_prompt)
+            transcribe_fn: Callable(wav_path) -> str — ASR-Transkription (z.B.
+                main.py's ``_transcribe_command``, die Server-Hybrid + lokalen
+                Fallback kapselt). ``record_until_silence()`` liefert selbst
+                KEIN Transkript, nur die Aufnahme + VAD-Flag.
         """
         self.backend = backend
         self.player = player
         self.recorder = recorder
         self.speaker = speaker
         self.volume = volume
+        self.transcribe_fn = transcribe_fn
 
         # Konversations-Memory (max 10 Turns, älteste werden gelöscht)
         self.history: list[dict[str, str]] = []
@@ -299,38 +312,50 @@ class VoiceAssistant:
 
         while True:
             try:
-                # 1. Aufnahme bis Stille (SILENCE_TIMEOUT = 5s)
+                # 1. Aufnahme bis Stille (SILENCE_TIMEOUT = 5s, sowohl als
+                # initiale als auch als Nachlauf-Stille — kein Zeitlimit fürs
+                # eigentliche Reden, siehe MAX_TURN_SECONDS als Sicherheitsnetz).
                 rec = self.recorder.record_until_silence(
-                    timeout_secs=self.SILENCE_TIMEOUT,
-                    silence_threshold=0.1,
+                    max_seconds=self.MAX_TURN_SECONDS,
+                    silence_seconds=self.SILENCE_TIMEOUT,
+                    initial_silence_seconds=self.SILENCE_TIMEOUT,
                 )
                 if not rec or not rec.speech_seen:
                     # Stille ohne Sprache → Abbruch
                     logger.info("KI-Modus: Stille erkannt, beende")
                     return None
 
-                transcript = rec.transcript or ""
+                # 2. Transkription (record_until_silence liefert nur die
+                # Aufnahme + VAD-Flag, kein Transkript).
+                if not self.transcribe_fn:
+                    logger.warning("KI-Modus: kein transcribe_fn gesetzt, beende")
+                    return None
+                try:
+                    transcript = self.transcribe_fn(rec.path) or ""
+                except Exception as e:
+                    logger.warning(f"KI-Modus: ASR-Fehler: {e}")
+                    return None
                 if not transcript:
                     # Leeres Transkript (ASR Fehler) → Abbruch
                     logger.warning("KI-Modus: ASR leer, beende")
                     return None
 
-                # 2. Claude verstehen (inkl. box_config + catalog)
+                # 3. Claude verstehen (inkl. box_config + catalog)
                 result = self.ask(transcript, box_config, catalog)
                 if not result:
                     logger.warning("KI-Modus: ask() gab None zurück (offline/Fehler)")
                     return {"intent": "offline"}
 
-                # 3. Safety-Check
+                # 4. Safety-Check
                 response_text = result.get("response", "")
                 if not self.safety.is_safe(response_text, box_config):
                     logger.warning("KI-Modus: Response blockiert (SafetyFilter)")
                     response_text = "Davon kann ich dir nicht erzählen."
 
-                # 4. TTS sprechen
+                # 5. TTS sprechen
                 self._speak(response_text)
 
-                # 5. Memory + Intent-Check
+                # 6. Memory + Intent-Check
                 self._add_to_history(transcript, response_text)
                 intent = result.get("intent", "answer")
 

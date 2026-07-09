@@ -73,6 +73,38 @@ class TestButtonHoldDetection:
             press_cb.assert_not_called()
             held_cb.assert_called_once()
 
+    def test_blue_held_fires_immediately_without_release(self):
+        """Kern-Anforderung: der Held-Callback feuert SOFORT bei Erreichen der
+        Hold-Schwelle — NICHT erst beim Loslassen. Anders als grün/rot/gelb soll
+        die KI-Konversation laufen, sobald 2s erreicht sind, auch wenn der Button
+        danach noch beliebig lange gehalten wird (kein Push-to-Talk-Verhalten)."""
+        with patch("hardware.buttons.GpioButton"):
+            buttons = Buttons()
+            held_cb = MagicMock()
+            buttons.on_blue_held(held_cb)
+
+            buttons._on_blue_internal_held()  # Button wird NICHT losgelassen
+
+            held_cb.assert_called_once()
+
+    def test_blue_release_after_held_does_not_fire_press(self):
+        """Nach einem gefeuerten Hold darf das spätere Loslassen NICHT
+        zusätzlich den press-Callback auslösen (sonst würde ein 2s-Halten
+        BEIDE Modi triggern — Voice-PTT UND KI)."""
+        with patch("hardware.buttons.GpioButton"):
+            buttons = Buttons()
+            press_cb = MagicMock()
+            held_cb = MagicMock()
+            buttons.on_blue(press_cb)
+            buttons.on_blue_held(held_cb)
+
+            buttons._on_blue_internal_held()
+            held_cb.assert_called_once()
+            buttons._on_blue_internal_released()
+
+            press_cb.assert_not_called()
+            held_cb.assert_called_once()  # weiterhin nur 1x, nicht nochmal bei Release
+
     def test_blue_callback_exception_doesnt_crash(self):
         """Exception im Callback sollte geloggt, nicht gethrowt werden."""
         with patch("hardware.buttons.GpioButton"):

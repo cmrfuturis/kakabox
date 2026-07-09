@@ -7,7 +7,8 @@ Verdrahtung (KY-Module + GND, Pi 5):
                              STOP bei Halten ≥ 1s; WLAN-Reset bei Halten ≥ 5s)
   - GPIO22  = Encoder-Push (kurz: Speed-Mode-Burst 4× in 3s; Hold ≥ 1s: Random-Modus)
   - GPIO5   = Blau         (Voice-Push-to-Talk — single-press;
-                             Hold ≥ 2s: KI-Konversations-Modus)
+                             Hold ≥ 2s: KI-Konversations-Modus, feuert SOFORT
+                             bei Erreichen der 2s, nicht erst beim Loslassen)
   - GPIO24  = Gelb         (kurz: Pause/Play-Toggle; Hold ≥ 3s: LED-Streifen
                              toggeln, Musik pausiert während Hold)
 
@@ -318,21 +319,30 @@ class Buttons:
         pass  # Entscheidung erfolgt im _on_blue_internal_released
 
     def _on_blue_internal_held(self) -> None:
-        """Hold-Schwelle (BLUE_HOLD_SECONDS=2s) erreicht — KI-Modus starten."""
+        """Hold-Schwelle (BLUE_HOLD_SECONDS=2s) erreicht — KI-Modus SOFORT
+        starten, nicht erst beim Loslassen. Anders als grün/rot/gelb (die ihre
+        Held-Aktion bewusst erst bei Release feuern) soll die KI-Konversation
+        laufen, sobald 2s erreicht sind — das Kind kann danach loslassen und
+        weiterreden, der Button ist kein Push-to-Talk mehr in diesem Modus."""
         self._blue_was_held = True
+        if self._blue_held_cb:
+            try:
+                self._blue_held_cb()
+            except Exception as e:
+                logger.exception("on_blue_held callback failed: %s", e)
 
     def _on_blue_internal_released(self) -> None:
         was_held = self._blue_was_held
         self._blue_was_held = False
-        cb = self._blue_held_cb if was_held else self._blue_press_cb
-        if cb:
+        if was_held:
+            # Bereits bei Hold-Schwelle gefeuert (siehe oben) — Release löst
+            # keine zusätzliche Aktion mehr aus.
+            return
+        if self._blue_press_cb:
             try:
-                cb()
+                self._blue_press_cb()
             except Exception as e:
-                logger.exception(
-                    "on_blue %s callback failed: %s",
-                    "held" if was_held else "press", e,
-                )
+                logger.exception("on_blue callback failed: %s", e)
 
     def close(self) -> None:
         for b in (self.green, self.red, self.push, self.yellow, self.blue):

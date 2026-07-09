@@ -597,6 +597,7 @@ class Kakabox:
             recorder=self._mic_recorder,
             speaker=self._speaker,
             volume=self._volume,
+            transcribe_fn=self._transcribe_command,
         )
         if self.config.get("child_age"):
             self._assistant.child_age = self.config["child_age"]

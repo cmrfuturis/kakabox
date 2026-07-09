@@ -202,34 +202,47 @@ def test_safety_filter_quiet_hours_blocks_scary_topics():
 
 
 class _FakeRecorder:
-    def __init__(self, transcripts=None, speech_seen=True):
-        self.transcripts = transcripts or ["Spiele 99 Luftballons"]
-        self.speech_seen_val = speech_seen
-        self.call_count = 0
+    """Emuliert MicRecorder.record_until_silence() — liefert NUR die Aufnahme
+    (path + speech_seen), KEIN Transkript (das macht ein separates transcribe_fn,
+    genau wie beim echten MicRecorder/Recognizer-Duo)."""
 
-    def record_until_silence(self, timeout_secs=5.0, silence_threshold=0.1):
-        if self.call_count >= len(self.transcripts):
-            # Stille (kein Transkript) → Abbruch
-            result = MagicMock()
-            result.speech_seen = False
-            result.transcript = None
-            result.path = "/tmp/silent.wav"
-            self.call_count += 1
-            return result
-        result = MagicMock()
-        result.speech_seen = self.speech_seen_val
-        result.transcript = self.transcripts[self.call_count]
-        result.path = f"/tmp/rec_{self.call_count}.wav"
+    def __init__(self, speech_seen_sequence=None):
+        # Ein Bool pro Aufnahme-Runde. Läuft die Liste aus, liefert jede
+        # weitere Runde "keine Sprache" (Stille) — beendet den Loop sicher.
+        self.speech_seen_sequence = speech_seen_sequence if speech_seen_sequence is not None else [True]
+        self.call_count = 0
+        self.recorded_kwargs = []
+
+    def record_until_silence(self, max_seconds=60.0, silence_seconds=5.0, initial_silence_seconds=5.0):
+        self.recorded_kwargs.append({
+            "max_seconds": max_seconds,
+            "silence_seconds": silence_seconds,
+            "initial_silence_seconds": initial_silence_seconds,
+        })
+        idx = self.call_count
         self.call_count += 1
+        result = MagicMock()
+        result.speech_seen = idx < len(self.speech_seen_sequence) and self.speech_seen_sequence[idx]
+        result.path = f"/tmp/rec_{idx}.wav"
         return result
+
+
+def _fake_transcriber(transcripts):
+    """Baut ein transcribe_fn, das die Transkripte der Reihe nach zurückgibt —
+    eins pro Aufnahme-Runde, unabhängig vom übergebenen Pfad."""
+    it = iter(transcripts)
+
+    def fn(path):
+        return next(it, "")
+
+    return fn
 
 
 def test_conversation_loop_exits_on_silence():
     from voice.assistant import VoiceAssistant
     backend = _FakeBackend(connected=True)
     player = MagicMock()
-    recorder = _FakeRecorder(transcripts=[], speech_seen=False)
-    backend._session.post.return_value = MagicMock(status_code=503)
+    recorder = _FakeRecorder(speech_seen_sequence=[])
 
     asst = VoiceAssistant(backend, player, recorder)
     result = asst.conversation_loop({}, [])
@@ -238,11 +251,31 @@ def test_conversation_loop_exits_on_silence():
     assert recorder.call_count == 1
 
 
+def test_conversation_loop_uses_correct_recorder_signature():
+    """Regression: record_until_silence() akzeptiert max_seconds/silence_seconds/
+    initial_silence_seconds — NICHT timeout_secs/silence_threshold (die es nie
+    gab). Ohne diesen Test crasht ein falscher Kwarg-Name erst live auf der Box."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend(connected=True)
+    player = MagicMock()
+    recorder = _FakeRecorder(speech_seen_sequence=[])
+
+    asst = VoiceAssistant(backend, player, recorder)
+    asst.conversation_loop({}, [])
+
+    assert recorder.recorded_kwargs[0] == {
+        "max_seconds": VoiceAssistant.MAX_TURN_SECONDS,
+        "silence_seconds": VoiceAssistant.SILENCE_TIMEOUT,
+        "initial_silence_seconds": VoiceAssistant.SILENCE_TIMEOUT,
+    }
+
+
 def test_conversation_loop_returns_play_song_intent():
     from voice.assistant import VoiceAssistant
     backend = _FakeBackend()
     player = MagicMock()
-    recorder = _FakeRecorder(transcripts=["Spiele 99 Luftballons", ""])
+    recorder = _FakeRecorder(speech_seen_sequence=[True])
+    transcribe_fn = _fake_transcriber(["Spiele 99 Luftballons"])
     backend._session.post.return_value = MagicMock(
         status_code=200,
         json=lambda: {
@@ -254,7 +287,7 @@ def test_conversation_loop_returns_play_song_intent():
         }
     )
 
-    asst = VoiceAssistant(backend, player, recorder)
+    asst = VoiceAssistant(backend, player, recorder, transcribe_fn=transcribe_fn)
     result = asst.conversation_loop({}, [])
 
     assert result is not None
@@ -283,13 +316,28 @@ def test_conversation_loop_returns_offline_on_ask_failure():
     from voice.assistant import VoiceAssistant
     backend = _FakeBackend(connected=True)
     player = MagicMock()
-    recorder = _FakeRecorder(transcripts=["Hallo"])
+    recorder = _FakeRecorder(speech_seen_sequence=[True])
+    transcribe_fn = _fake_transcriber(["Hallo"])
     backend._session.post.side_effect = Exception("connection reset")
 
-    asst = VoiceAssistant(backend, player, recorder)
+    asst = VoiceAssistant(backend, player, recorder, transcribe_fn=transcribe_fn)
     result = asst.conversation_loop({}, [])
 
     assert result == {"intent": "offline"}
+
+
+def test_conversation_loop_returns_none_without_transcribe_fn():
+    """Ohne transcribe_fn (main.py hat's vergessen zu übergeben) sauber
+    abbrechen statt mit AttributeError zu crashen."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend(connected=True)
+    player = MagicMock()
+    recorder = _FakeRecorder(speech_seen_sequence=[True])
+
+    asst = VoiceAssistant(backend, player, recorder, transcribe_fn=None)
+    result = asst.conversation_loop({}, [])
+
+    assert result is None
 
 
 def test_conversation_loop_speaks_response_via_tts():
@@ -297,7 +345,8 @@ def test_conversation_loop_speaks_response_via_tts():
     from voice.assistant import VoiceAssistant
     backend = _FakeBackend()
     player = MagicMock()
-    recorder = _FakeRecorder(transcripts=["Was ist ein Löwe?", ""])
+    recorder = _FakeRecorder(speech_seen_sequence=[True, False])
+    transcribe_fn = _fake_transcriber(["Was ist ein Löwe?"])
     speaker = MagicMock()
     speaker.synth_to_wav.return_value = "/tmp/answer.wav"
     backend._session.post.return_value = MagicMock(
@@ -308,7 +357,7 @@ def test_conversation_loop_speaks_response_via_tts():
         }
     )
 
-    asst = VoiceAssistant(backend, player, recorder, speaker=speaker, volume=42)
+    asst = VoiceAssistant(backend, player, recorder, speaker=speaker, volume=42, transcribe_fn=transcribe_fn)
     asst.conversation_loop({}, [])
 
     speaker.synth_to_wav.assert_called_with("Ein Löwe ist ein großes Tier.")
@@ -321,7 +370,8 @@ def test_conversation_loop_sends_box_config_and_catalog():
     from voice.assistant import VoiceAssistant
     backend = _FakeBackend()
     player = MagicMock()
-    recorder = _FakeRecorder(transcripts=["Spiele was"])
+    recorder = _FakeRecorder(speech_seen_sequence=[True, False])
+    transcribe_fn = _fake_transcriber(["Spiele was"])
     backend._session.post.return_value = MagicMock(
         status_code=200,
         json=lambda: {"status": "ok", "intent": "answer", "response": "ok", "confidence": 0.9}
@@ -329,7 +379,7 @@ def test_conversation_loop_sends_box_config_and_catalog():
     box_config = {"zauberwort_mode_enabled": True, "quiet_hours": []}
     catalog = [{"content_id": 1, "title": "Testlied"}]
 
-    asst = VoiceAssistant(backend, player, recorder)
+    asst = VoiceAssistant(backend, player, recorder, transcribe_fn=transcribe_fn)
     asst.conversation_loop(box_config, catalog)
 
     call_kwargs = backend._session.post.call_args[1]
@@ -341,7 +391,8 @@ def test_conversation_loop_safety_filter_blocks_response():
     from voice.assistant import VoiceAssistant
     backend = _FakeBackend()
     player = MagicMock()
-    recorder = _FakeRecorder(transcripts=["Erzähl mir etwas", ""])
+    recorder = _FakeRecorder(speech_seen_sequence=[True, False])
+    transcribe_fn = _fake_transcriber(["Erzähl mir etwas"])
     # Claude antwortet mit vulgarem Inhalt (hypothetisch — sollte nicht vorkommen,
     # aber Test deckt es ab)
     backend._session.post.return_value = MagicMock(
@@ -354,7 +405,7 @@ def test_conversation_loop_safety_filter_blocks_response():
         }
     )
 
-    asst = VoiceAssistant(backend, player, recorder)
+    asst = VoiceAssistant(backend, player, recorder, transcribe_fn=transcribe_fn)
     box_config = {}  # kein special mode
     result = asst.conversation_loop(box_config, [])
 
