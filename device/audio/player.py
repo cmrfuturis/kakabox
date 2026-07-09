@@ -12,10 +12,15 @@ logger = logging.getLogger(__name__)
 # Google Voice HAT Soundcard (MAX98357A Speaker + INMP441 Mic an I²S).
 # Card-Name kommt vom `dtoverlay=googlevoicehat-soundcard` in
 # /boot/firmware/config.txt — Playback (Speaker) und Capture (Mic) auf
-# der gleichen Karte. Direkt-Routing statt Multi-Device, weil snd-aloop
-# mit mpv jeden Track nach 250ms in idle zwingt — Audio-reaktive LEDs
-# müssen einen anderen Weg finden (z.B. mpv af=astats).
-AUDIO_DEVICE = "alsa/plughw:CARD=sndrpigooglevoi,DEV=0"
+# der gleichen Karte.
+#
+# "kakamix" = dmix-Software-Mixer aus /etc/asound.conf: seit der Spotify-
+# Anbindung teilen sich mpv und go-librespot die Karte — plughw wäre
+# exklusiv ("Device busy", sobald der jeweils andere spielt). dmix ist
+# NICHT das frühere snd-aloop-Multi-Device, das mpv nach 250ms in idle
+# zwang (siehe MIN_PLAY_SECONDS unten) — nur ein Software-Mischpult
+# direkt vor der Karte. Capture (Mic) bleibt ungewrappt.
+AUDIO_DEVICE = "alsa/kakamix"
 
 # Mindest-Spielzeit, bevor ein "mpv idle" als echtes Track-Ende zählt. Direkt
 # nach play() kann der EOF-Watcher einen veralteten idle-Read sehen (Race mit

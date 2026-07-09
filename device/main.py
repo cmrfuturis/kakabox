@@ -51,6 +51,7 @@ from audio import AudioCache, KakaContent, Playlist, PlaylistSnapshot
 from audio.library import scan
 from audio.player import Player
 from audio.spectrum import FileSpectrum
+from audio.spotify import SpotifyController
 from hardware.audio_output import set_volume
 from hardware.buttons import Buttons
 from hardware.leds import Leds, LedsUnavailable
@@ -469,6 +470,25 @@ class Kakabox:
         # MAX98357A hat keinen Hardware-Mixer → kein amixer-Call. Lautstärke
         # wird ausschließlich über mpv softvol gesteuert.
         self.player.set_volume(self._volume)
+
+        # Spotify-Chip (config "spotify"): die dort gelisteten Tag-UIDs
+        # schalten statt einer Kaka die Spotify-Wiedergabe an — via lokalem
+        # go-librespot-Daemon (audio/spotify.py, setup/spotify/README.md).
+        # Kein Daemon / kein Login → der Chip macht nichts außer einer
+        # Log-Warnung + rotem Blitz; die Box bleibt voll funktionsfähig.
+        _spotify_cfg = self.config.get("spotify") or {}
+        self._spotify_tag_uids = {
+            str(u).strip().upper()
+            for u in _spotify_cfg.get("tag_uids", []) if u
+        }
+        self._spotify: Optional[SpotifyController] = None
+        if _spotify_cfg.get("enabled") and self._spotify_tag_uids:
+            self._spotify = SpotifyController(
+                api_url=_spotify_cfg.get("api_url") or "http://127.0.0.1:3678",
+                default_uri=_spotify_cfg.get("uri"),
+            )
+        # True solange der Spotify-Chip aufliegt (Chip runter → pause).
+        self._spotify_active = False
 
         self._running = False
         self._current_playlist: Optional[Playlist] = None
@@ -1506,6 +1526,15 @@ class Kakabox:
         if self.leds is not None:
             self.leds.nfc_chip_present()
 
+        # Spotify-Chip? Dann kein Kaka-Lookup — der Chip ist ein reiner
+        # An-Schalter für den go-librespot-Daemon (audio/spotify.py). Läuft
+        # VOR Cache/Backend, damit eine evtl. noch bestehende Kaka-Zuordnung
+        # des Chips (Backend kennt ihn ja weiter) nicht dazwischenfunkt.
+        if self._spotify is not None and \
+                uid.strip().upper() in self._spotify_tag_uids:
+            self._start_spotify(uid)
+            return
+
         # Cache-first: bekannter Tag mit allen Audios lokal → sofort spielen,
         # Backend-Sync läuft im Hintergrund (siehe _refresh_tag_in_background).
         # So entfällt der HTTP-Roundtrip im User-kritischen Pfad — auf einem Pi
@@ -1721,6 +1750,39 @@ class Kakabox:
                 tag_uid=uid, track_index=idx, position_seconds=pos,
             )
             self._start_kaka_playlist(uid, kaka, trigger_sync=False)
+
+    def _start_spotify(self, uid: str) -> None:
+        """Spotify-Chip aufgelegt → lokale Wiedergabe räumen, Daemon anwerfen.
+
+        Spiegelt die Rahmenbedingungen von _start_kaka_playlist (Ruhezeit,
+        laufende Playlist ersetzen, _active_tag_uid für den Standby-Schutz) —
+        nur dass statt einer lokalen Playlist der go-librespot-Daemon spielt.
+        """
+        if self._quiet_hours_now():
+            logger.info("Ruhezeit aktiv — Spotify-Chip unterdrückt (still).")
+            self._flash_playback_denied()
+            return
+
+        with self._playlist_lock:
+            playlist = self._current_playlist
+            self._current_playlist = None
+            self._active_tag_uid = uid
+            self._random_mode = False
+        if playlist:
+            playlist.stop(reason="spotify_chip")
+        try:
+            self.player.stop()
+        except Exception as e:
+            logger.warning("Player.stop vor Spotify fehlgeschlagen: %s", e)
+
+        if self._spotify.turn_on(volume=self._volume):
+            self._spotify_active = True
+            logger.info("🎵 Spotify an (Chip %s).", uid)
+        else:
+            # Warum genau es nicht ging (Daemon down, kein Login, kein
+            # Kontext) hat der SpotifyController bereits geloggt — hier nur
+            # das sichtbare Feedback für das Kind.
+            self._flash_playback_denied()
 
     def _start_kaka_playlist(self, uid: str, kaka: dict, trigger_sync: bool = True) -> None:
         # Ruhezeit aktiv? Stumm ablehnen — kein Ton/Prompt, nur kurzer roter
@@ -1992,6 +2054,20 @@ class Kakabox:
         clearen nur ``_voice_pending_tag_uid``, damit beim Voice-Ende die
         Continue-Logik weiß "kein Tag mehr, fall back auf Random".
         """
+        # Spotify-Chip runter → nur den Daemon pausieren; die Snapshot-/
+        # Playlist-Logik unten gehört zu lokalen Kakas und wäre hier ein
+        # No-op mit irreführenden Logs.
+        if self._spotify_active and uid and \
+                uid.strip().upper() in self._spotify_tag_uids:
+            self._spotify_active = False
+            with self._playlist_lock:
+                self._active_tag_uid = None
+            if self._spotify is not None:
+                self._spotify.pause()
+            if self.leds is not None:
+                self.leds.nfc_chip_absent()
+            logger.info("Spotify-Chip %s entfernt → Pause.", uid)
+            return
         if self._voice_mode:
             if uid == self._voice_pending_tag_uid:
                 logger.info("Chip %s während Voice entfernt — Voice spielt weiter, "
@@ -3628,6 +3704,11 @@ class Kakabox:
         # jeder amixer-Subprocess blockte ~300ms und failte — staute den
         # Encoder-Pfad. mpv softvol via player.set_volume reicht aus.
         self.player.set_volume(new_vol)
+        # Spotify aktiv? Lautstärke auch an den Daemon — nicht-blockierend
+        # (coalescing Worker), der Encoder-Pfad darf nicht auf HTTP warten
+        # (gleiche Lektion wie beim früheren amixer-Call, siehe unten).
+        if self._spotify_active and self._spotify is not None:
+            self._spotify.set_volume_async(new_vol)
         if self.leds is not None:
             self.leds.show_volume(new_vol)
         # save_config NICHT bei jedem Tick — SD-Karten-Write blockt den

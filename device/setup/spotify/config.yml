@@ -1,0 +1,29 @@
+# go-librespot-Konfiguration für die Kakabox.
+# Repo-Kopie — live liegt die Datei unter /opt/go-librespot/config.yml.
+# Doku: https://github.com/devgianlu/go-librespot (v0.7.4)
+
+device_name: kakabox
+device_type: speaker
+audio_backend: alsa
+# Software-Mixer aus /etc/asound.conf — teilt sich die MAX98357A-Karte
+# mit mpv (Box-Software). NICHT auf plughw ändern, sonst "Device busy".
+audio_device: kakamix
+bitrate: 160
+# 100 Steps == Box-Prozentskala, damit audio/spotify.py nichts umrechnen muss.
+volume_steps: 100
+initial_volume: 30
+
+# Kein Zeroconf: die Box gehört fest dem Box-Konto (OAuth-Login). Sonst
+# könnte jedes Spotify-Konto im WLAN die Box übernehmen und der Chip würde
+# plötzlich ein fremdes Konto steuern.
+zeroconf_enabled: false
+
+credentials:
+  # Einmaliger OAuth-Login beim ersten Start (Link steht im Journal),
+  # danach liegen die Credentials persistent in state.json.
+  type: interactive
+
+server:
+  enabled: true
+  address: 127.0.0.1
+  port: 3678

@@ -28,5 +28,11 @@
     "samples_keep_days": 14,
     "upload_commands": false,
     "server_asr_enabled": false
+  },
+  "spotify": {
+    "enabled": false,
+    "tag_uids": [],
+    "uri": null,
+    "api_url": "http://127.0.0.1:3678"
   }
 }

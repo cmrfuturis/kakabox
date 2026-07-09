@@ -25,6 +25,8 @@ class FakeCmdBackend:
 def _bare_box() -> "main.Kakabox":
     box = object.__new__(main.Kakabox)
     box._standby = False  # _poll_commands/_send_heartbeat prüfen das Flag
+    box._spotify = None   # _adjust_volume prüft den Spotify-Chip-Zustand
+    box._spotify_active = False
     return box
 
 

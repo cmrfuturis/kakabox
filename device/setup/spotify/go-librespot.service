@@ -1,0 +1,30 @@
+# systemd-Unit für den go-librespot Spotify-Connect-Daemon der Kakabox.
+# Repo-Kopie — live: /etc/systemd/system/go-librespot.service
+#
+# Manuell:
+#   sudo systemctl enable --now go-librespot.service
+#   sudo journalctl -u go-librespot -f
+#
+# Erster Start: OAuth-Link erscheint im Journal → im Browser auf dem Pi
+# öffnen und mit dem Box-Spotify-Konto anmelden (siehe README.md).
+
+[Unit]
+Description=go-librespot Spotify Connect daemon (kakabox)
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=riffi
+Group=riffi
+SupplementaryGroups=audio
+ExecStart=/opt/go-librespot/go-librespot -config_dir /opt/go-librespot
+WorkingDirectory=/opt/go-librespot
+Restart=on-failure
+RestartSec=5
+# Kein Netz beim Boot / Spotify down → nicht in eine failed-Loop rennen.
+StartLimitBurst=10
+StartLimitIntervalSec=300
+
+[Install]
+WantedBy=multi-user.target

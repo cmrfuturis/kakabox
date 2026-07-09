@@ -84,6 +84,7 @@
         .btn-ghost { background: transparent; color: var(--ink); border: 1.5px solid var(--line); }
         .btn-ghost:hover { border-color: var(--primary); }
         .info { font-size: 0.9rem; color: var(--ink-2); margin: 16px 0; padding: 12px 14px; background: var(--bg-solid); border-radius: var(--radius-sm); }
+        .err { font-size: 0.85rem; color: #dc2626; margin: 8px 4px 0; }
     </style>
 </head>
 <body>
@@ -96,15 +97,19 @@
                 <p class="lead">Gib das Passwort für dieses Netz ein.</p>
             </div>
 
-            <form method="POST" action="/connect">
+            <form method="POST" action="/connect" onsubmit="return pruefePasswort(this)">
                 <input type="hidden" name="ssid" value="{{ ssid }}">
                 {% if encrypted == 'encrypted' %}
                 <div class="field">
                     <input class="input" type="password" name="password" placeholder="Passwort"
                            autofocus required minlength="8" maxlength="63">
+                    <p class="err" id="pw-err" hidden>Das WLAN-Passwort braucht mindestens 8 Zeichen.</p>
                 </div>
                 {% else %}
                 <div class="info">Das Netz ist offen — keine Passworteingabe nötig.</div>
+                {# comitupweb.py liest request.form["password"] ohne Fallback — fehlt das
+                   Feld im POST, antwortet das Portal mit 400 und legt nichts an. #}
+                <input type="hidden" name="password" value="">
                 {% endif %}
 
                 <div class="grid-2">
@@ -115,5 +120,20 @@
         </div>
     </div>
 </div>
+<script>
+// Captive-Portal-Browser (z. B. das iOS-Anmeldefenster) setzen required/minlength
+// nicht zuverlässig durch. Rutscht ein leeres Passwort durch, legt comitup ein
+// WLAN-Profil ohne PSK an, mit dem sich die Box endlos erfolglos zu verbinden
+// versucht (Vorfall 2026-07-09, STR-iPhone-Hotspot).
+function pruefePasswort(form) {
+    var pw = form.querySelector('input[type=password]');
+    if (pw && (pw.value.length < 8 || pw.value.length > 63)) {
+        document.getElementById('pw-err').hidden = false;
+        pw.focus();
+        return false;
+    }
+    return true;
+}
+</script>
 </body>
 </html>
