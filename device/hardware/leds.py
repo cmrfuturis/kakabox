@@ -85,6 +85,10 @@ NFC_VOICE_COLOR_BASE: Tuple[int, int, int] = (0, 0, 200)
 # (G=0), damit es sich vom Aufnahme-Blau (0,0,200) UND vom pinkeren Random-Lila
 # (160,50,255) unterscheidet.
 NFC_VOICE_SERVER_COLOR_BASE: Tuple[int, int, int] = (150, 0, 255)
+# Gold für KI-Konversations-Modus (Phase 4): zeigt "du kannst mit mir sprechen"
+# Pulsierend wie NFC, nicht statisch. Gelb-Gold Mix damit klar verschieden
+# von allen anderen Modi (nicht Pause-Gelb 255,200,0, nicht Lila, nicht Blau).
+ASSISTANT_CONVERSATION_COLOR_BASE: Tuple[int, int, int] = (200, 180, 50)
 # Lila für Random-Modus — visuelles Signal "kein Chip, aber Box spielt
 # zufällige Lieder". Anders als Speed-Mode-Lila (das nur am Ring leuchtet).
 NFC_RANDOM_COLOR_BASE: Tuple[int, int, int] = (160, 50, 255)
@@ -495,6 +499,15 @@ class Leds:
         """Chip aufgelegt + pausiert → gelbes Pulse-Licht (gleicher Pulse,
         nur Farbwechsel)."""
         self._start_nfc_pulse(NFC_PAUSED_COLOR_BASE)
+
+    def assistant_conversation_active(self) -> None:
+        """KI-Konversations-Modus: GOLD pulsierend wie NFC-Präsenz.
+
+        Nutzt den gleichen Pulsing-Mechanismus wie nfc_voice_active() — eine
+        sanfte, kontinuierliche Animation während Konversation läuft. Wird durch
+        assistant_conversation_stop() oder system_off() abgebrochen.
+        """
+        self._start_nfc_pulse(ASSISTANT_CONVERSATION_COLOR_BASE)
 
     def nfc_voice_active(self, server: bool = False) -> None:
         """Voice-Aufnahme läuft → Pulse-Licht (zeigt: ich höre dir gerade zu).

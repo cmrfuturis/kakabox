@@ -716,6 +716,7 @@ class Kakabox:
         self.buttons.on_yellow(w(self._on_yellow_pressed))
         self.buttons.on_yellow_held(w(self._on_yellow_held))
         self.buttons.on_blue(w(self._on_blue_pressed))
+        self.buttons.on_blue_held(w(self._on_blue_held))
 
     def _wire_encoder(self) -> None:
         if self.encoder is None:
@@ -2663,6 +2664,117 @@ class Kakabox:
             daemon=True,
             name="voice-ptt",
         ).start()
+
+    def _on_blue_held(self) -> None:
+        """Blau 2+ Sekunden halten → KI-Konversations-Modus starten.
+
+        Konversation: Keine Zeitlimits, nur 5s Stille → Abbruch. LED Gold
+        pulsierend. Automatisches Fallback: wenn Intent="play_song" → direct
+        playback ohne Bestätigung. Sonst: Antwort hören + Loop.
+        """
+        if self._abort_prompt_if_playing():
+            return
+        if self._speed_mode:
+            self._exit_speed_mode()
+            return
+        if self._quiet_hours_now():
+            # Nachtmodus: KI auch aus, wie Voice. Nachricht: "Es ist Schlafenszeit"
+            logger.info("Nachtmodus aktiv — KI-Modus unterdrückt (still).")
+            threading.Thread(
+                target=self._flash_playback_denied,
+                kwargs={"chip_present": self._active_tag_uid is not None},
+                daemon=True, name="assistant-quiet-denied",
+            ).start()
+            return
+        if not self._voice_lock.acquire(blocking=False):
+            logger.info("Voice/KI bereits aktiv — Trigger ignoriert.")
+            return
+        threading.Thread(
+            target=self._run_assistant_conversation,
+            daemon=True,
+            name="assistant-conv",
+        ).start()
+
+    def _run_assistant_conversation(self) -> None:
+        """KI-Konversations-Loop (5s Stille-Timeout, endlos sonst).
+
+        Snapshoten → listening.wav → Gold LED pulsierend → conversation_loop()
+        → bei play_song: positivton.wav + Start Track → Restore sonst.
+        """
+        try:
+            # Snapshot wie bei Voice
+            saved_tag_uid = self._active_tag_uid
+            saved_random_mode = self._random_mode
+            saved_voice_target = self._voice_last_target if self._voice_mode else None
+            saved_voice_pending = self._voice_pending_tag_uid
+            saved_session: Optional[dict] = None
+            with self._playlist_lock:
+                if self._current_playlist:
+                    saved_track_index = self._current_playlist.current_index
+                    saved_position = self.player.current_position_seconds()
+                    if self._active_tag_uid:
+                        _src, _kid = "kaka", (self._tag_cache.get(self._active_tag_uid) or {}).get("kaka", {}).get("id")
+                    elif self._voice_mode:
+                        _src, _kid = "voice", None
+                    else:
+                        _src, _kid = "manual", None
+                    saved_session = {
+                        "contents": self._current_playlist.contents_snapshot(),
+                        "index": saved_track_index, "position": saved_position,
+                        "source": _src, "kaka_id": _kid, "tag_uid": saved_tag_uid,
+                        "random_mode": saved_random_mode, "voice_mode": self._voice_mode,
+                        "voice_pending": saved_voice_pending, "voice_target": saved_voice_target,
+                    }
+
+            governor_boost = bool((self.config.get("voice") or {}).get("governor_boost", True))
+            if governor_boost:
+                self._set_cpu_governor("performance")
+            try:
+                self._stop_for_voice()
+                if self.leds is not None:
+                    self.leds.assistant_conversation_active()
+                self._play_prompt("listening.wav")
+                self.player.wait_until_idle(timeout=2.0)
+
+                # Box-Config für Claude
+                box_config = {
+                    "zauberwort_mode_enabled": bool(self.config.get("zauberwort_mode_enabled")),
+                    "quiet_hours": self.config.get("quiet_hours", []),
+                }
+                catalog = build_catalog_from_file(VOICE_CATALOG_PATH)
+
+                # KI-Konversation (endlosschleife, 5s Stille-Abbruch)
+                result = self._assistant.conversation_loop(box_config, catalog)
+
+                if result and result.get("intent") == "play_song":
+                    # play_song Intent → direkt abspielen, kein Bestätigungston nötig
+                    song_id = result.get("song_id")
+                    song_title = result.get("song_title", "Lied")
+                    logger.info("KI-Intent play_song: %s", song_title)
+                    if self.leds is not None:
+                        self.leds.nfc_flash_success()
+                    self._play_prompt("voice_success.wav")
+                    self.player.wait_until_idle(timeout=2.0)
+                    # TODO: Song nach song_id spielen
+                    #self._play_song_by_id(song_id)
+                else:
+                    # Abbruch (Stille/Goodbye) → Error-Ton, vorheriges Resume
+                    logger.info("KI-Modus abgebrochen (timeout/goodbye)")
+                    if self.leds is not None:
+                        self.leds.nfc_flash_error()
+                    self._play_prompt("voice_error.wav")
+                    self.player.wait_until_idle(timeout=2.0)
+                    if saved_session:
+                        self._resume_in_place(saved_session)
+            finally:
+                if governor_boost:
+                    self._set_cpu_governor("ondemand")
+                if self.leds is not None:
+                    self.leds.system_on()
+        except Exception:
+            logger.exception("KI-Konversation mit unerwartetem Fehler abgebrochen.")
+        finally:
+            self._voice_lock.release()
 
     def _voice_activation_guarded(self) -> None:
         """Wrapper um _run_voice_activation, der den _voice_lock GARANTIERT

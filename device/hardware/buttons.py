@@ -6,7 +6,8 @@ Verdrahtung (KY-Module + GND, Pi 5):
   - GPIO25  = Rot          (Track-vor   — kurzer Druck;
                              STOP bei Halten ≥ 1s; WLAN-Reset bei Halten ≥ 5s)
   - GPIO22  = Encoder-Push (kurz: Speed-Mode-Burst 4× in 3s; Hold ≥ 1s: Random-Modus)
-  - GPIO5   = Blau         (Voice-Push-to-Talk — single-press)
+  - GPIO5   = Blau         (Voice-Push-to-Talk — single-press;
+                             Hold ≥ 2s: KI-Konversations-Modus)
   - GPIO24  = Gelb         (kurz: Pause/Play-Toggle; Hold ≥ 3s: LED-Streifen
                              toggeln, Musik pausiert während Hold)
 
@@ -46,6 +47,7 @@ STOP_HOLD_SECONDS = 1.0   # grün/rot ≥ 1s = STOP (Playlist + Memory weg)
 HOLD_SECONDS = 5.0        # grün ≥ 5s = Power-Off; rot ≥ 5s = WLAN-Reset
 PUSH_HOLD_SECONDS = 1.0   # Encoder-Push ≥ 1s = Random-Modus an/neu starten
 YELLOW_HOLD_SECONDS = 3.0 # Gelb ≥ 3s = LED-Streifen toggeln + Musik pause während Hold
+BLUE_HOLD_SECONDS = 2.0   # Blau ≥ 2s = KI-Konversations-Modus (statt single-press Voice)
 
 
 class Buttons:
@@ -112,15 +114,21 @@ class Buttons:
         self.yellow.when_held = self._on_yellow_internal_held
         self.yellow.when_released = self._on_yellow_internal_released
 
-        # Blau: single-press, kein Hold.
+        # Blau: single-press → Voice-Mode, Hold ≥ 2s → KI-Modus.
         self._blue_press_cb: Optional[Callable[[], None]] = None
-        self.blue.when_pressed = self._on_blue_internal_pressed
+        self._blue_held_cb: Optional[Callable[[], None]] = None
+        self._blue_was_held: bool = False
+        self.blue.when_pressed = self._on_blue_internal_down
+        self.blue.when_held = self._on_blue_internal_held
+        self.blue.when_released = self._on_blue_internal_released
+        # gpiozero's when_held feuert nach hold_time; wir setzen das auf BLUE_HOLD_SECONDS.
+        self.blue.hold_time = BLUE_HOLD_SECONDS
 
         logger.info(
             "Buttons ready: green=GPIO%d red=GPIO%d push=GPIO%d yellow=GPIO%d blue=GPIO%d "
-            "(stop ≥ %.0fs, long ≥ %.0fs, push-hold ≥ %.0fs, yellow-hold ≥ %.0fs)",
+            "(stop ≥ %.0fs, long ≥ %.0fs, push-hold ≥ %.0fs, yellow-hold ≥ %.0fs, blue-hold ≥ %.0fs)",
             GREEN_PIN, RED_PIN, ENCODER_PUSH_PIN, YELLOW_PIN, BLUE_PIN,
-            STOP_HOLD_SECONDS, HOLD_SECONDS, PUSH_HOLD_SECONDS, YELLOW_HOLD_SECONDS,
+            STOP_HOLD_SECONDS, HOLD_SECONDS, PUSH_HOLD_SECONDS, YELLOW_HOLD_SECONDS, BLUE_HOLD_SECONDS,
         )
 
     def on_green(self, callback: Callable[[], None]) -> None:
@@ -169,8 +177,12 @@ class Buttons:
         self._yellow_down_cb = callback
 
     def on_blue(self, callback: Callable[[], None]) -> None:
-        """Blau — Voice-Push-to-Talk (Aufnahme)."""
+        """Blau — Voice-Push-to-Talk (Aufnahme, single-press)."""
         self._blue_press_cb = callback
+
+    def on_blue_held(self, callback: Callable[[], None]) -> None:
+        """Blau — Hold ≥ BLUE_HOLD_SECONDS (2s), KI-Konversations-Modus."""
+        self._blue_held_cb = callback
 
     # ---- Internals -------------------------------------------------------
 
@@ -302,12 +314,26 @@ class Buttons:
                     "held" if was_held else "press", e,
                 )
 
-    def _on_blue_internal_pressed(self) -> None:
-        if self._blue_press_cb:
+    def _on_blue_internal_down(self) -> None:
+        """Sofort bei Press — wird ignoriert wenn Hold kommt."""
+        pass  # Entscheidung erfolgt im _on_blue_internal_released
+
+    def _on_blue_internal_held(self) -> None:
+        """Hold-Schwelle (BLUE_HOLD_SECONDS=2s) erreicht — KI-Modus starten."""
+        self._blue_was_held = True
+
+    def _on_blue_internal_released(self) -> None:
+        was_held = self._blue_was_held
+        self._blue_was_held = False
+        cb = self._blue_held_cb if was_held else self._blue_press_cb
+        if cb:
             try:
-                self._blue_press_cb()
+                cb()
             except Exception as e:
-                logger.exception("on_blue callback failed: %s", e)
+                logger.exception(
+                    "on_blue %s callback failed: %s",
+                    "held" if was_held else "press", e,
+                )
 
     def close(self) -> None:
         for b in (self.green, self.red, self.push, self.yellow, self.blue):
