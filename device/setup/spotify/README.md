@@ -67,6 +67,7 @@ Login ist dauerhaft.
 | Daemon läuft nicht | `systemctl status go-librespot` / `journalctl -u go-librespot -n 50` |
 | „Device busy" im Audio | Beide Player MÜSSEN über `kakamix` gehen (mpv: `audio/player.py`, Daemon: `config.yml`) — nie direkt `plughw` |
 | Box erscheint nicht in der Spotify-App | App mit dem **Box-Konto** angemeldet? Login (OAuth) abgeschlossen? |
+| `refused the audio key (code 1)`, alle Tracks übersprungen, `/player/play` → 500 | Konto hat **kein Premium** — Family-Einladung fehlt oder wurde nicht angenommen. Login/OAuth ist davon unabhängig ok. |
 
 ## Bekannte Grenzen (v1)
 

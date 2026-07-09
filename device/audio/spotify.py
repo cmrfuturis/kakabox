@@ -104,10 +104,12 @@ class SpotifyController:
             logger.warning("Spotify: GET %s fehlgeschlagen: %s", path, e)
             return None
 
-    def _post(self, path: str, payload: Optional[dict] = None) -> bool:
+    def _post(self, path: str, payload: Optional[dict] = None,
+              read_timeout: Optional[float] = None) -> bool:
         try:
+            timeout = (_TIMEOUT[0], read_timeout or _TIMEOUT[1])
             r = self._session.post(self._base + path, json=payload,
-                                   timeout=_TIMEOUT)
+                                   timeout=timeout)
             r.raise_for_status()
             return True
         except Exception as e:
@@ -144,7 +146,12 @@ class SpotifyController:
             if self._default_uri:
                 logger.info("Spotify: kein Kontext — starte Default %s",
                             self._default_uri)
-                return self._post("/player/play", {"uri": self._default_uri})
+                # /player/play antwortet erst, wenn der Kontext geladen ist —
+                # bei langsamem WLAN oder (Fehlerfall) beim Durchskippen
+                # unspielbarer Tracks dauert das deutlich länger als der
+                # Standard-Read-Timeout. Aufrufer läuft eh im Worker-Thread.
+                return self._post("/player/play", {"uri": self._default_uri},
+                                  read_timeout=20.0)
             logger.info("Spotify: kein Kontext geladen und keine Default-URI "
                         "konfiguriert (config spotify.uri). Einmal in der "
                         "Spotify-App Musik auf 'kakabox' starten.")

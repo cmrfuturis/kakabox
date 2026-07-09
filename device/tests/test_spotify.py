@@ -50,7 +50,8 @@ def _controller(status=None, default_uri=None):
     c = SpotifyController(default_uri=default_uri)
     c._get = lambda path: status
     c.posts = []
-    c._post = lambda path, payload=None: c.posts.append((path, payload)) or True
+    c._post = (lambda path, payload=None, **kw:
+               c.posts.append((path, payload)) or True)
     return c
 
 
@@ -99,7 +100,7 @@ def test_turn_on_passes_volume():
     sent = threading.Event()
     volumes = []
 
-    def fake_post(path, payload=None):
+    def fake_post(path, payload=None, **kw):
         if path == "/player/volume":
             volumes.append(payload["volume"])
             sent.set()
@@ -139,7 +140,7 @@ def test_volume_clamped_and_coalesced():
     done = threading.Event()
     sent = []
 
-    def fake_post(path, payload=None):
+    def fake_post(path, payload=None, **kw):
         sent.append(payload["volume"])
         done.set()
         return True
