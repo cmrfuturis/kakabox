@@ -269,6 +269,17 @@ def test_conversation_loop_exits_on_silence():
     assert recorder.call_count == 1
 
 
+def test_turn_silence_is_responsive_not_full_timeout():
+    """Regression: Live-Test zeigte spürbare Verzögerung nach jedem Satz, weil
+    die Nachlauf-Stille (Satzende-Erkennung) denselben 5s-Wert nutzte wie der
+    'Kind reagiert gar nicht'-Abbruch. TURN_SILENCE_SECONDS muss deutlich
+    kürzer sein als SILENCE_TIMEOUT, sonst fühlt sich die KI nach jedem Turn
+    wieder träge an statt Siri-artig direkt zu reagieren."""
+    from voice.assistant import VoiceAssistant
+    assert VoiceAssistant.TURN_SILENCE_SECONDS < VoiceAssistant.SILENCE_TIMEOUT
+    assert VoiceAssistant.TURN_SILENCE_SECONDS <= 2.0
+
+
 def test_conversation_loop_uses_correct_recorder_signature():
     """Regression: record_until_silence() akzeptiert max_seconds/silence_seconds/
     initial_silence_seconds — NICHT timeout_secs/silence_threshold (die es nie
@@ -283,7 +294,7 @@ def test_conversation_loop_uses_correct_recorder_signature():
 
     assert recorder.recorded_kwargs[0] == {
         "max_seconds": VoiceAssistant.MAX_TURN_SECONDS,
-        "silence_seconds": VoiceAssistant.SILENCE_TIMEOUT,
+        "silence_seconds": VoiceAssistant.TURN_SILENCE_SECONDS,
         "initial_silence_seconds": VoiceAssistant.SILENCE_TIMEOUT,
     }
 

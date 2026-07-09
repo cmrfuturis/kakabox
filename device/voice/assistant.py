@@ -86,7 +86,19 @@ class SafetyFilter:
 class VoiceAssistant:
     """Konversations-Assistent für Kinder (mit Memory + Server-LLM + Safety)."""
 
-    SILENCE_TIMEOUT = 5.0  # Sekunden Stille (Start ODER Nachlauf) bevor Abbruch
+    # "5 Sekunden nichts sagen → Abbruch" (User-Wunsch): gilt für die Stille
+    # BEVOR überhaupt Sprache erkannt wurde — z.B. wenn das Kind nach der
+    # KI-Antwort gar nicht mehr reagiert. Das ist bewusst länger als die
+    # Nachlauf-Stille unten (Kind braucht ggf. einen Moment zum Überlegen).
+    SILENCE_TIMEOUT = 5.0
+    # Nachlauf-Stille NACH erkannter Sprache, bis der Satz als beendet gilt.
+    # Live-Test zeigte: mit SILENCE_TIMEOUT (5s) hier wartete die Box nach
+    # jedem Satz spürbar lange, bevor sie überhaupt zu antworten begann ("wie
+    # Siri, aber langsam" — User-Feedback). 1.4s matcht VOICE_SILENCE_SECONDS
+    # aus main.py, bereits an Kinder-Sprechpausen kalibriert (>1s Denkpausen
+    # MITTEN im Satz sind normal, siehe dortiger Kommentar) — dieselbe
+    # Schwelle ist auch hier ein sicherer, bereits validierter Wert.
+    TURN_SILENCE_SECONDS = 1.4
     # Harte Obergrenze pro Aufnahme-Turn — User-Wunsch ist "kein Zeitlimit",
     # aber MicRecorder.record_until_silence() verlangt ein max_seconds als
     # Sicherheitsnetz (falls VAD dauerhaft Sprache erkennt, z.B. Radio im
@@ -326,12 +338,14 @@ class VoiceAssistant:
 
         while True:
             try:
-                # 1. Aufnahme bis Stille (SILENCE_TIMEOUT = 5s, sowohl als
-                # initiale als auch als Nachlauf-Stille — kein Zeitlimit fürs
-                # eigentliche Reden, siehe MAX_TURN_SECONDS als Sicherheitsnetz).
+                # 1. Aufnahme bis Stille. Zwei unterschiedliche Schwellen (siehe
+                # Klassen-Konstanten oben): 5s BEVOR überhaupt Sprache erkannt
+                # wurde (Kind reagiert gar nicht → Abbruch), aber nur 1.4s NACH
+                # erkannter Sprache (Satzende, Siri-artige Reaktionszeit) — kein
+                # Zeitlimit fürs eigentliche Reden selbst (MAX_TURN_SECONDS).
                 rec = self.recorder.record_until_silence(
                     max_seconds=self.MAX_TURN_SECONDS,
-                    silence_seconds=self.SILENCE_TIMEOUT,
+                    silence_seconds=self.TURN_SILENCE_SECONDS,
                     initial_silence_seconds=self.SILENCE_TIMEOUT,
                 )
                 if not rec or not rec.speech_seen:
