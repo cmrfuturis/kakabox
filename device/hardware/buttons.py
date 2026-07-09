@@ -70,6 +70,7 @@ class Buttons:
         )
         self.blue = GpioButton(
             BLUE_PIN, pull_up=True, bounce_time=DEBOUNCE_S,
+            hold_time=BLUE_HOLD_SECONDS,
         )
 
         # Drei-Stufen-Funktion grün (press / stop ≥1s / held ≥10s)
@@ -121,8 +122,6 @@ class Buttons:
         self.blue.when_pressed = self._on_blue_internal_down
         self.blue.when_held = self._on_blue_internal_held
         self.blue.when_released = self._on_blue_internal_released
-        # gpiozero's when_held feuert nach hold_time; wir setzen das auf BLUE_HOLD_SECONDS.
-        self.blue.hold_time = BLUE_HOLD_SECONDS
 
         logger.info(
             "Buttons ready: green=GPIO%d red=GPIO%d push=GPIO%d yellow=GPIO%d blue=GPIO%d "

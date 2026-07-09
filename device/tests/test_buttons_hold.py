@@ -12,10 +12,12 @@ class TestButtonHoldDetection:
     """Blue button hold-time detection für KI-Mode Activation."""
 
     def test_blue_button_has_hold_time_set(self):
-        """Blau-Button sollte hold_time = BLUE_HOLD_SECONDS haben."""
-        with patch("hardware.buttons.GpioButton"):
+        """Blau-Button sollte hold_time = BLUE_HOLD_SECONDS im Constructor haben."""
+        with patch("hardware.buttons.GpioButton") as MockButton:
             buttons = Buttons()
-            assert buttons.blue.hold_time == BLUE_HOLD_SECONDS
+            # Verifiziere dass GpioButton mit hold_time=BLUE_HOLD_SECONDS aufgerufen wurde
+            mock_call = [c for c in MockButton.call_args_list if c[0][0] == 5][0]
+            assert mock_call[1].get("hold_time") == BLUE_HOLD_SECONDS
             assert BLUE_HOLD_SECONDS == 2.0
 
     def test_blue_button_registers_held_callback(self):
