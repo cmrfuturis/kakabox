@@ -178,6 +178,12 @@ STANDBY_TIMEOUT_S = 60
 SHUTDOWN_TIMEOUT_S = 300
 STANDBY_NFC_POLL_S = 0.6   # langsameres NFC-Polling im Standby (statt ~0.25s)
 
+# Sperrzeit nach fehlgeschlagenem Spotify-Start. Ein Chip in Randlage auf dem
+# Leser flackert (erkannt/weg im Sekunden- bis Minutentakt) — ohne Cooldown
+# löst jedes Flackern einen neuen Playlist-Start aus, und bei nicht
+# spielbarem Konto skippt der Daemon dann jedes Mal durch alle Tracks.
+SPOTIFY_FAIL_COOLDOWN_S = 60
+
 
 def _kill_aplay_prompt() -> bool:
     """Bricht einen WLAN-Status-Prompt ab, der per ``aplay`` aus dem Comitup-
@@ -489,6 +495,12 @@ class Kakabox:
             )
         # True solange der Spotify-Chip aufliegt (Chip runter → pause).
         self._spotify_active = False
+        # Cooldown nach fehlgeschlagenem Spotify-Start (monotonic-Zeitpunkt,
+        # bis zu dem neue Versuche unterdrückt werden). Ohne das rattert ein
+        # flackernder Chip (Randlage auf dem Leser) bei nicht spielbarem
+        # Konto/Playlist im Minutentakt durch alle Tracks — sichtbar als
+        # "Dauerblättern" in der Spotify-App (Live-Vorfall 2026-07-10).
+        self._spotify_fail_until = 0.0
 
         self._running = False
         self._current_playlist: Optional[Playlist] = None
@@ -1763,6 +1775,12 @@ class Kakabox:
             self._flash_playback_denied()
             return
 
+        if time.monotonic() < self._spotify_fail_until:
+            logger.info("Spotify-Start übersprungen — Cooldown nach "
+                        "Fehlversuch läuft noch.")
+            self._flash_playback_denied()
+            return
+
         with self._playlist_lock:
             playlist = self._current_playlist
             self._current_playlist = None
@@ -1789,6 +1807,7 @@ class Kakabox:
     def _spotify_turn_on_worker(self, uid: str) -> None:
         ok = self._spotify.turn_on(volume=self._volume)
         if ok:
+            self._spotify_fail_until = 0.0
             logger.info("🎵 Spotify an (Chip %s).", uid)
             # Race: Chip wurde während des (langsamen) turn_on wieder
             # runtergenommen → _on_tag_removed hat pausiert, aber unser
@@ -1796,12 +1815,16 @@ class Kakabox:
             if not self._spotify_active:
                 logger.info("Spotify: Chip war schon wieder weg → Pause.")
                 self._spotify.pause()
-        elif self._spotify_active:
-            # Warum genau es nicht ging (Daemon down, kein Login, kein
-            # Kontext) hat der SpotifyController bereits geloggt — hier nur
-            # das sichtbare Feedback für das Kind.
-            self._spotify_active = False
-            self._flash_playback_denied()
+        else:
+            # Fehl-Cooldown scharf stellen: NFC-Flackern (Chip in Randlage)
+            # darf einen kaputten Start nicht im Sekundentakt wiederholen.
+            self._spotify_fail_until = time.monotonic() + SPOTIFY_FAIL_COOLDOWN_S
+            if self._spotify_active:
+                # Warum genau es nicht ging (Daemon down, kein Login, kein
+                # Kontext) hat der SpotifyController bereits geloggt — hier
+                # nur das sichtbare Feedback für das Kind.
+                self._spotify_active = False
+                self._flash_playback_denied()
 
     def _start_kaka_playlist(self, uid: str, kaka: dict, trigger_sync: bool = True) -> None:
         # Ruhezeit aktiv? Stumm ablehnen — kein Ton/Prompt, nur kurzer roter
