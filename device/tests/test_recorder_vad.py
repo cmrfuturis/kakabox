@@ -254,3 +254,18 @@ def test_cancel_event_stops_recording_immediately(monkeypatch, tmp_path):
     assert result.speech_seen is False  # cancelled → nicht mehr transkribieren
     # Deutlich weniger als die verfügbaren 20 Chunks (2s) verarbeitet.
     assert result.duration_seconds < 1.0
+
+
+def test_cancel_event_already_set_before_first_chunk_returns_cleanly(monkeypatch, tmp_path):
+    """Regression (Live-Test 2026-07-09): ist cancel_event SCHON gesetzt, bevor
+    auch nur ein Chunk gelesen wurde (z.B. ein zweiter Aufruf direkt nach
+    einem harten Stopp, cancel_event noch nicht zurückgesetzt), warf der Code
+    vorher RecorderError('arecord lieferte keine Frames') statt sauber
+    cancelled=True zurückzugeben — der Aufrufer verlor dadurch das
+    cancelled-Signal in seinem except-Handler und krachte weiter."""
+    chunks = [_chunk(amplitude=2000.0, dc_offset=100)] * 20
+    result = _record(monkeypatch, tmp_path, chunks, cancel_event=_CancelAfterN(0))
+
+    assert result.cancelled is True
+    assert result.speech_seen is False
+    assert result.duration_seconds == 0.0

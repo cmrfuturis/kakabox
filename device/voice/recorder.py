@@ -319,6 +319,16 @@ class MicRecorder:
                 proc.kill()
 
         if not recorded:
+            if was_cancelled:
+                # Abbruch VOR dem allerersten Chunk (z.B. cancel_event war
+                # schon gesetzt, als dieser Call startete — live beobachtet
+                # nach einem harten Stopp während der Barge-in-Lauschphase).
+                # KEIN RecorderError: der Aufrufer würde das cancelled-Signal
+                # sonst im except-Handler verlieren und fälschlich als
+                # generischen Abbruch statt als harten Stopp behandeln.
+                return RecordingResult(
+                    path=Path(output_path), speech_seen=False, duration_seconds=0.0, cancelled=True,
+                )
             stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
             raise RecorderError(
                 f"arecord lieferte keine Frames. Stderr: {stderr[:200]}"

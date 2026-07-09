@@ -15,6 +15,7 @@ Modus-Integration:
 """
 import json
 import logging
+import re
 import threading
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
@@ -98,6 +99,29 @@ def _looks_like_self_echo(spoken_text: str, heard_text: str) -> bool:
     if a in b or b in a:
         return True
     return SequenceMatcher(None, a, b).ratio() > 0.7
+
+
+# Unicode-Bereiche gängiger Emoji (Emoticons, Symbole, Transport, Flaggen,
+# Dingbats, Variation-Selector). Piper (TTS) kann Emoji nicht sprechen und
+# verbalisiert sie stattdessen als Beschreibung ("😄" → "Gesicht mit
+# lachenden Augen") — live beobachtet: das wurde vom eigenen Mikro
+# aufgenommen (kein Echo-Cancelling) und wich vom Quelltext zu stark ab, um
+# vom Selbst-Echo-Filter (_looks_like_self_echo) erkannt zu werden. Also VOR
+# der TTS-Synthese entfernen, statt nur nachträglich zu filtern.
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"  # Symbols & Pictographs, Emoticons, Transport, Supplemental
+    "\U00002600-\U000027BF"  # Misc Symbols, Dingbats
+    "\U0001F1E6-\U0001F1FF"  # Regional Indicators (Flaggen)
+    "\U0000FE0F"              # Variation Selector-16
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _strip_emoji(text: str) -> str:
+    """Entfernt Emoji, damit die TTS nie deren Namen vorliest."""
+    return _EMOJI_RE.sub("", text)
 
 
 class VoiceAssistant:
@@ -308,6 +332,9 @@ class VoiceAssistant:
         """
         if not self.speaker or not self.player or not text:
             return
+        text = _strip_emoji(text).strip()
+        if not text:
+            return
         try:
             wav = self.speaker.synth_to_wav(text)
             if wav is None:
@@ -348,6 +375,9 @@ class VoiceAssistant:
             wurde (Selbst-Echo wird herausgefiltert, siehe oben).
         """
         if not self.speaker or not self.player or not text:
+            return False, None, False
+        text = _strip_emoji(text).strip()
+        if not text:
             return False, None, False
         try:
             wav = self.speaker.synth_to_wav(text)
@@ -392,7 +422,16 @@ class VoiceAssistant:
         except Exception as e:
             logger.warning(f"KI-Modus: Stop nach Antwort fehlgeschlagen: {e}")
 
-        if rec is not None and rec.cancelled:
+        # Defense-in-depth: falls record_until_silence() TROTZ des Fixes in
+        # recorder.py mal mit einer Exception statt cancelled=True rausfällt
+        # (rec bleibt dann None), prüfen wir das cancel_event direkt — sonst
+        # geht ein harter Stopp als generischer Fehler verloren und der Loop
+        # versucht fälschlich normal weiterzumachen (live beobachtet: führte
+        # zu einer zweiten Aufnahme mit noch gesetztem cancel_event → erneuter
+        # Crash statt sauberem Abbruch).
+        if (rec is not None and rec.cancelled) or (
+            self._cancel_event is not None and self._cancel_event.is_set()
+        ):
             logger.info("KI-Modus: hart abgebrochen (Blau-Knopf während Antwort).")
             return False, None, True
 

@@ -613,6 +613,50 @@ def test_looks_like_self_echo_ignores_unrelated_text():
     )
 
 
+def test_strip_emoji_removes_common_emoji():
+    """Regression (Live-Test 2026-07-09): Claude nutzt Emoji in Antworten,
+    Piper (TTS) kann die nicht sprechen und verbalisiert sie stattdessen als
+    Beschreibung ("😄" → "Gesicht mit lachenden Augen") — das Mikro hört diese
+    Beschreibung (kein Echo-Cancelling) und verwechselt sie mit Kind-Eingabe,
+    weil sie zu weit vom Quelltext abweicht um vom Selbst-Echo-Filter erkannt
+    zu werden. Also VOR der Synthese entfernen."""
+    from voice.assistant import _strip_emoji
+    assert _strip_emoji("Klar, hier kommt dein Lied! 😄") == "Klar, hier kommt dein Lied! "
+    assert _strip_emoji("Toll gemacht! 🎉🎈") == "Toll gemacht! "
+    assert _strip_emoji("Ganz normaler Text ohne Emoji.") == "Ganz normaler Text ohne Emoji."
+
+
+def test_speak_strips_emoji_before_synthesis():
+    """_speak() darf Emoji nie an die TTS weiterreichen."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    speaker = MagicMock()
+    speaker.synth_to_wav.return_value = "/tmp/answer.wav"
+
+    asst = VoiceAssistant(backend, player, speaker=speaker, volume=50)
+    asst._speak("Klar, hier kommt dein Lied! 😄🎉")
+
+    speaker.synth_to_wav.assert_called_once_with("Klar, hier kommt dein Lied!")
+
+
+def test_speak_interruptible_strips_emoji_before_synthesis():
+    """Gleicher Fix für den unterbrechbaren Antwortpfad."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    recorder = _FakeRecorder(speech_seen_sequence=[False])
+    transcribe_fn = _fake_transcriber([])
+    speaker = MagicMock()
+    speaker.synth_to_wav.return_value = "/tmp/answer.wav"
+
+    asst = VoiceAssistant(backend, player, recorder, speaker=speaker,
+                           transcribe_fn=transcribe_fn, volume=50)
+    asst._speak_interruptible("Toll gemacht! 🎉")
+
+    speaker.synth_to_wav.assert_called_once_with("Toll gemacht!")
+
+
 def test_speak_interruptible_filters_self_echo():
     """Erkennt _speak_interruptible einen Text, der fast identisch mit der
     gerade gesprochenen Antwort ist, wird das NICHT als Barge-in gewertet —
