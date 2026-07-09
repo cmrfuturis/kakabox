@@ -242,3 +242,11 @@ def test_upload_voice_command_offline_returns_false(tmp_path):
     p.write_text('{"serial_number":"S","activation_code":"C","registered_at":"pending"}')
     b = Backend(identity_path=p, base_url="https://test")   # kein api_token → offline
     assert b.upload_voice_command(tmp_path / "x.wav", {"action": "play"}) is False
+
+
+def test_session_sends_accept_json_header(backend):
+    """Regression: ohne 'Accept: application/json' behandelt Laravel jeden
+    Box-Request wie ein Browser-Formular — bei Validierungsfehlern kommt dann
+    ein 302-Redirect statt eines lesbaren 422-JSON-Fehlers zurück (live auf
+    kakaland.de beobachtet: leerer Response-Body bei /api/box/assistant)."""
+    assert backend._session.headers.get("Accept") == "application/json"

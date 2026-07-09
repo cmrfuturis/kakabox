@@ -74,6 +74,15 @@ class Backend:
         # sodass tag_scan/heartbeat/manifest ohne erneuten Handshake laufen.
         # Auf einem Pi über WLAN spart das pro Call ~100–500 ms.
         self._session = requests.Session()
+        # OHNE diesen Header hält Laravel jeden Request für einen Browser-
+        # Formular-POST — bei einem Validation-Fehler kommt dann ein 302-
+        # Redirect zur Startseite statt eines 422 mit JSON-Fehlern. python-
+        # requests sendet von sich aus nur "Accept: */*", was Laravels
+        # expectsJson()-Check nicht erfüllt (siehe Str::contains($accept,
+        # ['/json','+json'])). Betraf konkret /api/box/assistant: jede
+        # fehlgeschlagene Validierung landete als leerer Redirect-Body statt
+        # als lesbarer Fehler beim Aufrufer.
+        self._session.headers.update({"Accept": "application/json"})
 
     # ------------------------------------------------------------------
     # Identity persistence
