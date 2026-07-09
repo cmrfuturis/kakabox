@@ -393,6 +393,105 @@ def test_conversation_loop_returns_none_without_transcribe_fn():
     assert result is None
 
 
+# --------------------------------------------------------------------------
+# Barge-in — Kind unterbricht die KI während sie noch antwortet
+# --------------------------------------------------------------------------
+
+
+def test_speak_interruptible_no_barge_in_plays_normally():
+    """Ohne Barge-in (Stille während/nach der Antwort) spielt die Antwort
+    normal ab; player.stop() danach ist ein günstiges No-op."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    recorder = _FakeRecorder(speech_seen_sequence=[False])
+    transcribe_fn = _fake_transcriber([])
+    speaker = MagicMock()
+    speaker.synth_to_wav.return_value = "/tmp/answer.wav"
+
+    asst = VoiceAssistant(backend, player, recorder, speaker=speaker,
+                           transcribe_fn=transcribe_fn, volume=50)
+    barged_in, transcript = asst._speak_interruptible("Hallo!")
+
+    assert barged_in is False
+    assert transcript is None
+    speaker.synth_to_wav.assert_called_with("Hallo!")
+    player.play_prompt.assert_called_with("/tmp/answer.wav", 50)
+    player.stop.assert_called_once()
+
+
+def test_speak_interruptible_barge_in_stops_playback_and_returns_transcript():
+    """Kern des Barge-in-Verhaltens (wie ChatGPT Voice Mode): erkennt
+    _speak_interruptible während/nach der Antwort Sprache, wird player.stop()
+    aufgerufen und der transkribierte Text zurückgegeben."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    recorder = _FakeRecorder(speech_seen_sequence=[True])
+    transcribe_fn = _fake_transcriber(["Warte, ich hab noch was"])
+    speaker = MagicMock()
+    speaker.synth_to_wav.return_value = "/tmp/answer.wav"
+
+    asst = VoiceAssistant(backend, player, recorder, speaker=speaker,
+                           transcribe_fn=transcribe_fn, volume=50)
+    barged_in, transcript = asst._speak_interruptible("Es war einmal...")
+
+    assert barged_in is True
+    assert transcript == "Warte, ich hab noch was"
+    player.stop.assert_called_once()
+
+
+def test_speak_interruptible_without_recorder_falls_back_to_blocking():
+    """Ohne recorder/transcribe_fn (main.py hat's nicht gesetzt) läuft die
+    Antwort normal blockierend durch statt zu crashen."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    speaker = MagicMock()
+    speaker.synth_to_wav.return_value = "/tmp/answer.wav"
+
+    asst = VoiceAssistant(backend, player, recorder=None, speaker=speaker, volume=50)
+    barged_in, transcript = asst._speak_interruptible("Hallo!")
+
+    assert barged_in is False
+    assert transcript is None
+    player.wait_until_idle.assert_called_once()
+
+
+def test_conversation_loop_barge_in_skips_new_recording_for_next_turn():
+    """Barge-in während der Antwort → der aufgenommene Text wird DIREKT als
+    nächster Turn verarbeitet, OHNE eine zusätzliche Aufnahme zu starten."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    speaker = MagicMock()
+    speaker.synth_to_wav.return_value = "/tmp/answer.wav"
+    # [0] erster Turn (Sprache), [1] Barge-in während der ersten Antwort
+    recorder = _FakeRecorder(speech_seen_sequence=[True, True])
+    transcribe_fn = _fake_transcriber(["Erzähl mir was", "Stopp, spiel Musik"])
+
+    responses = [
+        {"status": "ok", "intent": "story", "response": "Es war einmal...", "confidence": 0.9},
+        {"status": "ok", "intent": "play_song", "response": "Klar!",
+         "action": {"song_id": 5, "song_title": "Testlied"}, "confidence": 0.95},
+    ]
+    backend._session.post.side_effect = [
+        MagicMock(status_code=200, json=lambda: responses[0]),
+        MagicMock(status_code=200, json=lambda: responses[1]),
+    ]
+
+    asst = VoiceAssistant(backend, player, recorder, speaker=speaker,
+                           transcribe_fn=transcribe_fn, volume=50)
+    result = asst.conversation_loop({}, [])
+
+    assert result == {"intent": "play_song", "song_id": 5, "song_title": "Testlied"}
+    # Nur 2 Recorder-Calls insgesamt: initiale Aufnahme + Barge-in-Erkennung
+    # während der ersten Antwort. KEIN dritter Call für den zweiten Turn —
+    # der kam ja schon aus dem Barge-in.
+    assert recorder.call_count == 2
+    assert backend._session.post.call_count == 2
+
+
 def test_conversation_loop_speaks_response_via_tts():
     """Antwort wird per Speaker synthetisiert + über Player abgespielt."""
     from voice.assistant import VoiceAssistant

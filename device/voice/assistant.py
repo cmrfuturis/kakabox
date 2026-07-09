@@ -297,6 +297,84 @@ class VoiceAssistant:
         except Exception as e:
             logger.warning(f"KI-Modus: TTS/Wiedergabe-Fehler: {e}")
 
+    def _speak_interruptible(self, text: str) -> tuple[bool, Optional[str]]:
+        """Wie ``_speak()``, aber lauscht GLEICHZEITIG aufs Mikrofon — redet
+        das Kind während der Antwort rein (Barge-in, wie ChatGPT Voice Mode),
+        wird die Wiedergabe SOFORT gestoppt statt zu Ende zu laufen.
+
+        Mikro-Aufnahme (arecord) und Wiedergabe (mpv) laufen auf getrennten
+        ALSA-Geräten — kein Ressourcen-Konflikt. Das Restrisiko ist rein
+        akustisch: ohne Echo-Unterdrückung in der Hardware hört das Mikro auch
+        die eigene Stimme der Box mit. Nutzt bewusst dieselbe adaptive VAD-
+        Schwelle wie normales Zuhören (kein blind geratener Sonder-Threshold) —
+        falls sich die Box dadurch live zu oft selbst unterbricht, muss das
+        empirisch nachjustiert werden (Mikro-/Lautsprecher-Abstand variiert).
+
+        Die Aufnahme läuft mit den GLEICHEN Timeouts wie ein normaler Turn
+        (SILENCE_TIMEOUT/TURN_SILENCE_SECONDS) — läuft die Antwort ungestört
+        durch, geht das Lauschen nahtlos in die normale "warte auf nächsten
+        Turn"-Phase über. Der Aufrufer braucht danach KEINE zusätzliche
+        Aufnahme mehr zu starten.
+
+        Returns:
+            (barged_in, transcript) — barged_in=True wenn währenddessen oder
+            direkt danach Sprache erkannt wurde; transcript deren Text (None
+            bei Stille, ASR-Fehler oder wenn kein Recorder/ASR verfügbar ist).
+        """
+        if not self.speaker or not self.player or not text:
+            return False, None
+        try:
+            wav = self.speaker.synth_to_wav(text)
+        except Exception as e:
+            logger.warning(f"KI-Modus: TTS-Synthese fehlgeschlagen: {e}")
+            return False, None
+        if wav is None:
+            logger.info("KI-Modus: TTS lieferte keine WAV für Antwort.")
+            return False, None
+
+        if not self.recorder or not self.transcribe_fn:
+            # Kein Barge-in möglich → normale, nicht unterbrechbare Wiedergabe.
+            try:
+                self.player.play_prompt(str(wav), self.volume)
+                self.player.wait_until_idle(timeout=15.0)
+            except Exception as e:
+                logger.warning(f"KI-Modus: TTS-Wiedergabe fehlgeschlagen: {e}")
+            return False, None
+
+        try:
+            self.player.play_prompt(str(wav), self.volume)
+        except Exception as e:
+            logger.warning(f"KI-Modus: TTS-Wiedergabe fehlgeschlagen: {e}")
+            return False, None
+
+        try:
+            rec = self.recorder.record_until_silence(
+                max_seconds=self.MAX_TURN_SECONDS,
+                silence_seconds=self.TURN_SILENCE_SECONDS,
+                initial_silence_seconds=self.SILENCE_TIMEOUT,
+            )
+        except Exception as e:
+            logger.warning(f"KI-Modus: Barge-in-Aufnahme fehlgeschlagen: {e}")
+            rec = None
+
+        # Falls die Antwort noch läuft (Barge-in): SOFORT stoppen. Ist sie
+        # schon fertig (kein Barge-in, normales Zuhören auf den nächsten
+        # Turn), ist stop() ein günstiges No-op.
+        try:
+            self.player.stop()
+        except Exception as e:
+            logger.warning(f"KI-Modus: Stop nach Antwort fehlgeschlagen: {e}")
+
+        if not rec or not rec.speech_seen:
+            return False, None
+
+        try:
+            transcript = self.transcribe_fn(rec.path) or ""
+        except Exception as e:
+            logger.warning(f"KI-Modus: Barge-in ASR-Fehler: {e}")
+            return True, None
+        return True, (transcript or None)
+
     def _add_to_history(self, user_text: str, bot_response: str) -> None:
         """Speichert einen Konversations-Turn im Memory."""
         self.history.append({
@@ -336,37 +414,48 @@ class VoiceAssistant:
 
         logger.info("KI-Modus gestartet (5s Stille-Timeout)")
 
+        # Von _speak_interruptible() erkannter Barge-in: das Kind hat schon
+        # während/direkt nach der letzten Antwort weitergeredet — dieser Text
+        # ist der nächste Turn, keine neue Aufnahme nötig (ist schon passiert).
+        pending_transcript: Optional[str] = None
+
         while True:
             try:
-                # 1. Aufnahme bis Stille. Zwei unterschiedliche Schwellen (siehe
-                # Klassen-Konstanten oben): 5s BEVOR überhaupt Sprache erkannt
-                # wurde (Kind reagiert gar nicht → Abbruch), aber nur 1.4s NACH
-                # erkannter Sprache (Satzende, Siri-artige Reaktionszeit) — kein
-                # Zeitlimit fürs eigentliche Reden selbst (MAX_TURN_SECONDS).
-                rec = self.recorder.record_until_silence(
-                    max_seconds=self.MAX_TURN_SECONDS,
-                    silence_seconds=self.TURN_SILENCE_SECONDS,
-                    initial_silence_seconds=self.SILENCE_TIMEOUT,
-                )
-                if not rec or not rec.speech_seen:
-                    # Stille ohne Sprache → Abbruch
-                    logger.info("KI-Modus: Stille erkannt, beende")
-                    return None
+                if pending_transcript is not None:
+                    transcript = pending_transcript
+                    pending_transcript = None
+                else:
+                    # 1. Aufnahme bis Stille. Zwei unterschiedliche Schwellen
+                    # (siehe Klassen-Konstanten oben): 5s BEVOR überhaupt
+                    # Sprache erkannt wurde (Kind reagiert gar nicht →
+                    # Abbruch), aber nur 1.4s NACH erkannter Sprache
+                    # (Satzende, Siri-artige Reaktionszeit) — kein Zeitlimit
+                    # fürs eigentliche Reden selbst (MAX_TURN_SECONDS).
+                    rec = self.recorder.record_until_silence(
+                        max_seconds=self.MAX_TURN_SECONDS,
+                        silence_seconds=self.TURN_SILENCE_SECONDS,
+                        initial_silence_seconds=self.SILENCE_TIMEOUT,
+                    )
+                    if not rec or not rec.speech_seen:
+                        # Stille ohne Sprache → Abbruch
+                        logger.info("KI-Modus: Stille erkannt, beende")
+                        return None
 
-                # 2. Transkription (record_until_silence liefert nur die
-                # Aufnahme + VAD-Flag, kein Transkript).
-                if not self.transcribe_fn:
-                    logger.warning("KI-Modus: kein transcribe_fn gesetzt, beende")
-                    return None
-                try:
-                    transcript = self.transcribe_fn(rec.path) or ""
-                except Exception as e:
-                    logger.warning(f"KI-Modus: ASR-Fehler: {e}")
-                    return None
-                if not transcript:
-                    # Leeres Transkript (ASR Fehler) → Abbruch
-                    logger.warning("KI-Modus: ASR leer, beende")
-                    return None
+                    # 2. Transkription (record_until_silence liefert nur die
+                    # Aufnahme + VAD-Flag, kein Transkript).
+                    if not self.transcribe_fn:
+                        logger.warning("KI-Modus: kein transcribe_fn gesetzt, beende")
+                        return None
+                    try:
+                        transcript = self.transcribe_fn(rec.path) or ""
+                    except Exception as e:
+                        logger.warning(f"KI-Modus: ASR-Fehler: {e}")
+                        return None
+                    if not transcript:
+                        # Leeres Transkript (ASR Fehler) → Abbruch
+                        logger.warning("KI-Modus: ASR leer, beende")
+                        return None
+
                 logger.info(f"KI-Modus transkribiert: «{transcript}»")
 
                 # 3. Claude verstehen (inkl. box_config + catalog)
@@ -388,26 +477,37 @@ class VoiceAssistant:
                     logger.warning("KI-Modus: Response blockiert (SafetyFilter)")
                     response_text = "Davon kann ich dir nicht erzählen."
 
-                # 5. TTS sprechen
-                self._speak(response_text)
-
-                # 6. Memory + Intent-Check
+                # 5. Memory + Intent-Check (VOR dem Sprechen: play_song braucht
+                # keine gesprochene Antwort — main.py spielt direkt den Song).
                 self._add_to_history(transcript, response_text)
                 intent = result.get("intent", "answer")
 
                 if intent == "play_song":
-                    # Lied spielen → beende Loop
                     action = result.get("action") or {}
                     song_id = action.get("song_id")
                     song_title = action.get("song_title")
                     logger.info(f"KI-Modus: Play-Intent → {song_title}")
                     return {"intent": "play_song", "song_id": song_id, "song_title": song_title}
 
-                elif intent == "goodbye":
+                if intent == "goodbye":
+                    # Nicht unterbrechbar — Konversation endet hier ohnehin;
+                    # ein Barge-in während des Abschieds würde sonst verworfen
+                    # (bewusste Vereinfachung, siehe _speak_interruptible-Doku).
+                    self._speak(response_text)
                     logger.info("KI-Modus: Goodbye-Intent, beende")
                     return None
 
-                # sonst: loop → warte auf nächste Eingabe
+                # 6. Antwort abspielen UND gleichzeitig auf Barge-in bzw. den
+                # nächsten Turn lauschen (wie ChatGPT Voice Mode) — redet das
+                # Kind rein, wird die Wiedergabe sofort gestoppt.
+                barged_in, next_transcript = self._speak_interruptible(response_text)
+                if barged_in:
+                    if not next_transcript:
+                        logger.info("KI-Modus: nach Antwort Sprache erkannt, ASR leer — beende")
+                        return None
+                    pending_transcript = next_transcript
+                # sonst: pending_transcript bleibt None → nächste Iteration
+                # nimmt normal auf (Antwort lief ungestört durch).
 
             except Exception as e:
                 logger.exception(f"KI-Modus: Fehler in Loop: {e}")
