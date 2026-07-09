@@ -237,15 +237,20 @@ class VoiceAssistant:
             return None
 
         if response.status_code == 503:
-            logger.debug("Assistant disabled or unavailable (503)")
+            # WARNING statt debug (User-Wunsch): dieser Fall ist unsichtbar auf
+            # INFO-Log-Level geblieben und hat einen Server-seitigen Bug
+            # (Assistant per Config deaktiviert) tagelang wie eine echte
+            # Verbindungsstörung aussehen lassen.
+            logger.warning(f"Assistant disabled or unavailable (503): {response.text[:200]}")
             return None
         if not response.ok:
-            logger.warning(f"Assistant HTTP {response.status_code}")
+            logger.warning(f"Assistant HTTP {response.status_code}: {response.text[:200]}")
             return None
 
         try:
             data = response.json()
             if data.get("status") != "ok":
+                logger.warning(f"Assistant response status != ok: {data}")
                 return None
             return data
         except (json.JSONDecodeError, KeyError) as e:
@@ -343,8 +348,15 @@ class VoiceAssistant:
                 # 3. Claude verstehen (inkl. box_config + catalog)
                 result = self.ask(transcript, box_config, catalog)
                 if not result:
-                    logger.warning("KI-Modus: ask() gab None zurück (offline/Fehler)")
-                    return {"intent": "offline"}
+                    # "offline" nur, wenn WIRKLICH keine Verbindung mehr besteht
+                    # (User-Wunsch) — ein serverseitiger Fehler (503/500/kaputtes
+                    # JSON) bei bestehender Verbindung ist kein Offline-Zustand
+                    # und soll nicht fälschlich als solcher angesagt werden.
+                    if not self.backend or not self.backend.is_connected:
+                        logger.warning("KI-Modus: Verbindung während Konversation verloren.")
+                        return {"intent": "offline"}
+                    logger.warning("KI-Modus: ask() gab None zurück (Server-Fehler, Verbindung besteht) — Abbruch.")
+                    return None
 
                 # 4. Safety-Check
                 response_text = result.get("response", "")

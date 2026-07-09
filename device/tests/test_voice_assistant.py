@@ -310,20 +310,44 @@ def test_conversation_loop_returns_offline_without_recording():
     assert recorder.call_count == 0
 
 
-def test_conversation_loop_returns_offline_on_ask_failure():
-    """Server bricht MITTEN in der Konversation weg (z.B. Timeout) → 'offline'
-    statt generischem Abbruch, damit main.py den Offline-Hinweis spielt."""
+def test_conversation_loop_returns_offline_when_connection_lost_mid_turn():
+    """Verbindung bricht ECHT weg (is_connected wird False) während des
+    Requests → 'offline', damit main.py den Offline-Hinweis spielt."""
     from voice.assistant import VoiceAssistant
     backend = _FakeBackend(connected=True)
     player = MagicMock()
     recorder = _FakeRecorder(speech_seen_sequence=[True])
     transcribe_fn = _fake_transcriber(["Hallo"])
-    backend._session.post.side_effect = Exception("connection reset")
+
+    def _drop_connection(*args, **kwargs):
+        backend.is_connected = False  # WLAN fällt genau jetzt weg
+        raise Exception("connection reset")
+    backend._session.post.side_effect = _drop_connection
 
     asst = VoiceAssistant(backend, player, recorder, transcribe_fn=transcribe_fn)
     result = asst.conversation_loop({}, [])
 
     assert result == {"intent": "offline"}
+
+
+def test_conversation_loop_returns_none_on_server_error_while_still_connected():
+    """User-Wunsch: ein serverseitiger Fehler (z.B. 503 weil der Assistant
+    server-seitig deaktiviert ist) bei weiterhin bestehender Verbindung ist
+    KEIN Offline-Zustand — nur ein normaler, stiller Abbruch. Sonst hätte ein
+    Konfigurationsfehler auf dem Server fälschlich behauptet, DIE BOX sei
+    offline, obwohl die Verbindung die ganze Zeit stand."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend(connected=True)
+    player = MagicMock()
+    recorder = _FakeRecorder(speech_seen_sequence=[True])
+    transcribe_fn = _fake_transcriber(["Hallo"])
+    backend._session.post.return_value = MagicMock(status_code=503, text="assistant disabled")
+
+    asst = VoiceAssistant(backend, player, recorder, transcribe_fn=transcribe_fn)
+    result = asst.conversation_loop({}, [])
+
+    assert result is None
+    assert backend.is_connected is True
 
 
 def test_conversation_loop_returns_none_without_transcribe_fn():
