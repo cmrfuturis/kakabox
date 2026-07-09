@@ -344,6 +344,7 @@ class VoiceAssistant:
                     # Leeres Transkript (ASR Fehler) → Abbruch
                     logger.warning("KI-Modus: ASR leer, beende")
                     return None
+                logger.info(f"KI-Modus transkribiert: «{transcript}»")
 
                 # 3. Claude verstehen (inkl. box_config + catalog)
                 result = self.ask(transcript, box_config, catalog)
