@@ -251,13 +251,37 @@ def test_safety_filter_ignores_zauberwort_mode_entirely():
 
 
 def test_safety_filter_quiet_hours_blocks_scary_topics():
+    """quiet_hours_active ist der von main.py AUSGEWERTETE Bool (Nachtmodus
+    JETZT) — der alte Zeitplan-Listen-Key aktivierte die Regeln 24/7, sobald
+    irgendein Fenster konfiguriert war (Review-Finding)."""
     from voice.assistant import SafetyFilter
-    box_config = {"quiet_hours": [{"start": "20:00", "end": "07:00"}]}
+    box_config = {"quiet_hours_active": True}
     # Horror-Inhalte blockiert
     assert not SafetyFilter.is_safe("Erzähl mir was Gruseliges", box_config)
     assert not SafetyFilter.is_safe("Monster und Angst", box_config)
     # Normale Fragen erlaubt
     assert SafetyFilter.is_safe("Was ist eine Pflanze?", box_config)
+
+
+def test_safety_filter_quiet_hours_schedule_alone_does_not_block():
+    """Regression: der ROHE Zeitplan (Liste) darf die Nachtmodus-Regeln NICHT
+    aktivieren — nur der ausgewertete quiet_hours_active-Bool zählt. Sonst
+    blockte die KI Grusel-Themen rund um die Uhr, sobald Eltern irgendein
+    Schlaffenster konfiguriert hatten."""
+    from voice.assistant import SafetyFilter
+    box_config = {"quiet_hours": [{"start": "20:00", "end": "07:00"}]}
+    assert SafetyFilter.is_safe("Erzähl mir was Gruseliges", box_config)
+
+
+def test_safety_filter_word_boundaries():
+    """Regression (Review-Finding): rohes Substring-Matching blockierte
+    harmlose Antworten — 'arsch' in 'Marsch', 'geist' in 'begeistert'."""
+    from voice.assistant import SafetyFilter
+    assert SafetyFilter.is_safe("Das ist der Radetzky-Marsch von Strauss", {})
+    assert SafetyFilter.is_safe("Ich bin ganz begeistert!", {"quiet_hours_active": True})
+    # Wortanfang matcht weiterhin, auch flektiert:
+    assert not SafetyFilter.is_safe("Er wollte ihn verprügeln.", {})
+    assert not SafetyFilter.is_safe("Gruselige Geschichten!", {"quiet_hours_active": True})
 
 
 # --------------------------------------------------------------------------
@@ -1143,3 +1167,98 @@ def test_conversation_loop_streaming_barge_in_uses_next_transcript():
     assert result == {"intent": "play_song", "song_id": 7, "song_title": "Musik"}
     assert stream1.closed is True
     assert backend._session.post.call_count == 2
+
+
+# --------------------------------------------------------------------------
+# Review-Fixes 2026-07-10 — Cancel-Fenster, Zauberwort-Vorturn, History-Guard
+# --------------------------------------------------------------------------
+
+
+def test_conversation_loop_hard_stop_during_think_window_discards_result():
+    """Review-Finding: Blau-Druck WÄHREND die Box denkt (nach der Aufnahme,
+    vor/während des Claude-Calls) wurde verschluckt — bei play_song startete
+    trotz Stopp die Musik. Jetzt wird das Event nach der ASR geprüft."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    recorder = _FakeRecorder(speech_seen_sequence=[True])
+    cancel_event = threading.Event()
+
+    def transcribe_and_cancel(path):
+        # Kind drückt Blau GENAU während der Transkription (Denk-Fenster).
+        cancel_event.set()
+        return "Spiele bitte 99 Luftballons"
+
+    backend._session.post.return_value = _legacy_response({
+        "status": "ok", "intent": "play_song", "response": "Klar!",
+        "action": {"song_id": 12, "song_title": "99 Luftballons"}, "confidence": 0.95,
+    })
+
+    asst = VoiceAssistant(backend, player, recorder, transcribe_fn=transcribe_and_cancel)
+    result = asst.conversation_loop({}, [], cancel_event=cancel_event)
+
+    assert result is None  # KEIN play_song-Ergebnis trotz Claude-Antwort
+
+
+def test_conversation_loop_zauberwort_accepts_bitte_from_previous_turn():
+    """Review-Finding: mehrstufiger Song-Wunsch — 'bitte' im Vorturn zählt.
+    Turn 1: 'Kannst du bitte ein Lied spielen?' → Rückfrage. Turn 2: 'Das
+    rote Pferd' (ohne bitte) → play_song darf NICHT geblockt werden."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    recorder = _FakeRecorder(speech_seen_sequence=[True])
+    transcribe_fn = _fake_transcriber(["Das rote Pferd"])  # KEIN bitte in DIESEM Turn
+    backend._session.post.return_value = _legacy_response({
+        "status": "ok", "intent": "play_song", "response": "Hier kommt es!",
+        "action": {"song_id": 7, "song_title": "Das rote Pferd"}, "confidence": 0.9,
+    })
+
+    asst = VoiceAssistant(backend, player, recorder, transcribe_fn=transcribe_fn)
+    # Vorturn mit "bitte" in der History (wie nach einer Rückfrage der Box)
+    asst._add_to_history("Kannst du bitte ein Lied spielen?", "Welches denn?")
+    result = asst.conversation_loop({"zauberwort_mode_enabled": True}, [])
+
+    assert result == {"intent": "play_song", "song_id": 7, "song_title": "Das rote Pferd"}
+
+
+def test_self_echo_does_not_swallow_short_real_answers():
+    """Review-Finding: 'Bitte' als echte Kind-Antwort war Substring der
+    Zauberwort-Erinnerung und wurde als Selbst-Echo verworfen."""
+    from voice.assistant import _looks_like_self_echo
+    reminder = "Du musst noch 'bitte' sagen, wenn du ein Lied hören möchtest!"
+    assert not _looks_like_self_echo(reminder, "Bitte")
+    assert not _looks_like_self_echo(reminder, "Ja")
+    # Echte lange Echo-Fragmente werden weiterhin erkannt:
+    assert _looks_like_self_echo(reminder, "Du musst noch 'bitte' sagen")
+
+
+def test_add_to_history_skips_empty_entries():
+    """Review-Finding: leere assistant-Inhalte in der History lassen die
+    Anthropic-API alle Folge-Turns mit 400 ablehnen — leere Turns werden
+    deshalb gar nicht erst gespeichert."""
+    backend = _FakeBackend()
+    asst = VoiceAssistant(backend, MagicMock())
+
+    asst._add_to_history("Hallo", "")       # leere Antwort (Barge-in vor Satz 1)
+    asst._add_to_history("", "Antwort")     # leeres Transkript
+    asst._add_to_history("  ", "  ")        # nur Whitespace
+    assert asst.history == []
+
+    asst._add_to_history("Hallo", "Hi!")
+    assert len(asst.history) == 1
+
+
+def test_open_stream_truncates_overlong_transcript():
+    """Review-Finding: Server validiert transcript max:500 — ein langer
+    60s-Redeturn führte zu 422 und Konversationsabbruch."""
+    backend = _FakeBackend()
+    backend._session.post.return_value = _legacy_response({
+        "status": "ok", "intent": "answer", "response": "ok", "confidence": 0.9,
+    })
+    asst = VoiceAssistant(backend, MagicMock())
+
+    asst._open_stream("wort " * 200, {}, [])  # 1000 Zeichen
+
+    sent = backend._session.post.call_args[1]["json"]["transcript"]
+    assert len(sent) <= 500

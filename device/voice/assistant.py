@@ -49,6 +49,19 @@ SCARY_TOPICS = {
     "monster", "geist", "zombie", "vampir", "werwolf",
 }
 
+# Wortanfangs-Grenze statt rohem Substring (Review-Finding: "arsch" matchte
+# in "Marsch", "geist" in "begeistert" — harmlose Antworten wurden blockiert).
+# \b + Wort erlaubt weiterhin Flexionen ("ficken", "gruselig"), verlangt aber
+# eine Wortgrenze VOR dem Treffer.
+_FORBIDDEN_RE = re.compile(
+    r"\b(" + "|".join(sorted(FORBIDDEN_WORDS, key=len, reverse=True)) + r")",
+    re.IGNORECASE,
+)
+_SCARY_RE = re.compile(
+    r"\b(" + "|".join(sorted(SCARY_TOPICS, key=len, reverse=True)) + r")",
+    re.IGNORECASE,
+)
+
 
 class SafetyFilter:
     """Blockiert unsichere Inhalte für Kinder.
@@ -63,20 +76,23 @@ class SafetyFilter:
     def is_safe(text: str, box_config: dict) -> bool:
         """Prüft ob Text für Kinder sicher ist (Vulgär/Rassistisch/Feindselig,
         gruselige Inhalte während Nachtmodus)."""
-        text_lower = text.lower()
-
         # Vulgär / Rassistisch / Feindselig
-        for word in FORBIDDEN_WORDS:
-            if word in text_lower:
-                logger.warning(f"SafetyFilter: blocked forbidden word '{word}'")
-                return False
+        m = _FORBIDDEN_RE.search(text)
+        if m:
+            logger.warning(f"SafetyFilter: blocked forbidden word '{m.group(1)}'")
+            return False
 
-        # Nachtmodus: keine gruselig/Action-Inhalte
-        if box_config.get("quiet_hours"):
-            for topic in SCARY_TOPICS:
-                if topic in text_lower:
-                    logger.warning(f"SafetyFilter: quiet hours, scary topic '{topic}' blocked")
-                    return False
+        # Nachtmodus: keine gruselig/Action-Inhalte. quiet_hours_active ist
+        # der von main.py AUSGEWERTETE Ist-Zustand (bool) — der alte Key
+        # quiet_hours enthielt den kompletten ZEITPLAN und war truthy, sobald
+        # Eltern irgendein Fenster konfiguriert hatten (Review-Finding: die KI
+        # lief dann 24/7 im Nachtmodus, auch mittags). Fallback auf den alten
+        # Key bewusst NICHT — lieber kein Nachtmodus-Block als Dauer-Block.
+        if box_config.get("quiet_hours_active"):
+            m = _SCARY_RE.search(text)
+            if m:
+                logger.warning(f"SafetyFilter: quiet hours, scary topic '{m.group(1)}' blocked")
+                return False
 
         return True
 
@@ -102,7 +118,12 @@ def _looks_like_self_echo(spoken_text: str, heard_text: str) -> bool:
     a, b = norm(spoken_text), norm(heard_text)
     if not a or not b:
         return False
-    if a in b or b in a:
+    # Containment nur bei ausreichend langem Gehörten (Review-Finding: das
+    # Kind ruft "Bitte" in die Zauberwort-Erinnerung "Du musst noch 'bitte'
+    # sagen …" — 'bitte' ist Substring der Antwort und wurde als Selbst-Echo
+    # verworfen, obwohl es die ECHTE Kind-Antwort war. Kurze Ein-Wort-Antworten
+    # ("Ja", "Nein", "Bitte") sind praktisch nie ein brauchbares Echo-Fragment).
+    if min(len(a), len(b)) >= 15 and (a in b or b in a):
         return True
     return SequenceMatcher(None, a, b).ratio() > 0.7
 
@@ -438,6 +459,12 @@ class VoiceAssistant:
         if not self.backend or not self.backend.is_connected:
             return None
 
+        # Server validiert transcript mit max:500 — ein 60s-Redeturn kann
+        # länger transkribieren und würde sonst mit 422 den ganzen Turn
+        # abbrechen (Review-Finding). Vorne kappen wäre falsch (der Anfang
+        # trägt meist den Intent), also hinten.
+        transcript = transcript[:500]
+
         context = {
             "child_age": self.child_age,
             "conversation_history": self.history[-5:],
@@ -695,7 +722,17 @@ class VoiceAssistant:
             # sonst: Fenster überlappte die Wiedergabe → einfach weiterlauschen.
 
     def _add_to_history(self, user_text: str, bot_response: str) -> None:
-        """Speichert einen Konversations-Turn im Memory."""
+        """Speichert einen Konversations-Turn im Memory.
+
+        Turns mit leerem Transkript ODER leerer Antwort werden verworfen
+        (Review-Finding: beim Streaming kann full_text leer sein, wenn ein
+        Barge-in/Stopp VOR dem ersten gesprochenen Satz kam — ein leerer
+        assistant-Turn in der History würde alle Folge-Requests an die
+        Anthropic-API mit 400 "all messages must have non-empty content"
+        scheitern lassen).
+        """
+        if not (user_text or "").strip() or not (bot_response or "").strip():
+            return
         self.history.append({
             "timestamp": datetime.now().isoformat(),
             "transcript": user_text,
@@ -790,11 +827,32 @@ class VoiceAssistant:
 
                 logger.info(f"KI-Modus transkribiert: «{transcript}»")
 
+                # Harter Stopp konnte während der ASR gedrückt worden sein —
+                # cancel_event wird sonst nur INNERHALB der Aufnahme geprüft
+                # (Review-Finding: Blau-Druck im mehrsekündigen "Denk-Fenster"
+                # ASR→Claude wurde verschluckt und der Song startete trotzdem).
+                if cancel_event is not None and cancel_event.is_set():
+                    logger.info("KI-Modus: hart abgebrochen (Blau-Knopf nach ASR).")
+                    return None
+
                 # 3. Claude fragen — bevorzugt STREAMEND: die Antwort wird
                 # satzweise gesprochen, sobald der erste Satz generiert ist,
                 # statt auf das komplette Ergebnis zu warten. Ein alter Server
                 # ohne Streaming antwortet klassisch mit Voll-JSON ("legacy").
                 opened = self._open_stream(transcript, box_config, catalog)
+
+                # Zweites Denk-Fenster: der Claude-Request selbst (bis zu
+                # mehrere Sekunden) — auch hier darf ein zwischenzeitlicher
+                # Blau-Druck nicht verloren gehen.
+                if cancel_event is not None and cancel_event.is_set():
+                    logger.info("KI-Modus: hart abgebrochen (Blau-Knopf während Claude-Anfrage).")
+                    if opened is not None and opened[3] is not None:
+                        try:
+                            opened[3].close()
+                        except Exception:
+                            pass
+                    return None
+
                 if opened is None:
                     # "offline" nur, wenn WIRKLICH keine Verbindung mehr besteht
                     # (User-Wunsch) — ein serverseitiger Fehler (503/500/kaputtes
@@ -822,11 +880,19 @@ class VoiceAssistant:
                 # umgewidmet + eine Erinnerung gesprochen — Witze/Geschichten/
                 # Fragen sind davon komplett unberührt. Deterministischer
                 # Backstop, falls Claude die System-Prompt-Regel ignoriert.
+                # "bitte" aus dem UNMITTELBAR vorigen Kind-Turn zählt mit
+                # (Review-Finding: "Kannst du bitte ein Lied spielen?" →
+                # Rückfrage "Welches?" → "Das rote Pferd" wurde geblockt,
+                # obwohl das Kind einen Turn vorher "bitte" gesagt hatte).
                 intent = meta.get("intent", "answer")
+                said_bitte = has_magic_word(transcript) or (
+                    bool(self.history)
+                    and has_magic_word(self.history[-1].get("transcript", ""))
+                )
                 if (
                     intent == "play_song"
                     and box_config.get("zauberwort_mode_enabled")
-                    and not has_magic_word(transcript)
+                    and not said_bitte
                 ):
                     logger.info("KI-Modus: Zauberwort-Mode aktiv, 'bitte' fehlt — kein Playback.")
                     intent = "answer"

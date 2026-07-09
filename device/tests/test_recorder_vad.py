@@ -242,6 +242,12 @@ class _CancelAfterN:
         self._count += 1
         return self._count > self._n
 
+    def wait(self, timeout=None):
+        # Für den Cancel-Watcher-Thread: nicht-blockierender Zustands-Check
+        # (der Fake zählt bewusst NUR über is_set hoch, damit die getestete
+        # Chunk-Schleife das Timing bestimmt, nicht der Watcher).
+        return self._count > self._n
+
 
 def test_cancel_event_stops_recording_immediately(monkeypatch, tmp_path):
     """Regression: harter KI-Modus-Stopp per Blau-Knopf (cancel_event) muss

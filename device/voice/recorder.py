@@ -252,6 +252,32 @@ class MicRecorder:
         except FileNotFoundError as e:
             raise RecorderError(f"arecord nicht installiert: {e}") from e
 
+        # Cancel-Watcher (Review-Finding): cancel_event wird sonst nur
+        # ZWISCHEN den ~100ms-Chunk-Reads geprüft — hängt arecord (ALSA-
+        # Treiber-Wedge) oder blockt der Read aus anderem Grund, wäre der
+        # harte Stopp wirkungslos und der aufrufende Thread (samt _voice_lock)
+        # dauerhaft blockiert. Der Watcher terminiert arecord, sobald das
+        # Event feuert → der blockierte Read läuft auf EOF und kehrt zurück.
+        watcher_done = threading.Event()
+
+        def _cancel_watcher() -> None:
+            # Kurzes Wait-Intervall: begrenzt die Stopp-Latenz auf ~100ms,
+            # kostet praktisch nichts (Event-Wait, kein Busy-Loop).
+            while not watcher_done.is_set():
+                if cancel_event.wait(timeout=0.1):
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    return
+
+        watcher: Optional[threading.Thread] = None
+        if cancel_event is not None:
+            watcher = threading.Thread(
+                target=_cancel_watcher, daemon=True, name="rec-cancel-watch",
+            )
+            watcher.start()
+
         recorded = bytearray()
         # ``streaming_speech`` steuert NUR den vorzeitigen Abbruch nach Stille.
         # Ob ASR läuft, entscheidet ``speech_present`` rückwirkend über
@@ -312,11 +338,21 @@ class MicRecorder:
                 if not streaming_speech and chunk_idx + 1 - settle_chunks >= initial_silence_chunks:
                     break
         finally:
+            watcher_done.set()
             proc.terminate()
             try:
                 proc.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
+            if watcher is not None:
+                watcher.join(timeout=0.5)
+
+        # Cancel kann den Read auch über den Watcher (proc.terminate → EOF)
+        # beendet haben — dann brach die Schleife über den Daten-Ende-Pfad ab,
+        # ohne dass der Inline-Check oben noch lief. Nachziehen, damit das
+        # Ergebnis in JEDEM Fall als cancelled markiert ist.
+        if cancel_event is not None and cancel_event.is_set():
+            was_cancelled = True
 
         if not recorded:
             if was_cancelled:

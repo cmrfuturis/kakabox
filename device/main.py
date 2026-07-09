@@ -1775,13 +1775,32 @@ class Kakabox:
         except Exception as e:
             logger.warning("Player.stop vor Spotify fehlgeschlagen: %s", e)
 
-        if self._spotify.turn_on(volume=self._volume):
-            self._spotify_active = True
+        # Optimistisch aktiv setzen, DANN im Worker anschalten: turn_on kann
+        # bei Kontext-Laden mehrere Sekunden brauchen und darf den NFC-Loop
+        # nicht blockieren (Chip-Runter muss sofort erkannt werden). Das Flag
+        # vorab garantiert, dass ein schnelles Chip-Runter in _on_tag_removed
+        # den Spotify-Zweig nimmt und pausiert.
+        self._spotify_active = True
+        threading.Thread(
+            target=self._spotify_turn_on_worker, args=(uid,),
+            daemon=True, name="spotify-on",
+        ).start()
+
+    def _spotify_turn_on_worker(self, uid: str) -> None:
+        ok = self._spotify.turn_on(volume=self._volume)
+        if ok:
             logger.info("🎵 Spotify an (Chip %s).", uid)
-        else:
+            # Race: Chip wurde während des (langsamen) turn_on wieder
+            # runtergenommen → _on_tag_removed hat pausiert, aber unser
+            # play/resume kam danach an. Dann sofort wieder pausieren.
+            if not self._spotify_active:
+                logger.info("Spotify: Chip war schon wieder weg → Pause.")
+                self._spotify.pause()
+        elif self._spotify_active:
             # Warum genau es nicht ging (Daemon down, kein Login, kein
             # Kontext) hat der SpotifyController bereits geloggt — hier nur
             # das sichtbare Feedback für das Kind.
+            self._spotify_active = False
             self._flash_playback_denied()
 
     def _start_kaka_playlist(self, uid: str, kaka: dict, trigger_sync: bool = True) -> None:
@@ -2063,7 +2082,13 @@ class Kakabox:
             with self._playlist_lock:
                 self._active_tag_uid = None
             if self._spotify is not None:
-                self._spotify.pause()
+                # Pause im Thread: der HTTP-Call darf den NFC-Loop nicht
+                # aufhalten (Timeout wäre mehrere Sekunden, wenn der Daemon
+                # gerade beschäftigt/weg ist).
+                threading.Thread(
+                    target=self._spotify.pause,
+                    daemon=True, name="spotify-pause",
+                ).start()
             if self.leds is not None:
                 self.leds.nfc_chip_absent()
             logger.info("Spotify-Chip %s entfernt → Pause.", uid)
@@ -2766,11 +2791,18 @@ class Kakabox:
         if not self._voice_lock.acquire(blocking=False):
             logger.info("Voice bereits aktiv — Trigger ignoriert.")
             return
-        threading.Thread(
-            target=self._voice_activation_guarded,
-            daemon=True,
-            name="voice-ptt",
-        ).start()
+        try:
+            threading.Thread(
+                target=self._voice_activation_guarded,
+                daemon=True,
+                name="voice-ptt",
+            ).start()
+        except Exception:
+            # Thread-Start kann bei Ressourcen-Erschöpfung werfen — dann muss
+            # der eben genommene Lock zurück, sonst ist Voice bis zum Reboot
+            # tot ("Voice bereits aktiv" bei jedem Druck).
+            self._voice_lock.release()
+            raise
 
     def _on_blue_held(self) -> None:
         """Blau 2+ Sekunden halten → KI-Konversations-Modus starten.
@@ -2796,11 +2828,16 @@ class Kakabox:
         if not self._voice_lock.acquire(blocking=False):
             logger.info("Voice/KI bereits aktiv — Trigger ignoriert.")
             return
-        threading.Thread(
-            target=self._run_assistant_conversation,
-            daemon=True,
-            name="assistant-conv",
-        ).start()
+        try:
+            threading.Thread(
+                target=self._run_assistant_conversation,
+                daemon=True,
+                name="assistant-conv",
+            ).start()
+        except Exception:
+            # Gegenstück zum Guard in _on_blue_pressed: Lock nie leaken.
+            self._voice_lock.release()
+            raise
 
     def _run_assistant_conversation(self) -> None:
         """KI-Konversations-Loop (5s Stille-Timeout, endlos sonst).
@@ -2849,10 +2886,14 @@ class Kakabox:
                 self._play_prompt("listening.wav")
                 self.player.wait_until_idle(timeout=2.0)
 
-                # Box-Config für Claude
+                # Box-Config für Claude. quiet_hours_active ist der HIER UND
+                # JETZT ausgewertete Zustand — der frühere Key quiet_hours
+                # enthielt den kompletten Zeitplan und war truthy, sobald
+                # Eltern irgendein Fenster konfiguriert hatten (Review-
+                # Finding: Nachtmodus-Regeln griffen dann 24/7, auch mittags).
                 box_config = {
                     "zauberwort_mode_enabled": bool(self.config.get("zauberwort_mode_enabled")),
-                    "quiet_hours": self.config.get("quiet_hours", []),
+                    "quiet_hours_active": bool(self._quiet_hours_now()),
                 }
                 # Rohe Song-Liste (content_id + title) für den Server-Kontext —
                 # NICHT build_catalog_from_file() (liefert Candidate-Objekte für
@@ -2868,7 +2909,24 @@ class Kakabox:
                     box_config, catalog, cancel_event=self._ki_cancel_event,
                 )
 
-                if result and result.get("intent") == "play_song":
+                # Ab hier läuft nur noch Feedback/Playback — der KI-Modus ist
+                # vorbei. Flag SOFORT zurücknehmen (Review-Finding: solange es
+                # stand, liefen Blau-Drücke während Titelansage/Error-Ton in
+                # den Hard-Stop-Zweig und setzten nur ein Event, das niemand
+                # mehr las — der Druck war wirkungslos verschluckt). Danach
+                # verhält sich Blau wieder normal (bricht z.B. die laufende
+                # Ansage über _abort_prompt_if_playing ab).
+                self._ki_mode_active = False
+
+                # Harter Stopp kann im Denk-Fenster (ASR/Claude) gedrückt
+                # worden sein, NACHDEM die Aufnahme durch war — dann kommt
+                # conversation_loop regulär zurück, aber der Wunsch des Kindes
+                # war STOPP: nichts mehr abspielen, still zurück zum Vorher.
+                if self._ki_cancel_event.is_set():
+                    logger.info("KI-Modus: harter Stopp — Ergebnis verworfen, kein Playback.")
+                    if saved_session:
+                        self._resume_in_place(saved_session)
+                elif result and result.get("intent") == "play_song":
                     # play_song Intent → direkt abspielen, kein Bestätigungston nötig
                     song_id = result.get("song_id")
                     song_title = result.get("song_title") or "Lied"
@@ -2956,6 +3014,18 @@ class Kakabox:
             content_id = int(song_id)
         except (TypeError, ValueError):
             logger.warning("KI-Modus: song_id nicht numerisch: %r", song_id)
+            return False
+
+        # Spielbarkeit VOR jedem Feedback prüfen (Review-Finding: bei einer
+        # halluzinierten/nicht gecachten song_id kamen erst Grün-Flash und
+        # "Ich spiele <Titel>", danach Stille — und weil trotzdem True
+        # zurückkam, nahm der Aufrufer den Erfolgspfad und ließ das vorher
+        # laufende Lied dauerhaft weg statt zu resumen).
+        if not self.audio_cache.path_for(content_id).is_file():
+            logger.warning(
+                "KI-Modus: song_id %d nicht im lokalen Cache — kein Playback.",
+                content_id,
+            )
             return False
 
         target = Candidate(
@@ -3704,6 +3774,14 @@ class Kakabox:
         # jeder amixer-Subprocess blockte ~300ms und failte — staute den
         # Encoder-Pfad. mpv softvol via player.set_volume reicht aus.
         self.player.set_volume(new_vol)
+        # KI-Antworten übernehmen die neue Lautstärke SOFORT — der Assistent
+        # hält sonst den Session-Start-Snapshot und jedes play_prompt() einer
+        # Antwort würde die Encoder-Drehung wieder überschreiben (Review-
+        # Finding: Lautstärkeregler wirkte während der Konversation scheinbar
+        # nicht). getattr-defensiv: Tests bauen Teil-Objekte ohne Assistant.
+        assistant = getattr(self, "_assistant", None)
+        if assistant is not None:
+            assistant.volume = new_vol
         # Spotify aktiv? Lautstärke auch an den Daemon — nicht-blockierend
         # (coalescing Worker), der Encoder-Pfad darf nicht auf HTTP warten
         # (gleiche Lektion wie beim früheren amixer-Call, siehe unten).
