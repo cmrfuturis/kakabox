@@ -6,7 +6,10 @@ Features: Lied-Info, Rätsel, Geschichten, Schulunterstützung, Gedächtnis.
 Offline-Fallback: Bei Server-Fehler spielen einfache lokale Befehle ab.
 
 Modus-Integration:
-- Zauberwort-Mode: nur play_song/pause/next/volume erlaubt
+- Zauberwort-Mode: betrifft NUR Song-Wünsche (intent="play_song") — das Kind
+  muss "bitte" gesagt haben, sonst kein Playback. Hat NICHTS mit anderen
+  Konversationsarten zu tun (Witze/Geschichten/Fragen sind unberührt,
+  User-Klarstellung 2026-07-09) — siehe conversation_loop().
 - Nachtmodus (quiet_hours): ruhige Inhalte, leise Antworten
 - SafetyFilter: blockiert Vulgär/Rassistisch/Feindselig (deutsche Blacklist)
 """
@@ -17,6 +20,8 @@ from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from voice.intent import has_magic_word
 
 logger = logging.getLogger(__name__)
 
@@ -39,37 +44,24 @@ SCARY_TOPICS = {
 
 
 class SafetyFilter:
-    """Blockiert unsichere Inhalte für Kinder."""
+    """Blockiert unsichere Inhalte für Kinder.
+
+    Zauberwort-Modus gehört NICHT hierher (User-Klarstellung 2026-07-09):
+    "bitte" ist nur für Song-Wünsche relevant und wird direkt in
+    conversation_loop() vor dem play_song-Intent geprüft — Witze/Geschichten/
+    Fragen sind von Zauberwort-Modus komplett unberührt.
+    """
 
     @staticmethod
-    def is_safe(text: str, box_config: dict, intent: Optional[str] = None) -> bool:
-        """Prüft ob Text für Kinder sicher ist.
-
-        ``intent``: Claudes EIGENER, bereits bekannter Intent (aus der
-        strukturierten Antwort) — wird für den Zauberwort-Mode-Check genutzt,
-        statt ihn per Keyword-Heuristik aus dem Antworttext zu erraten. Ein
-        Witz/eine Geschichte enthält so gut wie nie Wörter wie "spiel" oder
-        "pause" — die alte Text-Heuristik hätte JEDE nicht-Musik-Antwort im
-        Zauberwort-Mode blockiert, unabhängig davon ob das Kind eigentlich
-        (auch) nach einem Lied gefragt hatte, und umgekehrt jede zufällige
-        Erwähnung von "aus"/"nächst" in einer Geschichte fälschlich als
-        erlaubten Musik-Intent durchgewunken. ``_detect_intent()`` bleibt nur
-        als Fallback, wenn kein Intent übergeben wird (Legacy-Aufrufer).
-        """
+    def is_safe(text: str, box_config: dict) -> bool:
+        """Prüft ob Text für Kinder sicher ist (Vulgär/Rassistisch/Feindselig,
+        gruselige Inhalte während Nachtmodus)."""
         text_lower = text.lower()
 
         # Vulgär / Rassistisch / Feindselig
         for word in FORBIDDEN_WORDS:
             if word in text_lower:
                 logger.warning(f"SafetyFilter: blocked forbidden word '{word}'")
-                return False
-
-        # Zauberwort-Mode: nur Musik-Befehle
-        if box_config.get("zauberwort_mode_enabled"):
-            allowed_intents = {"play_song", "pause", "next", "volume", "goodbye"}
-            effective_intent = intent if intent is not None else SafetyFilter._detect_intent(text_lower)
-            if effective_intent not in allowed_intents:
-                logger.warning(f"SafetyFilter: zauberwort mode, intent '{effective_intent}' not allowed")
                 return False
 
         # Nachtmodus: keine gruselig/Action-Inhalte
@@ -80,21 +72,6 @@ class SafetyFilter:
                     return False
 
         return True
-
-    @staticmethod
-    def _detect_intent(text_lower: str) -> str:
-        """Einfache Intent-Heuristik (wird durch Claude ersetzt, aber Fallback)."""
-        if any(word in text_lower for word in ["spiel", "play"]):
-            return "play_song"
-        elif any(word in text_lower for word in ["pausier", "pause", "stopp", "stop"]):
-            return "pause"
-        elif any(word in text_lower for word in ["nächst", "next", "vor"]):
-            return "next"
-        elif any(word in text_lower for word in ["lauter", "leiser", "volume", "laut"]):
-            return "volume"
-        elif any(word in text_lower for word in ["aus", "goodbye", "bye", "schlaf", "nacht"]):
-            return "goodbye"
-        return "answer"
 
 
 def _looks_like_self_echo(spoken_text: str, heard_text: str) -> bool:
@@ -543,13 +520,25 @@ class VoiceAssistant:
                     logger.warning("KI-Modus: ask() gab None zurück (Server-Fehler, Verbindung besteht) — Abbruch.")
                     return None
 
-                # 4. Intent zuerst auslesen — Safety-Check nutzt Claudes ECHTEN
-                # Intent für den Zauberwort-Mode-Check (siehe SafetyFilter.is_safe-
-                # Doku: die alte Text-Heuristik hätte Witze/Geschichten fast
-                # immer fälschlich blockiert).
+                # 4. Intent auslesen. Zauberwort-Modus betrifft NUR Song-
+                # Wünsche (User-Klarstellung 2026-07-09): ohne "bitte" im
+                # TRANSKRIPT (nicht im Antworttext!) wird play_song zu answer
+                # umgewidmet + eine Erinnerung gesprochen — Witze/Geschichten/
+                # Fragen sind davon komplett unberührt, unabhängig ob "bitte"
+                # gesagt wurde. Deterministischer Backstop, falls Claude die
+                # Regel aus dem System-Prompt trotzdem mal ignoriert.
                 intent = result.get("intent", "answer")
                 response_text = result.get("response", "")
-                if not self.safety.is_safe(response_text, box_config, intent=intent):
+                if (
+                    intent == "play_song"
+                    and box_config.get("zauberwort_mode_enabled")
+                    and not has_magic_word(transcript)
+                ):
+                    logger.info("KI-Modus: Zauberwort-Mode aktiv, 'bitte' fehlt — kein Playback.")
+                    intent = "answer"
+                    response_text = "Du musst noch 'bitte' sagen, wenn du ein Lied hören möchtest!"
+
+                if not self.safety.is_safe(response_text, box_config):
                     logger.warning("KI-Modus: Response blockiert (SafetyFilter)")
                     response_text = "Davon kann ich dir nicht erzählen."
 

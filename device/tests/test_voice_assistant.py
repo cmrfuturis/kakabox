@@ -195,40 +195,17 @@ def test_safety_filter_allows_clean_text():
     assert SafetyFilter.is_safe("Guten Morgen!", {})
 
 
-def test_safety_filter_zauberwort_mode_only_music():
+def test_safety_filter_ignores_zauberwort_mode_entirely():
+    """User-Klarstellung (2026-07-09): Zauberwort-Modus hat NICHTS mit
+    SafetyFilter/Konversationsarten zu tun — 'bitte' ist nur für Song-Wünsche
+    relevant und wird separat in conversation_loop() geprüft (siehe
+    test_conversation_loop_zauberwort_*). Witze/Geschichten/Fragen sind vom
+    Zauberwort-Modus IMMER unberührt, egal ob 'bitte' gesagt wurde."""
     from voice.assistant import SafetyFilter
     box_config = {"zauberwort_mode_enabled": True}
-    # Musik-Befehle erlaubt
+    assert SafetyFilter.is_safe("Erzähl mir eine Geschichte", box_config)
+    assert SafetyFilter.is_safe("Warum können Geister nicht lügen? Weil man durch sie hindurchsieht!", box_config)
     assert SafetyFilter.is_safe("Spiele irgendwas", box_config)
-    assert SafetyFilter.is_safe("Pausiere", box_config)
-    # Story-Intent blockiert
-    assert not SafetyFilter.is_safe("Erzähl mir eine Geschichte", box_config)
-
-
-def test_safety_filter_uses_real_intent_not_text_heuristic():
-    """Regression (Live-Test 2026-07-09): die alte Text-Heuristik erriet den
-    Intent aus dem ANTWORTTEXT — ein Witz ohne Musik-Wörter wurde IMMER als
-    'answer' geblockt, unabhängig davon was Claude tatsächlich als intent
-    zurückgab, UND umgekehrt eine play_song-Antwort ohne das Wort 'spiel'
-    fälschlich geblockt. Mit dem echten intent-Parameter funktioniert beides
-    korrekt."""
-    from voice.assistant import SafetyFilter
-    box_config = {"zauberwort_mode_enabled": True}
-
-    joke_response = "Warum können Geister nicht lügen? Weil man durch sie hindurchsieht!"
-    assert not SafetyFilter.is_safe(joke_response, box_config, intent="joke")
-
-    play_response = "Hier kommt dein Lieblingslied!"  # kein "spiel" im Text
-    assert SafetyFilter.is_safe(play_response, box_config, intent="play_song")
-
-
-def test_safety_filter_falls_back_to_heuristic_without_intent():
-    """Ohne übergebenen intent (Legacy-Aufrufer) bleibt die alte Text-
-    Heuristik als Fallback aktiv."""
-    from voice.assistant import SafetyFilter
-    box_config = {"zauberwort_mode_enabled": True}
-    assert SafetyFilter.is_safe("Ich spiele jetzt dein Lied", box_config)
-    assert not SafetyFilter.is_safe("Warum können Geister nicht lügen?", box_config)
 
 
 def test_safety_filter_quiet_hours_blocks_scary_topics():
@@ -358,6 +335,87 @@ def test_conversation_loop_returns_play_song_intent():
     assert result is not None
     assert result.get("intent") == "play_song"
     assert result.get("song_title") == "99 Luftballons"
+
+
+def test_conversation_loop_zauberwort_mode_blocks_song_without_bitte():
+    """User-Klarstellung (2026-07-09): Zauberwort-Modus verlangt 'bitte' NUR
+    für Songs. Fehlt es im TRANSKRIPT, wird play_song zu answer umgewidmet
+    (Erinnerung gesprochen statt Playback) — deterministischer Backstop,
+    falls Claude die System-Prompt-Regel trotzdem mal ignoriert."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    speaker = MagicMock()
+    speaker.synth_to_wav.return_value = "/tmp/answer.wav"
+    recorder = _FakeRecorder(speech_seen_sequence=[True, False])
+    transcribe_fn = _fake_transcriber(["Spiele 99 Luftballons"])  # KEIN "bitte"
+    backend._session.post.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {
+            "status": "ok", "intent": "play_song",
+            "response": "Klar, hier kommt 99 Luftballons!",
+            "action": {"song_id": 12, "song_title": "99 Luftballons"},
+            "confidence": 0.95,
+        }
+    )
+    box_config = {"zauberwort_mode_enabled": True}
+
+    asst = VoiceAssistant(backend, player, recorder, speaker=speaker, transcribe_fn=transcribe_fn)
+    result = asst.conversation_loop(box_config, [])
+
+    # KEIN play_song-Ergebnis — stattdessen wurde die Erinnerung gesprochen.
+    assert result is None
+    speaker.synth_to_wav.assert_called_with("Du musst noch 'bitte' sagen, wenn du ein Lied hören möchtest!")
+
+
+def test_conversation_loop_zauberwort_mode_allows_song_with_bitte():
+    """Mit 'bitte' im Transkript wird der Song ganz normal gespielt, auch bei
+    aktivem Zauberwort-Modus."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    recorder = _FakeRecorder(speech_seen_sequence=[True])
+    transcribe_fn = _fake_transcriber(["Spiele bitte 99 Luftballons"])
+    backend._session.post.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {
+            "status": "ok", "intent": "play_song",
+            "response": "Klar, hier kommt 99 Luftballons!",
+            "action": {"song_id": 12, "song_title": "99 Luftballons"},
+            "confidence": 0.95,
+        }
+    )
+    box_config = {"zauberwort_mode_enabled": True}
+
+    asst = VoiceAssistant(backend, player, recorder, transcribe_fn=transcribe_fn)
+    result = asst.conversation_loop(box_config, [])
+
+    assert result == {"intent": "play_song", "song_id": 12, "song_title": "99 Luftballons"}
+
+
+def test_conversation_loop_zauberwort_mode_does_not_affect_jokes():
+    """Kern der User-Klarstellung: Witze/Geschichten/Fragen sind vom
+    Zauberwort-Modus KOMPLETT unberührt — funktionieren unabhängig davon ob
+    'bitte' gesagt wurde."""
+    from voice.assistant import VoiceAssistant
+    backend = _FakeBackend()
+    player = MagicMock()
+    speaker = MagicMock()
+    speaker.synth_to_wav.return_value = "/tmp/answer.wav"
+    recorder = _FakeRecorder(speech_seen_sequence=[True, False])
+    transcribe_fn = _fake_transcriber(["Erzähl mir einen Witz"])  # KEIN "bitte"
+    joke_text = "Warum können Geister nicht lügen? Weil man durch sie hindurchsieht!"
+    backend._session.post.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {"status": "ok", "intent": "joke", "response": joke_text, "confidence": 0.9},
+    )
+    box_config = {"zauberwort_mode_enabled": True}
+
+    asst = VoiceAssistant(backend, player, recorder, speaker=speaker, transcribe_fn=transcribe_fn)
+    asst.conversation_loop(box_config, [])
+
+    # Der ECHTE Witz wurde gesprochen, NICHT die Zauberwort-Erinnerung.
+    speaker.synth_to_wav.assert_any_call(joke_text)
 
 
 def test_conversation_loop_returns_offline_without_recording():
