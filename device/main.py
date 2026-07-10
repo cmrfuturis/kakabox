@@ -1542,9 +1542,20 @@ class Kakabox:
         # An-Schalter für den go-librespot-Daemon (audio/spotify.py). Läuft
         # VOR Cache/Backend, damit eine evtl. noch bestehende Kaka-Zuordnung
         # des Chips (Backend kennt ihn ja weiter) nicht dazwischenfunkt.
-        if self._spotify is not None and \
-                uid.strip().upper() in self._spotify_tag_uids:
-            self._start_spotify(uid)
+        if uid.strip().upper() in self._spotify_tag_uids:
+            if self._spotify is not None:
+                self._start_spotify(uid)
+            else:
+                # Spotify per Config deaktiviert (spotify.enabled=false):
+                # Chip bewusst NUR ignorieren (roter Blitz) — ohne diesen
+                # Guard fiele er in den normalen Kaka-Flow und Auto-Pairing
+                # würde eine leere Kreativ-Kaka für den Spotify-Chip anlegen.
+                logger.info(
+                    "Spotify-Chip %s aufgelegt, aber Spotify ist deaktiviert — ignoriert.",
+                    uid,
+                )
+                if self.leds is not None:
+                    self.leds.nfc_flash_error()
             return
 
         # Cache-first: bekannter Tag mit allen Audios lokal → sofort spielen,
