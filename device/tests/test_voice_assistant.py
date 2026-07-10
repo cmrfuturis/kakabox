@@ -9,31 +9,13 @@ from voice.assistant import VoiceAssistant
 
 
 class _FakeBackend:
-    def __init__(self, connected=True, result=None):
+    def __init__(self, connected=True):
         self.is_connected = connected
         self._base_url = "https://test"
         self._session = MagicMock()
-        self._result = result or {
-            "status": "ok",
-            "intent": "answer",
-            "response": "Das ist eine tolle Frage!",
-            "confidence": 0.9,
-        }
 
     def _auth_headers(self):
         return {"Authorization": "Bearer test"}
-
-
-class _FakeLResponse:
-    def __init__(self, data, status=200):
-        self.status_code = status
-        self._data = data
-
-    def ok(self):
-        return self.status_code == 200
-
-    def json(self):
-        return self._data
 
 
 def _legacy_response(payload, status=200):
@@ -79,139 +61,43 @@ class _FakeStreamResponse:
 
 
 # --------------------------------------------------------------------------
-# VoiceAssistant — Memory + Server Integration
+# VoiceAssistant — Memory (History + now_playing)
+#
+# Der Request-Aufbau selbst wird über _open_stream/conversation_loop getestet
+# (weiter unten). Die Legacy-Methoden understand()/ask()/get_debug_info() wurden
+# 2026-07-10 als toter Code entfernt — conversation_loop nutzt nur _open_stream.
 # --------------------------------------------------------------------------
 
 
-def test_assistant_understand_success():
-    backend = _FakeBackend()
-    response = _FakeLResponse(_FakeBackend()._result)
-    backend._session.post.return_value = response
-    player = MagicMock()
-
-    asst = VoiceAssistant(backend, player)
-    result = asst.understand("Was ist ein Löwe?")
-
-    assert result == "Das ist eine tolle Frage!"
-    assert len(asst.history) == 1
-    assert asst.history[0]["transcript"] == "Was ist ein Löwe?"
-
-
-def test_assistant_offline_returns_none():
-    backend = _FakeBackend(connected=False)
-    player = MagicMock()
-
-    asst = VoiceAssistant(backend, player)
-    result = asst.understand("test")
-
-    assert result is None
-    assert backend._session.post.call_count == 0
-
-
-def test_assistant_error_503_returns_none():
-    backend = _FakeBackend()
-    response = _FakeLResponse({"status": "disabled"}, status=503)
-    backend._session.post.return_value = response
-    player = MagicMock()
-
-    asst = VoiceAssistant(backend, player)
-    result = asst.understand("test")
-
-    assert result is None
-
-
-def test_assistant_history_max_10_turns():
-    backend = _FakeBackend()
-    response = _FakeLResponse(_FakeBackend()._result)
-    backend._session.post.return_value = response
-    player = MagicMock()
-
-    asst = VoiceAssistant(backend, player)
+def test_add_to_history_caps_at_max_history():
+    """_add_to_history hält die Konversations-History bei max_history (10)."""
+    asst = VoiceAssistant(_FakeBackend(), MagicMock())
     for i in range(15):
-        asst.understand(f"Frage {i}")
+        asst._add_to_history(f"Frage {i}", f"Antwort {i}")
+    assert len(asst.history) == 10
+    # Die jüngsten 10 bleiben, die ältesten 5 sind raus.
+    assert asst.history[0]["transcript"] == "Frage 5"
+    assert asst.history[-1]["transcript"] == "Frage 14"
 
-    assert len(asst.history) == 10  # capped at max_history
 
-
-def test_assistant_now_playing_in_context():
-    backend = _FakeBackend()
-    response = _FakeLResponse(_FakeBackend()._result)
-    backend._session.post.return_value = response
-    player = MagicMock()
-
-    asst = VoiceAssistant(backend, player)
+def test_set_now_playing_populates_context_field():
+    """set_now_playing setzt das now_playing-Feld (von _open_stream in den
+    Server-Kontext gepackt, wenn ein Lied läuft)."""
+    asst = VoiceAssistant(_FakeBackend(), MagicMock())
+    assert asst.now_playing is None
     asst.set_now_playing("99 Luftballons", "Nena")
-    asst.understand("Wer singt das?")
-
-    # Verifiziere now_playing wurde im Request mitgesendet
-    call_args = backend._session.post.call_args
-    assert call_args[1]["json"]["now_playing"] == {
-        "title": "99 Luftballons",
-        "artist": "Nena",
-    }
+    assert asst.now_playing == {"title": "99 Luftballons", "artist": "Nena"}
 
 
-def test_assistant_omits_now_playing_when_nothing_plays():
-    """Regression: Laravels 'sometimes|array'-Validierung prüft nur, ob der
-    Key existiert — ein explizites "now_playing": null zählt als vorhanden
-    und scheitert an der array-Regel (422 bei JEDER Anfrage ohne laufendes
-    Lied, live beobachtet). Der Key muss bei fehlendem now_playing GANZ
-    fehlen, nicht mit null gesendet werden."""
-    backend = _FakeBackend()
-    response = _FakeLResponse(_FakeBackend()._result)
-    backend._session.post.return_value = response
-    player = MagicMock()
-
-    asst = VoiceAssistant(backend, player)
-    asst.understand("Was ist ein Löwe?")  # kein set_now_playing() aufgerufen
-
-    call_args = backend._session.post.call_args
-    assert "now_playing" not in call_args[1]["json"]
-
-
-def test_assistant_clear_history():
-    backend = _FakeBackend()
-    response = _FakeLResponse(_FakeBackend()._result)
-    backend._session.post.return_value = response
-    player = MagicMock()
-
-    asst = VoiceAssistant(backend, player)
-    asst.understand("test1")
-    asst.understand("test2")
-    assert len(asst.history) == 2
+def test_clear_history_resets_memory_and_now_playing():
+    asst = VoiceAssistant(_FakeBackend(), MagicMock())
+    asst._add_to_history("a", "b")
+    asst.set_now_playing("Lied", "Artist")
+    assert len(asst.history) == 1
 
     asst.clear_history()
-    assert len(asst.history) == 0
+    assert asst.history == []
     assert asst.now_playing is None
-
-
-def test_assistant_child_age_passed_to_server():
-    backend = _FakeBackend()
-    response = _FakeLResponse(_FakeBackend()._result)
-    backend._session.post.return_value = response
-    player = MagicMock()
-
-    asst = VoiceAssistant(backend, player)
-    asst.child_age = 8
-    asst.understand("Mathe-Frage")
-
-    call_args = backend._session.post.call_args
-    assert call_args[1]["json"]["child_age"] == 8
-
-
-def test_assistant_debug_info():
-    backend = _FakeBackend()
-    player = MagicMock()
-
-    asst = VoiceAssistant(backend, player)
-    asst.child_age = 6
-    asst.set_now_playing("Bibi und Tina", "Lied")
-
-    info = asst.get_debug_info()
-    assert info["enabled"] is True
-    assert info["child_age"] == 6
-    assert info["now_playing"]["title"] == "Bibi und Tina"
-    assert info["history_turns"] == 0
 
 
 # --------------------------------------------------------------------------
