@@ -953,14 +953,33 @@ class Kakabox:
         return wrapped
 
     def _set_cpu_governor(self, name: str) -> None:
-        """CPU-Governor via sudo-Helper setzen (best-effort; ohne Helper no-op)."""
+        """CPU-Governor via sudo-Helper setzen (best-effort; ohne Helper no-op).
+
+        Ein Fehlschlag beim ZURÜCK-Schalten auf 'ondemand' (Wake/Boot) ist der
+        gefährliche Fall (QS-Finding F10a): die Box bliebe dann auf 'powersave'
+        kleben und die Voice-ASR wäre unbrauchbar langsam — bisher komplett
+        stumm (nur DEBUG). Ein non-zero Returncode wird jetzt auf WARNING
+        geloggt. Der reine "Helper nicht installiert"-Fall (FileNotFoundError)
+        bleibt DEBUG — das ist der erwartete Dev-No-op.
+        """
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["sudo", "-n", "/usr/local/bin/kakabox-cpu-governor", name],
                 check=False, capture_output=True, timeout=5,
             )
+        except FileNotFoundError:
+            logger.debug("CPU-Governor-Helper nicht installiert — %s übersprungen.", name)
+            return
         except Exception as e:
-            logger.debug("CPU-Governor %s nicht gesetzt: %s", name, e)
+            logger.warning("CPU-Governor %s nicht gesetzt: %s", name, e)
+            return
+        if result.returncode != 0:
+            stderr = (result.stderr or b"").decode(errors="replace").strip()
+            logger.warning(
+                "CPU-Governor '%s' fehlgeschlagen (rc=%d): %s — Box läuft evtl. "
+                "auf falschem Governor (ASR ggf. langsam).",
+                name, result.returncode, stderr[:200],
+            )
 
     def _enter_standby(self) -> None:
         if self._standby:
@@ -1158,11 +1177,22 @@ class Kakabox:
             # Sync deckt ohnehin alle Inhalte der Box ab).
             self._trigger_background_sync("command")
         elif name == "refresh_settings":
-            # max_volume + enable_zauberwort über den bestehenden Rule-Pfad.
-            self._apply_rule_from_manifest({
+            # Das VOLLE Rule-Payload über den bestehenden Rule-Pfad — inkl.
+            # quiet_hours + blocked_category_ids (QS-Finding A2): die wurden
+            # bisher aus dem Push-Payload NICHT durchgereicht, sodass eine
+            # gerade aktivierte Ruhezeit/Kategorie-Sperre erst beim nächsten
+            # 5-Min-Manifest-Sync griff (Eltern setzen 19:59 "ab 20:00" → Box
+            # spielte bis zu 5 Min weiter). _apply_rule_from_manifest wendet nur
+            # tatsächlich übermittelte Felder an (kein Reset bei fehlendem Key).
+            rule: dict = {
                 "max_volume": payload.get("max_volume"),
                 "enable_zauberwort": payload.get("enable_zauberwort"),
-            })
+            }
+            if "quiet_hours" in payload:
+                rule["quiet_hours"] = payload.get("quiet_hours")
+            if "blocked_category_ids" in payload:
+                rule["blocked_category_ids"] = payload.get("blocked_category_ids")
+            self._apply_rule_from_manifest(rule)
             if payload.get("mode"):
                 self._set_mode(str(payload["mode"]))
             # TTS-Stimme (männlich/weiblich) sofort umschalten, falls im Payload.
@@ -1962,6 +1992,11 @@ class Kakabox:
             self._flash_playback_denied()
             return
 
+        # Frische Wiedergabe startet immer bei Normalgeschwindigkeit (F6) —
+        # ein hängengebliebener Speed-Mode/mpv-Tempo darf nicht in den neuen
+        # Track lecken.
+        self._reset_speed_if_active()
+
         # Nur tatsächlich auslieferbare Lieder (veröffentlicht + Audiodatei) in
         # die Playlist nehmen. 'playable' kommt vom Backend (formatKaka); fehlt
         # das Feld (älteres Backend), gilt der Track als spielbar (Kompat).
@@ -2107,6 +2142,8 @@ class Kakabox:
         if self._quiet_hours_now():
             logger.info("Ruhezeit aktiv — Random-Modus-Start unterdrückt (still).")
             return
+        # Frischer Random-Start bei Normalgeschwindigkeit (F6).
+        self._reset_speed_if_active()
         contents = self._all_cached_contents()
         if not contents:
             logger.warning("🎲 Random-Modus: keine gecachten Tracks gefunden.")
@@ -2505,6 +2542,9 @@ class Kakabox:
             self.player.stop()
         except Exception as e:
             logger.warning("Player.stop nach Full-Stop fehlgeschlagen: %s", e)
+        # Speed-Mode mit beenden (F6): sonst regelt der Encoder nach dem Stop
+        # weiter das Tempo, und die nächste Wiedergabe startet schnell/langsam.
+        self._reset_speed_if_active()
         self._last_kaka_memory = None
         self._random_mode = False
         self._voice_mode = False
@@ -3899,6 +3939,16 @@ class Kakabox:
         logger.info("⏩ Speed zurück auf 100%%")
         if self.leds is not None:
             self.leds.hide_speed()
+
+    def _reset_speed_if_active(self) -> None:
+        """Setzt Speed-Mode + mpv-Tempo idempotent auf Normal zurück — für
+        Stop-/Neu-Start-Pfade (QS-Finding F6). Ohne das blieb _speed_mode nach
+        einem Knopf-Stop True (Encoder regelte weiter Tempo statt Lautstärke)
+        und die NÄCHSTE Wiedergabe startete mit dem alten mpv-Speed (z.B. 2×),
+        weil player.play_file das Tempo nicht zurücksetzt. No-op, wenn ohnehin
+        Normalgeschwindigkeit — kein Spurious-Log."""
+        if self._speed_mode or abs(self._speed - 1.0) > 1e-6:
+            self._exit_speed_mode()
 
     def _adjust_speed(self, delta: float) -> None:
         # Auf 2 Nachkommastellen runden, sonst bekommen wir durch float-Drift

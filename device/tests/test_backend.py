@@ -250,3 +250,44 @@ def test_session_sends_accept_json_header(backend):
     ein 302-Redirect statt eines lesbaren 422-JSON-Fehlers zurück (live auf
     kakaland.de beobachtet: leerer Response-Body bei /api/box/assistant)."""
     assert backend._session.headers.get("Accept") == "application/json"
+
+
+def test_load_identity_recovers_from_backup_when_main_corrupt(tmp_path):
+    """Haupt-Identity kaputt, .bak gültig → Recovery aus .bak (kein Crash)."""
+    from network.backend import Backend
+    p = tmp_path / "box_identity.json"
+    p.write_text('{"serial_number": "S", "api_token": {')  # abgeschnitten
+    Path(str(p) + ".bak").write_text(json.dumps({
+        "serial_number": "KB-BAK", "activation_code": "C",
+        "api_token": "bak-token", "registered_at": "connected",
+    }))
+    b = Backend(identity_path=p, base_url="https://test")
+    assert b.token == "bak-token"
+
+
+def test_load_identity_both_corrupt_raises_backend_error(tmp_path):
+    """Regression F6: sind Haupt-Datei UND .bak kaputt, muss ein BackendError
+    kommen (den main.py fängt → offline-only), NICHT ein roher JSONDecodeError
+    (der die __init__ crasht → systemd-Boot-Crash-Schleife)."""
+    from network.backend import Backend, BackendError
+    p = tmp_path / "box_identity.json"
+    p.write_text('{"broken":')
+    Path(str(p) + ".bak").write_text('{"also broken":')
+    with pytest.raises(BackendError):
+        Backend(identity_path=p, base_url="https://test")
+
+
+def test_save_identity_is_atomic_and_owner_only(tmp_path):
+    """_save_identity schreibt atomar (kein tmp-Rest) + 0600 (Token drin)."""
+    import os
+    import stat
+    from network.backend import Backend
+    p = tmp_path / "box_identity.json"
+    p.write_text(json.dumps({"serial_number": "S", "activation_code": "C"}))
+    b = Backend(identity_path=p, base_url="https://test")
+    b._identity["api_token"] = "neu"
+    b._save_identity()
+
+    assert json.loads(p.read_text())["api_token"] == "neu"
+    assert list(tmp_path.glob("box_identity.json.*.tmp")) == []
+    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600

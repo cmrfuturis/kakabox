@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -69,6 +71,9 @@ class Backend:
         self._identity_path = Path(identity_path)
         self._base_url = _validate_url(base_url or DEFAULT_BACKEND_URL)
         self._timeout = timeout
+        # Serialisiert _save_identity (zwei gleichzeitige 401s → beide clearen
+        # den Token und schreiben; ohne Lock racen sie auf den Schreibpfad).
+        self._identity_lock = threading.Lock()
         self._identity: dict[str, Any] = self._load_identity()
         # Persistente HTTP-Session: hält die TCP/TLS-Verbindung am Leben,
         # sodass tag_scan/heartbeat/manifest ohne erneuten Handshake laufen.
@@ -97,28 +102,54 @@ class Backend:
             return json.loads(self._identity_path.read_text())
         except json.JSONDecodeError:
             # Kann durch einen Spannungseinbruch mitten in _save_identity()
-            # entstehen (vor dem Atomic-Write-Fix unten passiert, alte Backups
-            # können noch betroffen sein). Ohne Identität kann die Box sich
-            # nicht am Backend anmelden — .bak ist der einzige Recovery-Pfad,
-            # da es keine sinnvollen Default-Werte für Serial/Token gibt.
+            # entstehen. Ohne Identität kann die Box sich nicht am Backend
+            # anmelden — .bak ist der einzige Recovery-Pfad (keine sinnvollen
+            # Default-Werte für Serial/Token). Ist AUCH das .bak kaputt oder
+            # fehlt es, wird ein BackendError geworfen (NICHT der rohe
+            # JSONDecodeError): main.py fängt BackendError und läuft dann
+            # offline-only weiter, statt in eine systemd-Boot-Crash-Schleife zu
+            # geraten (QS-Finding F6). Die Box spielt so wenigstens lokale
+            # Kakas + Voice, statt gar nicht zu starten.
             backup_path = Path(str(self._identity_path) + ".bak")
             if backup_path.is_file():
-                logger.error(
-                    "box_identity.json ist beschädigt — falle auf %s zurück.",
-                    backup_path,
-                )
-                return json.loads(backup_path.read_text())
-            raise
+                try:
+                    ident = json.loads(backup_path.read_text())
+                    logger.error(
+                        "box_identity.json ist beschädigt — falle auf %s zurück.",
+                        backup_path,
+                    )
+                    return ident
+                except json.JSONDecodeError:
+                    pass
+            raise BackendError(
+                "box_identity.json UND .bak sind beschädigt — Box läuft offline."
+            )
 
     def _save_identity(self) -> None:
-        data = json.dumps(self._identity, indent=2, ensure_ascii=False)
-        # Atomar: tmp-Datei + os.replace, damit ein Spannungseinbruch mitten im
-        # Schreiben nie eine halbe/kaputte box_identity.json hinterlässt.
-        tmp_path = Path(str(self._identity_path) + ".tmp")
-        tmp_path.write_text(data)
-        tmp_path.replace(self._identity_path)
-        # Zusätzliches .bak als zweite Verteidigungslinie (siehe _load_identity).
-        Path(str(self._identity_path) + ".bak").write_text(data)
+        with self._identity_lock:
+            data = json.dumps(self._identity, indent=2, ensure_ascii=False)
+            # Atomar mit EINDEUTIGEM tmp-Namen (mkstemp) + os.replace: ein
+            # Spannungseinbruch mitten im Schreiben hinterlässt nie eine halbe
+            # Datei, und zwei gleichzeitige 401s (die beide _clear_token →
+            # _save_identity auslösen) kollidieren nicht mehr auf einem festen
+            # ".tmp"-Pfad (QS-Finding, analog save_config in main.py).
+            self._atomic_write(self._identity_path, data)
+            # Zusätzliches .bak als zweite Verteidigungslinie — ebenfalls
+            # atomar, damit ein Brownout während des .bak-Writes nicht die
+            # einzige Recovery-Quelle zerstört.
+            self._atomic_write(Path(str(self._identity_path) + ".bak"), data)
+
+    @staticmethod
+    def _atomic_write(path: Path, data: str) -> None:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+        )
+        try:
+            os.write(fd, data.encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.chmod(tmp_name, 0o600)  # Identity trägt den Token → nicht world-readable
+        os.replace(tmp_name, path)
 
     @property
     def token(self) -> str | None:

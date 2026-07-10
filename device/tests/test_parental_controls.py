@@ -15,6 +15,10 @@ def _bare_box(config=None) -> "main.Kakabox":
     box = object.__new__(main.Kakabox)
     box.config = config or {}
     box.leds = None  # kein Hardware-Flash in Tests noetig
+    # Speed-Mode-Defaults wie in __init__ — _start_kaka_playlist ruft jetzt
+    # _reset_speed_if_active() (F6-Fix), das diese Attribute liest.
+    box._speed_mode = False
+    box._speed = 1.0
     return box
 
 
