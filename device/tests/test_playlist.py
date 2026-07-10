@@ -138,6 +138,44 @@ def test_stop_prevents_further_play(cache):
     assert len(player.played) == 1
 
 
+def test_stop_during_blocking_download_prevents_play(cache):
+    """QS-Finding F1: Wird die Playlist gestoppt (Chip abgenommen), WÄHREND ein
+    Track-Download läuft, darf sie nach Download-Ende NICHT losspielen — sonst
+    startet Musik 'chiplos' und die Steuerknöpfe wirken nicht mehr darauf."""
+    backend = FakeBackend()
+    backend.set_content(1, b"alpha")
+    player = FakePlayer()
+
+    download_started = threading.Event()
+    release_download = threading.Event()
+
+    def blocking_download(content_id: int, target: Path) -> bool:
+        download_started.set()
+        # Simuliert einen langen Download — hier stoppt der andere Thread.
+        release_download.wait(timeout=5)
+        return backend.download(content_id, target)
+
+    pl = Playlist(
+        contents=[_make_content(1, b"alpha")],
+        cache=cache,
+        download_fn=blocking_download,
+        play_fn=player.play,
+        stop_fn=player.stop,
+    )
+
+    result: list[bool] = []
+    starter = threading.Thread(target=lambda: result.append(pl.start()))
+    starter.start()
+
+    assert download_started.wait(timeout=5)
+    pl.stop()                 # Chip weg, während der Download blockt
+    release_download.set()    # Download läuft jetzt zu Ende
+    starter.join(timeout=5)
+
+    assert result == [False]          # start() meldet: nicht gestartet
+    assert player.played == []        # KEINE chiplose Wiedergabe
+
+
 def test_hash_mismatch_after_download_aborts_play(cache):
     backend = FakeBackend()
     # Backend liefert "evil" — die deklarierte Hash erwartet aber "expected"

@@ -1,9 +1,18 @@
 smbus2==0.4.3
-RPi.GPIO==0.7.1
 python-mpv==1.0.7
 fastapi==0.115.0
 uvicorn==0.30.6
 requests==2.32.3
+# numpy: von audio/spectrum.py (LED-Spektrum) TOP-LEVEL importiert, und
+# main.py importiert FileSpectrum unbedingt → eine frische Installation nur
+# aus dieser Datei crashte bisher beim Start (kam nur transitiv über
+# requirements-voice rein). QS-Finding.
+numpy==2.2.4
+# Pi5Neo: LED-Streifen (hardware/leds.py, lazy import). System-Paket-frei via
+# pip installierbar.
+Pi5Neo==1.1.0
+# RPi.GPIO ENTFERNT: nirgends importiert (Hardware nutzt gpiozero/lgpio via
+# System-Site-Packages, smbus2, pi5neo). QS-Finding.
 # gpiozero + lgpio (Pi 5 RP1) kommen via System-Site-Packages — der venv ist
 # mit `include-system-site-packages = true` konfiguriert. Auf der Pi installieren:
 #   sudo apt install python3-gpiozero python3-lgpio

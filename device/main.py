@@ -325,13 +325,41 @@ def load_config() -> dict:
     }
 
 
+# Serialisiert alle save_config-Aufrufe (Heartbeat- + Sync-Thread schreiben
+# parallel, QS-Finding F10). Modul-Ebene, weil save_config eine freie Funktion
+# ist.
+_CONFIG_WRITE_LOCK = threading.Lock()
+
+
 def save_config(config: dict) -> None:
-    # Atomar: tmp-Datei + os.replace, damit ein Spannungseinbruch mitten im
-    # Schreiben nie eine halbe/kaputte config.json hinterlässt (siehe
-    # load_config()).
-    tmp_path = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
-    tmp_path.write_text(json.dumps(config, indent=2, ensure_ascii=False))
-    tmp_path.replace(CONFIG_PATH)
+    # Atomar: eindeutige tmp-Datei (mkstemp) + os.replace, damit ein
+    # Spannungseinbruch mitten im Schreiben nie eine halbe/kaputte config.json
+    # hinterlässt (siehe load_config()). Der Lock + der EINDEUTIGE tmp-Name
+    # verhindern das frühere Race, bei dem zwei Threads denselben ".tmp"-Pfad
+    # nutzten und der zweite replace() mit FileNotFoundError den Sync-Thread
+    # killte (F10). chmod 0600, weil config.json den api_token im Klartext
+    # trägt und sonst world-readable (0664) bliebe (F3).
+    with _CONFIG_WRITE_LOCK:
+        # json.dumps kann RuntimeError werfen, wenn ein anderer Thread den
+        # dict WÄHREND der Serialisierung mutiert — ein kurzer Retry deckt das
+        # praktisch immer ab (Mutationen sind selten + kurz).
+        for attempt in range(3):
+            try:
+                payload = json.dumps(config, indent=2, ensure_ascii=False)
+                break
+            except RuntimeError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.02)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=CONFIG_PATH.name + ".", suffix=".tmp", dir=str(CONFIG_PATH.parent),
+        )
+        try:
+            os.write(fd, payload.encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, CONFIG_PATH)
 
 
 _WEEKDAY_ABBREVS = ["mo", "di", "mi", "do", "fr", "sa", "so"]
@@ -836,7 +864,13 @@ class Kakabox:
         self.play_session_reporter.start_worker()
 
         threading.Thread(target=self._nfc_loop, daemon=True, name="nfc").start()
-        if self.backend and self.backend.is_connected:
+        # Heartbeat + Audio-Sync starten IMMER, sobald ein Backend-Objekt
+        # existiert — auch wenn beim Boot (noch) keine Verbindung steht (WLAN
+        # kommt oft erst nach dem Box-Start, oder ein transientes 401 hat den
+        # Token gelöscht). Der Heartbeat-Loop versucht dann pro Iteration einen
+        # Reconnect (_ensure_backend_connection), statt die Box die ganze
+        # Uptime offline zu lassen (QS-Finding F4).
+        if self.backend is not None:
             threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat").start()
             threading.Thread(target=self._audio_sync_loop, daemon=True, name="audio-sync").start()
 
@@ -991,7 +1025,34 @@ class Kakabox:
     # Hintergrund-Loops
     # ------------------------------------------------------------------
 
+    def _ensure_backend_connection(self) -> bool:
+        """Best-effort-Reconnect: True, wenn die Box (jetzt) verbunden ist.
+
+        Läuft in jedem Heartbeat-Zyklus, wenn der Token fehlt — sei es weil
+        beim Boot noch kein WLAN da war oder weil ein transientes 401 den
+        Token gelöscht hat (backend._clear_token). Ohne diesen Retry blieb die
+        Box bis zum Service-Neustart offline (QS-Finding F4). connect() kann
+        BackendError werfen (fehlende serial/activation) — defensiv fangen,
+        damit der Heartbeat-Loop niemals daran stirbt."""
+        if not self.backend:
+            return False
+        if self.backend.is_connected:
+            return True
+        try:
+            if self.backend.connect():
+                logger.info("Backend-Verbindung wiederhergestellt.")
+                # Nach frischem Connect Einstellungen/Downloads nachziehen —
+                # während der Offline-Phase könnten sich Rules geändert haben.
+                threading.Thread(
+                    target=self._sync_audio_manifest, daemon=True, name="resync-after-reconnect",
+                ).start()
+                return True
+        except Exception as e:
+            logger.debug("Reconnect-Versuch fehlgeschlagen: %s", e)
+        return False
+
     def _heartbeat_loop(self) -> None:
+        self._ensure_backend_connection()
         self._send_heartbeat()
         self._poll_commands()
         while self._running:
@@ -999,6 +1060,9 @@ class Kakabox:
                 if not self._running:
                     return
                 time.sleep(0.1)
+            # Reconnect-Versuch VOR Heartbeat/Commands — sonst wären beide bei
+            # fehlendem Token dauerhaft No-ops.
+            self._ensure_backend_connection()
             self._send_heartbeat()
             # Webapp-Commands gleich nach dem Heartbeat abholen (#18). Ohne das
             # blieben Modus-/Finder-/Volume-/Resync-Aktionen aus der Webapp ohne
@@ -1008,7 +1072,15 @@ class Kakabox:
     def _audio_sync_loop(self) -> None:
         time.sleep(5)
         while self._running:
-            self._sync_audio_manifest()
+            # Catch-all pro Iteration: ein malformtes Manifest, ein OSError
+            # beim Download/disk_usage oder ein save_config-Race darf den
+            # Sync-Thread NICHT dauerhaft killen (QS-Finding F8) — sonst kämen
+            # keine Downloads/Rules/quiet_hours-Updates mehr, ohne dass es
+            # jemand merkt.
+            try:
+                self._sync_audio_manifest()
+            except Exception:
+                logger.exception("Audio-Sync-Iteration fehlgeschlagen — Loop läuft weiter.")
             for _ in range(AUDIO_SYNC_INTERVAL * 10):
                 if not self._running:
                     return
@@ -1461,6 +1533,30 @@ class Kakabox:
             else:
                 self.leds.nfc_chip_absent()
 
+    def _restore_playback_led(self) -> None:
+        """Setzt die NFC-Status-LED auf den UNTERLIEGENDEN Wiedergabe-Zustand:
+        Kakafigur aktiv → grün, Random → lila, sonst aus. Genutzt, wenn ein
+        Overlay (Fehler-Blitz eines ignorierten Chips) verschwinden soll, ohne
+        eine laufende Wiedergabe optisch zu unterschlagen."""
+        if self.leds is None:
+            return
+        if self._active_tag_uid is not None:
+            self.leds.nfc_chip_present()
+        elif self._random_mode:
+            self.leds.nfc_random_active()
+        else:
+            self.leds.nfc_chip_absent()
+
+    def _flash_then_restore_playback_led(self) -> None:
+        """Roter Blitz (1,2s), danach LED zurück auf den echten Wiedergabe-
+        Zustand — für den ignorierten (deaktivierten) Spotify-Chip, damit die
+        statische Fehlerfarbe nicht hängen bleibt (QS-Finding F7-kern)."""
+        if self.leds is None:
+            return
+        self.leds.nfc_flash_error()
+        time.sleep(1.2)
+        self._restore_playback_led()
+
     # ------------------------------------------------------------------
     # NFC-Loop (mit Multi-Chip-Tracking)
     # ------------------------------------------------------------------
@@ -1509,13 +1605,26 @@ class Kakabox:
             )
 
             if new_active != active_uid:
-                if new_active is None:
-                    self._on_tag_removed(active_uid)
-                else:
-                    if active_uid is not None:
-                        logger.info("Chip-Wechsel: %s → %s", active_uid, new_active)
+                # Catch-all um die Transition (QS-Finding F7): _handle_tag /
+                # _on_tag_removed können werfen (voller Disk beim Download,
+                # Tag-Cache-Race, Thread-Start bei Ressourcenmangel). Eine
+                # ungefangene Exception hier beendet den NFC-Thread still →
+                # Chips sind tot bis Reboot, ohne sichtbaren Fehler. active_uid
+                # wird trotzdem vorgerückt: der Chip macht dann nichts, statt
+                # dass die Box jede Iteration erneut hämmert.
+                try:
+                    if new_active is None:
                         self._on_tag_removed(active_uid)
-                    self._handle_tag(new_active)
+                    else:
+                        if active_uid is not None:
+                            logger.info("Chip-Wechsel: %s → %s", active_uid, new_active)
+                            self._on_tag_removed(active_uid)
+                        self._handle_tag(new_active)
+                except Exception:
+                    logger.exception(
+                        "NFC-Transition %s → %s fehlgeschlagen — Loop läuft weiter.",
+                        active_uid, new_active,
+                    )
                 active_uid = new_active
 
             # Im Standby seltener pollen (spart CPU); ein aufgelegter Chip
@@ -1547,15 +1656,23 @@ class Kakabox:
                 self._start_spotify(uid)
             else:
                 # Spotify per Config deaktiviert (spotify.enabled=false):
-                # Chip bewusst NUR ignorieren (roter Blitz) — ohne diesen
-                # Guard fiele er in den normalen Kaka-Flow und Auto-Pairing
-                # würde eine leere Kreativ-Kaka für den Spotify-Chip anlegen.
+                # Chip bewusst NUR ignorieren — ohne diesen Guard fiele er in
+                # den normalen Kaka-Flow und Auto-Pairing würde eine leere
+                # Kreativ-Kaka für den Spotify-Chip anlegen.
                 logger.info(
                     "Spotify-Chip %s aufgelegt, aber Spotify ist deaktiviert — ignoriert.",
                     uid,
                 )
-                if self.leds is not None:
-                    self.leds.nfc_flash_error()
+                # Kurzer roter Blitz, dann LED auf den UNTERLIEGENDEN Zustand
+                # restoren (QS-Finding F7-kern): nfc_flash_error() schreibt
+                # sonst STATISCH rot, die bliebe hängen solange der ignorierte
+                # Chip aufliegt und würde eine laufende Random-Lila-Anzeige
+                # verdecken. Im Thread, weil der Blitz 1,2s blockt — der
+                # NFC-Loop darf nicht warten.
+                threading.Thread(
+                    target=self._flash_then_restore_playback_led,
+                    daemon=True, name="spotify-disabled-flash",
+                ).start()
             return
 
         # Cache-first: bekannter Tag mit allen Audios lokal → sofort spielen,
@@ -2107,25 +2224,34 @@ class Kakabox:
         clearen nur ``_voice_pending_tag_uid``, damit beim Voice-Ende die
         Continue-Logik weiß "kein Tag mehr, fall back auf Random".
         """
-        # Spotify-Chip runter → nur den Daemon pausieren; die Snapshot-/
-        # Playlist-Logik unten gehört zu lokalen Kakas und wäre hier ein
-        # No-op mit irreführenden Logs.
-        if self._spotify_active and uid and \
-                uid.strip().upper() in self._spotify_tag_uids:
-            self._spotify_active = False
-            with self._playlist_lock:
-                self._active_tag_uid = None
-            if self._spotify is not None:
-                # Pause im Thread: der HTTP-Call darf den NFC-Loop nicht
-                # aufhalten (Timeout wäre mehrere Sekunden, wenn der Daemon
-                # gerade beschäftigt/weg ist).
-                threading.Thread(
-                    target=self._spotify.pause,
-                    daemon=True, name="spotify-pause",
-                ).start()
-            if self.leds is not None:
-                self.leds.nfc_chip_absent()
-            logger.info("Spotify-Chip %s entfernt → Pause.", uid)
+        # Spotify-Chip runter. Zwei Fälle, beide dürfen NICHT in die generische
+        # Kaka-Stop-Logik unten fallen (QS-Finding F1: die würde sonst eine
+        # darunter laufende Random-Wiedergabe abwürgen und den Player stoppen,
+        # obwohl der Spotify-Chip damit gar nichts zu tun hatte):
+        if uid and uid.strip().upper() in self._spotify_tag_uids:
+            if self._spotify_active:
+                # (a) Spotify spielte tatsächlich → Daemon pausieren.
+                self._spotify_active = False
+                with self._playlist_lock:
+                    self._active_tag_uid = None
+                if self._spotify is not None:
+                    # Pause im Thread: der HTTP-Call darf den NFC-Loop nicht
+                    # aufhalten (Timeout mehrere Sekunden, wenn der Daemon
+                    # gerade beschäftigt/weg ist).
+                    threading.Thread(
+                        target=self._spotify.pause,
+                        daemon=True, name="spotify-pause",
+                    ).start()
+                if self.leds is not None:
+                    self.leds.nfc_chip_absent()
+                logger.info("Spotify-Chip %s entfernt → Pause.", uid)
+            else:
+                # (b) Spotify war deaktiviert/inaktiv, der Chip hat also nie
+                # etwas gestartet → Abnehmen ist ein reiner No-op für die
+                # Wiedergabe. Nur die LED wieder auf den echten Zustand
+                # (falls der Fehler-Blitz noch nachhängt).
+                self._restore_playback_led()
+                logger.debug("Ignorierter Spotify-Chip %s entfernt — kein Effekt auf Wiedergabe.", uid)
             return
         if self._voice_mode:
             if uid == self._voice_pending_tag_uid:

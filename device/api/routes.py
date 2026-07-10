@@ -76,7 +76,12 @@ def _get_box() -> Kakabox:
 
 
 def _save() -> None:
-    _CONFIG_PATH.write_text(json.dumps(_box.config, indent=2, ensure_ascii=False))
+    # Über main.save_config statt direktem write_text (QS-Finding F10/A4):
+    # nutzt denselben Lock + atomaren, 0600-gechmodten Schreibpfad wie die
+    # Box-internen Config-Writes — sonst racen REST-API- und main-Writes auf
+    # dieselbe Datei und der Token bliebe world-readable.
+    from main import save_config
+    save_config(_box.config)
 
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
@@ -121,7 +126,9 @@ def play(album_id: str):
         raise HTTPException(status_code=404, detail=f"Album '{album_id}' not found")
     if album_id in box.config.get("parental", {}).get("disabled_albums", []):
         raise HTTPException(status_code=403, detail="Album disabled by parental controls")
-    box.effects.reset()
+    # box.effects.reset() entfernt (QS-Finding A1): die Kakabox-Klasse hat kein
+    # Attribut `effects` — AudioEffects wurde nie instanziiert. Der Aufruf ließ
+    # JEDEN POST /play mit AttributeError/500 scheitern.
     box.player.play_album(album)
     return {"ok": True, "album_id": album_id}
 

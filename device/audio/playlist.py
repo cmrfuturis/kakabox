@@ -190,6 +190,12 @@ class Playlist:
         if path is None:
             logger.error("Kann Start-Track '%s' nicht laden.", first.title)
             return False
+        # Recheck nach dem (blockierenden) Download — Chip könnte während des
+        # Ladens schon wieder weg sein (QS-Finding F1). Ohne das startet die
+        # Musik chiplos.
+        if self._stopped.is_set():
+            logger.info("Playlist während Start-Download gestoppt — kein Playback.")
+            return False
 
         self._index = start_index
         self._play(first, path, start_seconds=start_position)
@@ -303,6 +309,14 @@ class Playlist:
             i = (index + offset) % n
             nxt = contents[i]
             path = self._ensure_local(nxt, blocking=True)
+            # Recheck NACH dem (bis zu 60s) blockierenden Download: wurde die
+            # Playlist zwischenzeitlich gestoppt (Chip abgenommen, Modus-
+            # wechsel), darf sie NICHT losspielen (QS-Finding F1: sonst startet
+            # Musik "chiplos", und weil main._current_playlist schon None ist,
+            # wirken Grün/Rot nicht mehr darauf — nur der Hold-Stop hilft).
+            if self._stopped.is_set():
+                logger.info("Playlist während Download gestoppt — kein Playback.")
+                return
             if path is not None:
                 self._index = i
                 self._play(nxt, path)
