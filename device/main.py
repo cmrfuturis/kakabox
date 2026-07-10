@@ -2844,7 +2844,18 @@ class Kakabox:
         Konversation: Keine Zeitlimits, nur 5s Stille → Abbruch. LED Gold
         pulsierend. Automatisches Fallback: wenn Intent="play_song" → direct
         playback ohne Bestätigung. Sonst: Antwort hören + Loop.
+
+        Per Config abschaltbar (assistant.enabled, Default AUS — User-
+        Entscheidung 2026-07-10: klein starten, Fokus auf dem lokalen
+        Sprachmodul; die Cloud-Roundtrip-Latenz war für Kinder unbrauchbar).
+        Deaktiviert verhält sich der Hold wie ein kurzer Druck → normales
+        Voice-Push-to-Talk. Für Kinder ist Blau damit einfach immer
+        "sprechen", egal wie lange gedrückt wird.
         """
+        if not bool((self.config.get("assistant") or {}).get("enabled", False)):
+            logger.info("KI-Modus deaktiviert (assistant.enabled=false) — Blau-Hold startet Voice-PTT.")
+            self._on_blue_pressed()
+            return
         if self._abort_prompt_if_playing():
             return
         if self._speed_mode:
